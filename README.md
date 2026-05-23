@@ -10,6 +10,8 @@ The key insight: **CFR is game-agnostic.** It doesn't know anything about poker.
 
 ## Empirical Results
 
+![alt text](image.png)
+
 ### Complexity Scaling
 
 |  | Kuhn | Leduc | NLHE (8-bucket) |

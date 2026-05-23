@@ -67,6 +67,7 @@ class CFRSolver:
     info_sets: dict[InfoSetKey, InfoSetData] = field(default_factory=dict)
     iterations: int = 0
     linear_averaging: bool = True  # Linear CFR (Brown & Sandholm 2019)
+    cfr_plus: bool = False         # CFR+ (Tammelin 2014) — clamp regrets ≥ 0
 
     def _get_or_create_info_set(
         self, key: InfoSetKey, actions: list[Action]
@@ -161,6 +162,13 @@ class CFRSolver:
                     self._cfr_recursive(init_history, reach, traversing_player)
 
             self.iterations += 1
+
+            # CFR+: clamp cumulative regrets to ≥ 0 after each iteration
+            # This prevents negative regrets from accumulating, yielding
+            # faster convergence (Tammelin, 2014)
+            if self.cfr_plus:
+                for data in self.info_sets.values():
+                    np.maximum(data.cumulative_regret, 0, out=data.cumulative_regret)
 
             if callback and t % callback_freq == 0:
                 callback(self, t)
