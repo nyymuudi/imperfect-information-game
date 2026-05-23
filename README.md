@@ -10,7 +10,7 @@ The key insight: **CFR is game-agnostic.** It doesn't know anything about poker.
 
 ## Empirical Results
 
-![alt text](image.png)
+![alt text](image-1.png)
 
 ### Complexity Scaling
 
