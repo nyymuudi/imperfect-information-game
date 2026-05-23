@@ -150,12 +150,11 @@ class TestCFRSolver:
         self.solver = CFRSolver(game=self.game, linear_averaging=True)
         self.tracker = ConvergenceTracker()
         # solve palauttaa nyt listan [p0_strat, p1_strat]
-        p0_strat, p1_strat = self.solver.solve(
+        self.strategy = self.solver.solve(
             iterations=5000,
             callback=self.tracker.record,
             callback_freq=500,
         )
-        self.strategy = {**p0_strat, **p1_strat}
 
     def test_all_info_sets_discovered(self):
         # Kuhn poker has 12 information sets
@@ -186,8 +185,7 @@ class TestNashVerification:
     def setup_deep(self):
         self.game = KuhnPoker()
         self.solver = CFRSolver(game=self.game, linear_averaging=True)
-        p0_strat, p1_strat = self.solver.solve(iterations=10000)
-        self.strategy = {**p0_strat, **p1_strat}
+        self.strategy = self.solver.solve(iterations=10000)
 
     def test_exploitability_near_zero(self):
         exploit = self.solver.exploitability()
