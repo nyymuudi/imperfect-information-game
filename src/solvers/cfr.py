@@ -243,81 +243,144 @@ class CFRSolver:
 
     def _br_tree_walk(self, br_player: int) -> float:
         """
-        Tree-walk best response for larger games.
+        Correct bottom-up best response for games of any size.
         
-        Bottom-up: accumulates per-info-set action values weighted
-        by opponent reach, then picks best action per info set.
+        Processes BR player's info sets layer-by-layer (deepest first),
+        where "layer" = how many times the BR player has acted on the
+        path to this node. This eliminates the clairvoyant contamination
+        that caused negative exploitability values.
         
-        Two-pass approach:
-        1. Traverse tree, accumulate action values per BR info set
-        2. Pick best action per info set, recompute total value
+        Algorithm:
+            1. Identify max depth K (max times BR player acts on any path)
+            2. For layer K down to 0:
+               a. Traverse tree, accumulate action values per info set
+               b. At layers > current: use already-fixed best actions
+               c. At current layer: try all actions (full expansion)
+               d. At layers < current: use current CFR strategy
+               e. Pick best action per info set at current layer
+            3. Final traversal with all fixed actions → BR value
         """
         from collections import defaultdict
 
-        # Pass 1: accumulate action values per info set
-        is_action_values: dict[InfoSetKey, dict[int, float]] = defaultdict(
-            lambda: defaultdict(float)
-        )
+        # Step 1: Identify layers (how many BR player actions precede each info set)
+        info_set_layer: dict[InfoSetKey, int] = {}
 
-        def _accumulate(history: History, opp_reach: float) -> float:
-            """Returns value for br_player at this node."""
+        def _find_layers(history: History, br_action_count: int):
             if self.game.is_terminal(history):
-                return self.game.terminal_payoffs(history)[br_player] * opp_reach
-
+                return
             player = self.game.current_player(history)
             actions = self.game.legal_actions(history)
-            info_key = self.game.info_set_key(history, player)
-
             if player == br_player:
-                # Compute value of each action
-                best_val = float("-inf")
-                for i, action in enumerate(actions):
-                    val = _accumulate(
-                        self.game.apply_action(history, action), opp_reach
-                    )
-                    is_action_values[info_key][i] += val
-                    best_val = max(best_val, val)
-                return best_val  # Clairvoyant for downstream estimation
-            else:
-                info_set = self._get_or_create_info_set(info_key, actions)
-                strategy = info_set.average_strategy()
-                total = 0.0
-                for i, action in enumerate(actions):
-                    total += _accumulate(
+                key = self.game.info_set_key(history, player)
+                if key not in info_set_layer:
+                    info_set_layer[key] = br_action_count
+                for action in actions:
+                    _find_layers(
                         self.game.apply_action(history, action),
-                        opp_reach * strategy[i],
+                        br_action_count + 1,
                     )
-                return total
+            else:
+                for action in actions:
+                    _find_layers(
+                        self.game.apply_action(history, action),
+                        br_action_count,
+                    )
 
-        for init_h, chance_prob in self.game.initial_histories():
-            _accumulate(init_h, chance_prob)
+        for init_h, _ in self.game.initial_histories():
+            _find_layers(init_h, 0)
 
-        # Pick best action per info set
+        if not info_set_layer:
+            return 0.0
+
+        max_layer = max(info_set_layer.values())
         best_actions: dict[InfoSetKey, int] = {}
-        for key, action_vals in is_action_values.items():
-            best_actions[key] = max(action_vals, key=action_vals.get)
 
-        # Pass 2: compute actual BR value with fixed actions
+        # Step 2: Process each layer from deepest to shallowest
+        for target_layer in range(max_layer, -1, -1):
+            is_action_values: dict[InfoSetKey, dict[int, float]] = defaultdict(
+                lambda: defaultdict(float)
+            )
+
+            def _traverse(history: History, opp_reach: float, br_depth: int) -> float:
+                if self.game.is_terminal(history):
+                    return self.game.terminal_payoffs(history)[br_player] * opp_reach
+
+                player = self.game.current_player(history)
+                actions = self.game.legal_actions(history)
+                info_key = self.game.info_set_key(history, player)
+
+                if player == br_player:
+                    layer = info_set_layer.get(info_key, br_depth)
+
+                    if layer == target_layer:
+                        # Current layer: try ALL actions, accumulate values
+                        vals = {}
+                        for i, action in enumerate(actions):
+                            vals[i] = _traverse(
+                                self.game.apply_action(history, action),
+                                opp_reach, br_depth + 1,
+                            )
+                            is_action_values[info_key][i] += vals[i]
+                        # Return average (current strategy) for upstream estimation
+                        info_set = self._get_or_create_info_set(info_key, actions)
+                        strategy = info_set.average_strategy()
+                        return sum(strategy[i] * vals[i] for i in range(len(actions)))
+
+                    elif layer > target_layer and info_key in best_actions:
+                        # Deeper layer already fixed: use best action
+                        best_idx = best_actions[info_key]
+                        return _traverse(
+                            self.game.apply_action(history, actions[best_idx]),
+                            opp_reach, br_depth + 1,
+                        )
+                    else:
+                        # Shallower layer: use current strategy
+                        info_set = self._get_or_create_info_set(info_key, actions)
+                        strategy = info_set.average_strategy()
+                        return sum(
+                            strategy[i] * _traverse(
+                                self.game.apply_action(history, actions[i]),
+                                opp_reach, br_depth + 1,
+                            )
+                            for i in range(len(actions))
+                        )
+                else:
+                    # Opponent: use average strategy
+                    info_set = self._get_or_create_info_set(info_key, actions)
+                    strategy = info_set.average_strategy()
+                    return sum(
+                        _traverse(
+                            self.game.apply_action(history, actions[i]),
+                            opp_reach * strategy[i], br_depth,
+                        )
+                        for i in range(len(actions))
+                    )
+
+            for init_h, chance_prob in self.game.initial_histories():
+                _traverse(init_h, chance_prob, 0)
+
+            # Fix best actions for this layer
+            for key, action_vals in is_action_values.items():
+                best_actions[key] = max(action_vals, key=action_vals.get)
+
+        # Step 3: Final evaluation with all best actions fixed
         def _evaluate(history: History, weight: float) -> float:
             if self.game.is_terminal(history):
                 return self.game.terminal_payoffs(history)[br_player] * weight
-
             player = self.game.current_player(history)
             actions = self.game.legal_actions(history)
             info_key = self.game.info_set_key(history, player)
-
             if player == br_player:
                 best_idx = best_actions.get(info_key, 0)
                 return _evaluate(
-                    self.game.apply_action(history, actions[best_idx]),
-                    weight,
+                    self.game.apply_action(history, actions[best_idx]), weight,
                 )
             else:
                 info_set = self._get_or_create_info_set(info_key, actions)
                 strategy = info_set.average_strategy()
                 return sum(
-                    strategy[i] * _evaluate(
-                        self.game.apply_action(history, a), weight * strategy[i]
+                    _evaluate(
+                        self.game.apply_action(history, a), weight * strategy[i],
                     )
                     for i, a in enumerate(actions)
                 )
