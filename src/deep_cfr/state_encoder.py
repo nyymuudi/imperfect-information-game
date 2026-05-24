@@ -55,7 +55,7 @@ class LeducEncoder(StateEncoder):
 
     RANK_IDX = {"J": 0, "Q": 1, "K": 2}
     ACTION_ENC = {"c": 0.0, "r": 0.5, "f": -1.0, "k": 1.0}
-    MAX_POT = 26.0  # Max possible pot in Leduc (ante 1+1, R1 raise 2+2+2+2, R2 raise 4+4+4+4)
+    MAX_POT = 26.0
     HISTORY_LEN = 10
 
     def state_size(self) -> int:
@@ -63,56 +63,40 @@ class LeducEncoder(StateEncoder):
 
     def encode(self, history: History, player: int) -> np.ndarray:
         state = np.zeros(self.state_size(), dtype=np.float32)
-
-        # Private card (one-hot)
         private_rank = history[player][0]
         state[self.RANK_IDX[private_rank]] = 1.0
-
-        # Community card (one-hot, only if revealed)
-        # Determine if round 1 is complete by parsing actions
         actions = history[3:]
         r1_done = self._is_round1_done(actions)
-
         if r1_done:
             comm_rank = history[2][0]
             state[3 + self.RANK_IDX[comm_rank]] = 1.0
-            state[6] = 1.0  # Community revealed flag
-
-        # Pot and betting info
+            state[6] = 1.0
         pot, to_call = self._compute_pot_info(actions, player)
         state[7] = pot / self.MAX_POT
         state[8] = to_call / self.MAX_POT
         state[9] = 1.0 if r1_done else 0.0
-
-        # Action history (last HISTORY_LEN actions)
         for i, a in enumerate(actions[-self.HISTORY_LEN:]):
             state[10 + i] = self.ACTION_ENC.get(a, 0.0)
-
         return state
 
     def _is_round1_done(self, actions: tuple) -> bool:
-        """Check if round 1 betting is complete."""
         if len(actions) < 2:
             return False
-        # Simulate round 1
         for i, a in enumerate(actions):
             if a == 'f':
                 return False
             if a == 'k':
-                return True  # Call ends round 1
+                return True
             if a == 'c' and i >= 1:
-                # Check after check (or check after any non-raise) ends round
                 if actions[i-1] == 'c' or (i == 1 and actions[0] == 'c'):
                     return True
         return False
 
     def _compute_pot_info(self, actions: tuple, player: int) -> tuple[float, float]:
-        """Compute current pot and amount to call."""
-        pot = [1.0, 1.0]  # Antes
+        pot = [1.0, 1.0]
         r1_done = False
         current = 0
         raise_sizes = {False: 2.0, True: 4.0}
-
         for a in actions:
             if a == 'f':
                 break
@@ -120,18 +104,139 @@ class LeducEncoder(StateEncoder):
                 opp = 1 - current
                 pot[current] = pot[opp] + raise_sizes[r1_done]
             elif a == 'k':
-                opp = 1 - current
-                pot[current] = pot[opp]
+                pot[current] = pot[1 - current]
                 if not r1_done:
                     r1_done = True
                     current = 0
                     continue
+            current = 1 - current
+        to_call = max(0, pot[1 - player] - pot[player])
+        return sum(pot), to_call
+
+
+class NLHEEncoder(StateEncoder):
+    """
+    No-Limit Hold'em state encoder for Deep CFR.
+    
+    State vector (120 dimensions):
+        [0:52]    Private cards (one-hot, 2 bits set)
+        [52:104]  Board cards (one-hot, 0-5 bits set)
+        [104:108] Street (one-hot: preflop/flop/turn/river)
+        [108]     Pot size (normalized by 2× starting stack)
+        [109]     Amount to call (normalized)
+        [110]     Own stack remaining (normalized)
+        [111]     Opponent stack remaining (normalized)
+        [112:120] Action history (last 8 actions encoded)
+    
+    Card encoding: card = rank * 4 + suit
+        rank: 0=2, 1=3, ..., 12=A
+        suit: 0=♣, 1=♦, 2=♥, 3=♠
+    """
+
+    ACTION_ENC = {"f": -1.0, "c": 0.0, "k": 0.25, "r": 0.5, "b": 0.75, "a": 1.0}
+    HISTORY_LEN = 8
+
+    def __init__(self, starting_stack: float = 200.0):
+        self.starting_stack = starting_stack
+        self.norm = 2 * starting_stack  # Max pot ≈ 2× stacks
+
+    def state_size(self) -> int:
+        return 120
+
+    def encode(self, history: History, player: int) -> np.ndarray:
+        state = np.zeros(120, dtype=np.float32)
+
+        # Private cards (one-hot in 52-dim)
+        p0_cards = history[0]  # (card1, card2)
+        p1_cards = history[1]
+        my_cards = p0_cards if player == 0 else p1_cards
+        state[my_cards[0]] = 1.0
+        state[my_cards[1]] = 1.0
+
+        # Board cards (only visible ones based on street)
+        board = history[2]  # Full pre-dealt board
+        actions = history[3:]
+        n_visible = self._visible_board_count(actions)
+        for card in board[:n_visible]:
+            state[52 + card] = 1.0
+
+        # Street (one-hot)
+        street = {0: 0, 3: 1, 4: 2, 5: 3}.get(n_visible, 0)
+        state[104 + street] = 1.0
+
+        # Betting info
+        actions = history[3:]
+        pot, to_call, my_stack, opp_stack = self._parse_betting(
+            actions, player, n_visible
+        )
+        state[108] = pot / self.norm
+        state[109] = to_call / self.norm
+        state[110] = my_stack / self.starting_stack
+        state[111] = opp_stack / self.starting_stack
+
+        # Action history
+        for i, a in enumerate(actions[-self.HISTORY_LEN:]):
+            if isinstance(a, str):
+                state[112 + i] = self.ACTION_ENC.get(a, 0.0)
+            else:
+                state[112 + i] = min(a / self.starting_stack, 1.0)
+
+        return state
+
+    def _visible_board_count(self, actions: tuple) -> int:
+        """Count how many board cards are visible based on completed streets."""
+        streets_done = 0
+        street_actions = []
+        pending = False
+        for a in actions:
+            if a == 'f':
+                break
+            street_actions.append(a)
+            if a in ('r', 'a'):
+                pending = True
+            elif a == 'k':
+                pending = False
+            # Check if street complete
+            if len(street_actions) >= 2:
+                last = street_actions[-1]
+                if last == 'k' or (last == 'c' and not pending):
+                    streets_done += 1
+                    street_actions = []
+                    pending = False
+        return {0: 0, 1: 3, 2: 4, 3: 5}.get(streets_done, 5)
+
+    def _parse_betting(
+        self, actions: tuple, player: int, n_board: int
+    ) -> tuple[float, float, float, float]:
+        """Parse actions to get pot, to_call, and stack info."""
+        stacks = [self.starting_stack - 1.0, self.starting_stack - 2.0]  # After blinds
+        pot = 3.0  # SB(1) + BB(2)
+        current = 0  # SB acts first preflop
+
+        for a in actions:
+            if a == 'f':
+                break
             elif a == 'c':
-                if not r1_done and len([x for x in actions if x != 'f'][:actions.index(a)+1]) >= 2:
-                    pass
+                pass  # Check, no money change
+            elif a == 'k':
+                # Call: match opponent
+                opp = 1 - current
+                call_amt = max(0, (self.starting_stack - stacks[opp]) -
+                               (self.starting_stack - stacks[current]))
+                stacks[current] -= call_amt
+                pot += call_amt
+            elif isinstance(a, str) and a == 'a':
+                # All-in
+                allin_amt = stacks[current]
+                pot += allin_amt
+                stacks[current] = 0
+            elif isinstance(a, str) and a.startswith('r'):
+                # Raise: 'r' followed by amount or fixed
+                raise_amt = min(pot * 0.75, stacks[current])
+                pot += raise_amt
+                stacks[current] -= raise_amt
             current = 1 - current
 
-        opp = 1 - player
-        to_call = max(0, pot[opp] - pot[player])
-        total_pot = sum(pot)
-        return total_pot, to_call
+        to_call = max(0, (self.starting_stack - stacks[1-player]) -
+                       (self.starting_stack - stacks[player]))
+        return pot, to_call, stacks[player], stacks[1 - player]

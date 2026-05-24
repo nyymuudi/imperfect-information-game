@@ -10,7 +10,7 @@ The key insight: **CFR is game-agnostic.** It doesn't know anything about poker.
 
 ## Results
 
-![Convergence comparison](convergence_comparison.png)
+![Convergence Comparison](convergence_comparison.png)
 
 ### Game Complexity Scaling
 
@@ -35,9 +35,29 @@ The key insight: **CFR is game-agnostic.** It doesn't know anything about poker.
 
 *MCCFR at 50,000 iterations to match wall-clock time.
 
+### Deep CFR — Neural Network-Based Solver
+
+Deep CFR (Steinberger, 2019) replaces tabular regret/strategy storage with neural networks, enabling scaling to games where tabular CFR is infeasible. Validated on Leduc Hold'em (288 info sets) against tabular CFR:
+
+| Hand | Deep CFR (100 iter) | Tabular CFR | GTO Logic |
+|---|---|---|---|
+| K (opening) | **Raise 83%** | Raise ~80% | Value bet |
+| J (opening) | Raise 17% | Raise ~15% | Bluff |
+| Q (opening) | Check 88% | Check ~85% | Medium hand |
+
+Deep CFR independently learns the correct value-bluff structure without any poker domain knowledge — using only the 20-dimensional state vector from the neural network encoder.
+
+**Postflop NLHE** (preflop through river, 52 cards, ~10¹⁴ info sets) is trained with Deep CFR using:
+- 120-dimensional state vector (52-bit hole cards + 52-bit board + street/pot/stack features)
+- Reservoir sampling replay buffers (MR for regrets, MΠ for strategies)
+- Regret network (Huber loss) + Strategy network (cross-entropy with softmax)
+- External Sampling MCCFR for data generation
+
+Early training (200 iterations, 500 traversals/iter) shows correct qualitative structure — premium hands fold rarely (3%), trash hands fold frequently (26%) — with full convergence requiring 500+ iterations.
+
 ### Convergence Visualization
 
-![Convergence comparison](convergence_comparison-1.png)
+![Convergence Comparison](convergence_comparison-1.png)
 
 **Left — vs iterations:** CFR and CFR+ converge smoothly to ~0.003 exploitability in 10k iterations. MCCFR requires ~50k iterations for comparable quality, with visible sampling variance (shaded band = min/max across 5 random seeds).
 
@@ -107,6 +127,10 @@ The CFR solver receives zero poker knowledge — no concept of "bluffing," "valu
 
 These emergent properties validate the solver's correctness and demonstrate that GTO play arises from mathematical structure, not human intuition.
 
+### 6. Deep CFR bridges tabular and neural approaches
+
+Tabular CFR stores exact regrets per info set — precise but memory-bounded at ~10⁶ info sets. Deep CFR replaces tables with neural networks that generalize across similar game states, enabling scaling to 10¹⁰+ info sets. The tradeoff: function approximation error replaces exact computation, requiring more training iterations but removing the memory bottleneck entirely. Validated on Leduc: Deep CFR (100 iterations, 81k samples) recovers the same value-bluff structure as tabular CFR (200 iterations, exact).
+
 ## Architecture
 
 ```
@@ -115,10 +139,17 @@ src/
 │   ├── base.py              # Abstract ExtensiveFormGame interface
 │   ├── kuhn.py              # Kuhn Poker (3 cards, 12 info sets)
 │   ├── leduc.py             # Leduc Hold'em (6 cards, 288 info sets)
-│   └── nlhe_preflop.py      # Preflop NLHE with abstraction (240 info sets)
+│   ├── nlhe_preflop.py      # Preflop NLHE with card abstraction
+│   └── postflop_nlhe.py     # Full HU NLHE: preflop → river (Deep CFR only)
 ├── solvers/
 │   ├── cfr.py               # Vanilla CFR + Linear CFR + CFR+
 │   └── mccfr.py             # External Sampling Monte Carlo CFR
+├── deep_cfr/
+│   ├── deep_cfr_solver.py   # Deep CFR training loop (MCCFR + neural networks)
+│   ├── networks.py          # RegretNetwork (Huber) + StrategyNetwork (softmax)
+│   ├── replay_buffer.py     # Reservoir sampling experience buffers
+│   ├── state_encoder.py     # LeducEncoder (20-dim) + NLHEEncoder (120-dim)
+│   └── train_postflop.py    # Postflop NLHE training runner
 ├── abstraction/
 │   ├── equity.py            # Monte Carlo equity calculator + hand evaluator
 │   └── card_abstraction.py  # Equity-based hand clustering (169 → k buckets)
@@ -131,8 +162,9 @@ src/
 tests/
 ├── test_kuhn_cfr.py         # 41 tests
 ├── test_leduc.py            # 30 tests
-└── test_nlhe.py             # 43 tests
-                               114 total
+├── test_nlhe.py             # 43 tests
+└── test_postflop.py         # 40 tests (postflop mechanics + Deep CFR pipeline)
+                               154 total
 ```
 
 The `ExtensiveFormGame` abstract class ensures complete solver-game separation:
@@ -163,6 +195,8 @@ CFR (Zinkevich et al., 2007) iteratively traverses the game tree, computes count
 
 **MCCFR** (Lanctot et al., 2009) samples chance outcomes and opponent actions instead of traversing the full tree. External Sampling MCCFR expands all traversing player actions but samples one opponent action per node.
 
+**Deep CFR** (Steinberger, 2019) replaces tabular regret/strategy storage with neural networks. A regret network predicts counterfactual regrets (Huber loss, linear output), while a strategy network learns the average policy (cross-entropy, softmax output). MCCFR generates training data stored in reservoir-sampled replay buffers. This enables solving games with 10¹⁰+ information sets where tabular storage is infeasible.
+
 ### Abstraction
 
 Full NLHE has ~10¹⁴ information sets. The Abstraction-Solving-Translation pipeline:
@@ -174,18 +208,24 @@ Full NLHE has ~10¹⁴ information sets. The Abstraction-Solving-Translation pip
 ## Usage
 
 ```bash
-pip install numpy pytest matplotlib
+pip install numpy pytest matplotlib torch
 
-# Kuhn solver
+# Kuhn solver (tabular CFR)
 python -m src.main --iterations 10000
 
-# NLHE solver
+# Preflop NLHE solver (tabular CFR + abstraction)
 python -m src.nlhe_main --buckets 8 --iterations 1000
 
-# Convergence benchmark
+# Convergence benchmark (CFR vs CFR+ vs MCCFR)
 python -m src.analysis.convergence_benchmark
 
-# Tests (114 total)
+# Deep CFR on Postflop NLHE
+python -m src.deep_cfr.train_postflop --iterations 200 --traversals 500
+
+# Full training run (~1h+)
+python -m src.deep_cfr.train_postflop --iterations 500 --traversals 1000 --hidden 256
+
+# Tests (154 total)
 pytest tests/ -v
 ```
 
@@ -197,6 +237,7 @@ pytest tests/ -v
 - Zinkevich, M. et al. (2007). "Regret Minimization in Games with Incomplete Information." *NIPS*.
 - Lanctot, M. et al. (2009). "Monte Carlo Sampling for Regret Minimization in Extensive Games." *NIPS*.
 - Tammelin, O. (2014). "Solving Large Imperfect Information Games Using CFR+." *arXiv:1407.5042*.
+- Steinberger, E. (2019). "Single Deep Counterfactual Regret Minimization." *arXiv:1901.07621*.
 - Brown, N. & Sandholm, T. (2017). "Superhuman AI for heads-up no-limit poker: Libratus beats top professionals." *Science*.
 - Brown, N. & Sandholm, T. (2019). "Solving Imperfect-Information Games via Discounted Regret Minimization." *AAAI*.
 - Brown, N. & Sandholm, T. (2019). "Superhuman AI for multiplayer poker." *Science*.

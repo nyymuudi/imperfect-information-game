@@ -156,17 +156,24 @@ class DeepCFRSolver:
             Trained StrategyNetwork (the final Nash approximation).
         """
         num_players = self.game.num_players()
-        initial_states = self.game.initial_histories()
-        chance_probs = np.array([p for _, p in initial_states])
-        chance_histories = [h for h, _ in initial_states]
+
+        # Detect game type: sample_deal for large games, initial_histories for small
+        has_sample_deal = hasattr(self.game, 'sample_deal')
+        if not has_sample_deal:
+            initial_states = self.game.initial_histories()
+            chance_probs = np.array([p for _, p in initial_states])
+            chance_histories = [h for h, _ in initial_states]
 
         for t in range(1, iterations + 1):
             # ── Step 1: Generate data via MCCFR traversals ──
             for _ in range(self.traversals_per_iter):
                 for traversing_player in range(num_players):
-                    # Sample one initial state
-                    idx = self._rng.choice(len(chance_histories), p=chance_probs)
-                    self._traverse(chance_histories[idx], traversing_player)
+                    if has_sample_deal:
+                        init_h = self.game.sample_deal(self._rng)
+                    else:
+                        idx = self._rng.choice(len(chance_histories), p=chance_probs)
+                        init_h = chance_histories[idx]
+                    self._traverse(init_h, traversing_player)
 
             self.iterations += 1
 
