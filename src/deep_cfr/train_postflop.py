@@ -72,7 +72,7 @@ def main():
 
     hand_samples = [
         "AhAs", "KhKs", "AhKh", "AhKd", "QhQs",
-        "JhTs", "ThJs", "9h8h", "7h6h", "2h3d",
+        "JhTs", "9h8h", "Kd4s", "9s3d", "7h2d",
     ]
 
     for hand_str in hand_samples:

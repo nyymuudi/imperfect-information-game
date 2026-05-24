@@ -136,15 +136,49 @@ class NLHEEncoder(StateEncoder):
     ACTION_ENC = {"f": -1.0, "c": 0.0, "k": 0.25, "r": 0.5, "b": 0.75, "a": 1.0}
     HISTORY_LEN = 8
 
-    def __init__(self, starting_stack: float = 200.0):
+    _shared_equity_cache = None
+
+    def __init__(self, starting_stack: float = 200.0, equity_sims: int = 500):
         self.starting_stack = starting_stack
         self.norm = 2 * starting_stack  # Max pot ≈ 2× stacks
+        self._equity_sims = equity_sims
+        if NLHEEncoder._shared_equity_cache is None:
+            NLHEEncoder._shared_equity_cache = {}
+            self._build_equity_cache()
+        self._equity_cache = NLHEEncoder._shared_equity_cache
+
+    def _build_equity_cache(self):
+        """Pre-compute preflop equity for all 169 canonical hands."""
+        from ..abstraction.equity import (
+            canonical_hand_class, representative_hand,
+            equity_vs_random, all_169_classes,
+        )
+        rng = np.random.default_rng(42)
+        for hc in all_169_classes():
+            cards = representative_hand(hc)
+            eq = equity_vs_random(cards, num_simulations=self._equity_sims, rng=rng)
+            NLHEEncoder._shared_equity_cache[hc] = eq
+
+    def _get_preflop_equity(self, card1: int, card2: int) -> float:
+        from ..abstraction.equity import canonical_hand_class
+        hc = canonical_hand_class(card1, card2)
+        return self._equity_cache.get(hc, 0.5)
+
+    def _get_board_strength(self, hole: tuple, board: tuple) -> float:
+        if not board:
+            return 0.0
+        from ..abstraction.equity import evaluate_7card, evaluate_5card
+        all_cards = hole + board
+        if len(all_cards) >= 5:
+            val = evaluate_7card(all_cards[:7]) if len(all_cards) >= 7 else evaluate_5card(all_cards[:5])
+            return min(val / 6_000_000, 1.0)
+        return 0.0
 
     def state_size(self) -> int:
-        return 120
+        return 122
 
     def encode(self, history: History, player: int) -> np.ndarray:
-        state = np.zeros(120, dtype=np.float32)
+        state = np.zeros(122, dtype=np.float32)
 
         # Private cards (one-hot in 52-dim)
         p0_cards = history[0]  # (card1, card2)
@@ -180,6 +214,11 @@ class NLHEEncoder(StateEncoder):
                 state[112 + i] = self.ACTION_ENC.get(a, 0.0)
             else:
                 state[112 + i] = min(a / self.starting_stack, 1.0)
+
+        # Hand strength features (key for convergence)
+        state[120] = self._get_preflop_equity(my_cards[0], my_cards[1])
+        visible_board = history[2][:n_visible] if n_visible > 0 else ()
+        state[121] = self._get_board_strength(my_cards, visible_board)
 
         return state
 

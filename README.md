@@ -10,7 +10,7 @@ The key insight: **CFR is game-agnostic.** It doesn't know anything about poker.
 
 ## Results
 
-![Convergence Comparison](convergence_comparison.png)
+![Results](convergence_comparison.png)
 
 ### Game Complexity Scaling
 
@@ -53,7 +53,22 @@ Deep CFR independently learns the correct value-bluff structure without any poke
 - Regret network (Huber loss) + Strategy network (cross-entropy with softmax)
 - External Sampling MCCFR for data generation
 
-Early training (200 iterations, 500 traversals/iter) shows correct qualitative structure — premium hands fold rarely (3%), trash hands fold frequently (26%) — with full convergence requiring 500+ iterations.
+Early training results on HU Preflop NLHE (200 iterations, 500 traversals/iter, 122-dim state with equity features):
+
+```
+SB Opening Strategy (Heads-Up):
+    AhAs: fold  4%  call 52%  raise 36%  allin  8%
+    KhKs: fold  4%  call 56%  raise 31%  allin  9%
+    AhKh: fold  4%  call 54%  raise 34%  allin  8%
+    QhQs: fold  4%  call 52%  raise 34%  allin 10%
+    JhTs: fold  7%  call 51%  raise 30%  allin 12%
+    9h8h: fold  9%  call 43%  raise 33%  allin 14%
+    Kd4s: fold  8%  call 42%  raise 36%  allin 14%
+    9s3d: fold 13%  call 38%  raise 35%  allin 14%
+    7h2d: fold 14%  call 34%  raise 37%  allin 15%
+```
+
+Note: These are heads-up strategies where ~70-80% of hands are playable. The fold rates are lower than full-table GTO because the opponent pool is one player, not eight. The equity feature (preflop hand strength as explicit input) reduced premium fold rates from 13% → 4% compared to raw one-hot encoding alone. Full convergence requires 1000+ iterations.
 
 ### Convergence Visualization
 

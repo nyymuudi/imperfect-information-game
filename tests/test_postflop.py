@@ -45,7 +45,8 @@ def game():
 
 @pytest.fixture
 def encoder():
-    return NLHEEncoder(starting_stack=200.0)
+    NLHEEncoder._shared_equity_cache = None  # Reset cache for tests
+    return NLHEEncoder(starting_stack=200.0, equity_sims=100)
 
 
 # ── Tier 1: Postflop Game Mechanics ─────────────────────────────
@@ -190,15 +191,16 @@ class TestPostflopMechanics:
 class TestNLHEEncoder:
 
     def setup_method(self):
-        self.encoder = NLHEEncoder(starting_stack=200.0)
+        NLHEEncoder._shared_equity_cache = None
+        self.encoder = NLHEEncoder(starting_stack=200.0, equity_sims=100)
         self.deal = make_deal("AhKh", "QdJd", "7c8s9cTh2d")
 
     def test_state_size(self):
-        assert self.encoder.state_size() == 120
+        assert self.encoder.state_size() == 122
 
     def test_output_shape(self):
         state = self.encoder.encode(self.deal, 0)
-        assert state.shape == (120,)
+        assert state.shape == (122,)
 
     def test_output_dtype(self):
         state = self.encoder.encode(self.deal, 0)
@@ -258,7 +260,20 @@ class TestNLHEEncoder:
         p1_cards = self.deal[1]
         state = self.encoder.encode(self.deal, 0)
         for card in p1_cards:
-            assert state[card] == 0.0  # P1's cards not in P0's encoding
+            assert state[card] == 0.0
+
+    def test_equity_feature_present(self):
+        """Preflop equity feature should be non-zero."""
+        state = self.encoder.encode(self.deal, 0)
+        assert 0.0 < state[120] < 1.0  # AhKh equity ≈ 0.65
+
+    def test_premium_higher_equity_than_trash(self):
+        """AA should have higher equity feature than 23o."""
+        aa_deal = make_deal("AhAs", "QdJd", "7c8s9cTh2d")
+        trash_deal = make_deal("2h3d", "QdJd", "7c8s9cTh2d")
+        aa_state = self.encoder.encode(aa_deal, 0)
+        trash_state = self.encoder.encode(trash_deal, 0)
+        assert aa_state[120] > trash_state[120]  # P1's cards not in P0's encoding
 
 
 # ── Tier 3: Deep CFR Pipeline ──────────────────────────────────
@@ -294,7 +309,8 @@ class TestDeepCFRPipeline:
         from src.deep_cfr.deep_cfr_solver import DeepCFRSolver
 
         game = PostflopNLHE(starting_stack=200.0, max_raises_per_street=2)
-        encoder = NLHEEncoder(starting_stack=200.0)
+        NLHEEncoder._shared_equity_cache = None
+        encoder = NLHEEncoder(starting_stack=200.0, equity_sims=50)
 
         solver = DeepCFRSolver(
             game=game,
@@ -315,7 +331,7 @@ class TestDeepCFRPipeline:
         from src.deep_cfr.deep_cfr_solver import DeepCFRSolver
 
         game = PostflopNLHE(starting_stack=200.0, max_raises_per_street=2)
-        encoder = NLHEEncoder(starting_stack=200.0)
+        encoder = NLHEEncoder(starting_stack=200.0, equity_sims=50)
 
         solver = DeepCFRSolver(
             game=game,
@@ -342,7 +358,7 @@ class TestDeepCFRPipeline:
         from src.deep_cfr.deep_cfr_solver import DeepCFRSolver
 
         game = PostflopNLHE(starting_stack=200.0, max_raises_per_street=2)
-        encoder = NLHEEncoder(starting_stack=200.0)
+        encoder = NLHEEncoder(starting_stack=200.0, equity_sims=50)
 
         solver = DeepCFRSolver(
             game=game,
