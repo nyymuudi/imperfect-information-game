@@ -8,6 +8,79 @@ How does solving imperfect-information games become harder as you add cards, bet
 
 The key insight: **CFR is game-agnostic.** It doesn't know anything about poker. It operates on any extensive-form game with imperfect information through a generic interface, converging to a Nash equilibrium at a known rate. By scaling the game while holding the algorithm constant, we isolate exactly which complexity dimensions drive computational cost.
 
+## Diagrams
+
+### Algorithm Overview — Solver–Game Separation
+
+```mermaid
+graph TD
+    subgraph Games["Games — ExtensiveFormGame interface"]
+        K["KuhnPoker\n3 cards · 12 info sets\n0.97ms/iter"]
+        L["LeducHoldem\n6 cards · 288 info sets\n193ms/iter"]
+        N["PreflopNLHE\n169→8 buckets · 240 info sets\n112ms/iter"]
+        P["PostflopNLHE\n52 cards · ~10¹⁴ info sets\nDeep CFR only"]
+    end
+
+    subgraph Interface["ExtensiveFormGame"]
+        I["legal_actions(h)\napply_action(h,a)\nterminal_payoffs(h)\ninfo_set_key(h,p)"]
+    end
+
+    subgraph Solvers["Solvers"]
+        CFR["CFR / CFR+ / Linear CFR\nfull tree · O(1/T) convergence"]
+        MC["MCCFR\nsampled tree · O(1/√T) · 4.5× faster/iter"]
+        DC["DeepCFRSolver\nneural regret + strategy nets\nscales to 10¹⁰⁺ info sets"]
+    end
+
+    K & L & N & P --> Interface
+    Interface --> CFR & MC & DC
+
+    style Interface fill:#1e3a5f,color:#fff,stroke:#3b82f6
+    style Games fill:#1a2e1a,color:#fff,stroke:#22c55e
+    style Solvers fill:#2d1b1b,color:#fff,stroke:#ef4444
+```
+
+### Deep CFR Training Loop — C++ Backend
+
+```mermaid
+flowchart TD
+    A(["Start iteration t"]) --> B
+
+    B["PostflopNLHE\n200BB · 75% pot · 4 actions\nSB=1 BB=2"]
+
+    B --> C{{"use_cpp_engine?"}}
+
+    C -- "No (Python)" --> D["Python _traverse()\nrecursive · slow\n~219 trav/s"]
+    C -- "Yes (C++)" --> E
+
+    subgraph CPP["C++ NLHEMCCFREngine"]
+        E{{"iter == 1?"}}
+        E -- "Yes" --> F["run_traversals_uniform()\nuniform strategy · no network"]
+        E -- "No" --> G["run_traversals_model()\nLibTorch inline inference\nzero Python callbacks\n~927 trav/s"]
+        F & G --> H["ReservoirBuffer\nVitter Algorithm R\nregret + strategy samples"]
+    end
+
+    D --> I
+    H --> I["numpy add_batch()\nvectorised reservoir insert\nO(1) per batch"]
+
+    I --> J["train_regret_network()\nHuber loss · MPS/CPU\nlinear output"]
+
+    J --> K["export TorchScript\n_ScriptableNet wrapper\ndetach().to('cpu')"]
+
+    K --> L["load_model()\nC++ loads .pt\nready for next iteration"]
+
+    L --> M{{"t < iterations?"}}
+    M -- "Yes" --> A
+    M -- "No" --> N["train_strategy_network()\ncross-entropy · 300 epochs"]
+
+    N --> O(["Strategy ready\nquery_preflop_strategy()"])
+
+    style CPP fill:#1e3a5f,color:#fff,stroke:#3b82f6
+    style F fill:#1a2e1a,color:#fff,stroke:#22c55e
+    style G fill:#1a2e1a,color:#fff,stroke:#22c55e
+    style D fill:#2d1b1b,color:#fff,stroke:#ef4444
+```
+
+
 ## Results
 
 ![Results](convergence_comparison.png)
