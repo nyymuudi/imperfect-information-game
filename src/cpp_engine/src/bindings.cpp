@@ -89,16 +89,28 @@ PYBIND11_MODULE(cfr_engine, m) {
     m.attr("BET_ROUND2") = BET_ROUND2;
 
     // ════════════════════════════════════════════════════════════════════════
-    // NLHE
+    // NLHE — 4-action space matching Python PostflopNLHE
     // ════════════════════════════════════════════════════════════════════════
     py::enum_<NLHEAction>(m, "NLHEAction")
-        .value("NLHE_FOLD",     NLHE_FOLD)
-        .value("NLHE_CHECK",    NLHE_CHECK)
-        .value("NLHE_CALL",     NLHE_CALL)
-        .value("NLHE_BET_HALF", NLHE_BET_HALF)
-        .value("NLHE_BET_POT",  NLHE_BET_POT)
-        .value("NLHE_ALL_IN",   NLHE_ALL_IN)
+        .value("NLHE_FOLD_OR_CHECK", NLHE_FOLD_OR_CHECK)
+        .value("NLHE_CALL",          NLHE_CALL)
+        .value("NLHE_RAISE",         NLHE_RAISE)
+        .value("NLHE_ALL_IN",        NLHE_ALL_IN)
         .export_values();
+
+    // Expose int values for Python action indexing
+    m.attr("NLHE_FOLD_OR_CHECK") = (int)NLHE_FOLD_OR_CHECK;
+    m.attr("NLHE_CALL")          = (int)NLHE_CALL;
+    m.attr("NLHE_RAISE")         = (int)NLHE_RAISE;
+    m.attr("NLHE_ALL_IN")        = (int)NLHE_ALL_IN;
+
+    py::class_<NLHEGameConfig>(m, "NLHEGameConfig")
+        .def(py::init<>())
+        .def_readwrite("starting_stack", &NLHEGameConfig::starting_stack)
+        .def_readwrite("sb",             &NLHEGameConfig::sb)
+        .def_readwrite("bb",             &NLHEGameConfig::bb)
+        .def_readwrite("raise_fraction", &NLHEGameConfig::raise_fraction)
+        .def_readwrite("max_raises",     &NLHEGameConfig::max_raises);
 
     py::class_<NLHETraversalConfig>(m, "NLHETraversalConfig")
         .def(py::init<>())
@@ -108,11 +120,11 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def_readwrite("strategy_capacity", &NLHETraversalConfig::strategy_capacity)
         .def_readwrite("collect_strategy",  &NLHETraversalConfig::collect_strategy)
         .def_readwrite("seed",              &NLHETraversalConfig::seed)
-        .def_readwrite("max_actions",       &NLHETraversalConfig::max_actions);
+        .def_readwrite("max_actions",       &NLHETraversalConfig::max_actions)
+        .def_readwrite("game_cfg",          &NLHETraversalConfig::game_cfg);
 
     py::class_<NLHEMCCFREngine>(m, "NLHEMCCFREngine")
         .def(py::init<const NLHETraversalConfig&>())
-        // Callback-based (Python strategy fn)
         .def("run_traversals",
              &NLHEMCCFREngine::run_traversals,
              py::arg("traversing_player"), py::arg("strategy_fn"),
@@ -121,25 +133,20 @@ PYBIND11_MODULE(cfr_engine, m) {
              &NLHEMCCFREngine::run_traversals_uniform,
              py::arg("traversing_player"),
              py::call_guard<py::gil_scoped_release>())
-        // LibTorch-based (zero Python callbacks)
         .def("load_model",
              &NLHEMCCFREngine::load_model,
-             py::arg("path"),
-             "Load TorchScript regret network. Enables run_traversals_model().")
+             py::arg("path"))
         .def("model_loaded",     &NLHEMCCFREngine::model_loaded)
         .def("run_traversals_model",
              &NLHEMCCFREngine::run_traversals_model,
              py::arg("traversing_player"),
-             py::call_guard<py::gil_scoped_release>(),
-             "Run traversals using LibTorch model — no Python callbacks, no GIL.")
-        // Buffer management
+             py::call_guard<py::gil_scoped_release>())
         .def("clear_buffers",          &NLHEMCCFREngine::clear_buffers)
         .def("set_iteration",          &NLHEMCCFREngine::set_iteration)
         .def("export_regret_buffer",   &NLHEMCCFREngine::export_regret_buffer)
         .def("export_strategy_buffer", &NLHEMCCFREngine::export_strategy_buffer)
         .def("regret_buffer_size",     &NLHEMCCFREngine::regret_buffer_size)
         .def("strategy_buffer_size",   &NLHEMCCFREngine::strategy_buffer_size)
-        // Strategy evaluation
         .def("load_strategy_model",    &NLHEMCCFREngine::load_strategy_model)
         .def("strategy_model_loaded",  &NLHEMCCFREngine::strategy_model_loaded)
         .def("query_preflop_strategy", &NLHEMCCFREngine::query_preflop_strategy,
@@ -149,11 +156,11 @@ PYBIND11_MODULE(cfr_engine, m) {
              py::arg("board"), py::arg("pot"), py::arg("to_call"),
              py::arg("my_stack"));
 
-    m.attr("NLHE_STACK")         = NLHE_STACK;
-    m.attr("NLHE_BB")            = NLHE_BB;
-    m.attr("NLHE_DECK_SIZE")     = NLHE_DECK_SIZE;
-    m.attr("NLHE_STATE_SIZE")    = NLHEStateEncoder::STATE_SIZE;
-    m.attr("TORCH_AVAILABLE")    = bool(
+    m.attr("NLHE_STACK")      = NLHE_STACK;
+    m.attr("NLHE_BB")         = NLHE_BB;
+    m.attr("NLHE_DECK_SIZE")  = NLHE_DECK_SIZE;
+    m.attr("NLHE_STATE_SIZE") = NLHEStateEncoder::STATE_SIZE;
+    m.attr("TORCH_AVAILABLE") = bool(
 #ifdef CFR_TORCH_AVAILABLE
         true
 #else

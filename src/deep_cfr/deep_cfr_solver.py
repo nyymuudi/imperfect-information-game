@@ -51,11 +51,15 @@ class DeepCFRSolver:
             if engine_available():
                 from ..games.postflop_nlhe import PostflopNLHE
                 if isinstance(self.game, PostflopNLHE):
+                    # Pass game parameters to C++ engine so it matches Python exactly
                     self._cpp = NLHECppBackend(
                         n_traversals=self.traversals_per_iter,
                         regret_capacity=self.buffer_capacity,
                         strategy_capacity=self.buffer_capacity,
                         device=self.device,
+                        starting_stack=self.game.starting_stack,
+                        raise_fraction=self.game.raise_fractions[0],
+                        max_raises=self.game.max_raises_per_street,
                     )
                 else:
                     self._cpp = CppMCCFRBackend(
@@ -106,15 +110,9 @@ class DeepCFRSolver:
             new_h = self.game.apply_action(history, actions[action_idx])
             return self._traverse(new_h, traversing_player)
 
-    # C++ 6-action → Python 4-slot mapping:
-    # FOLD(0)→0, CHECK(1)→1, CALL(2)→1, BET_HALF(3)→2, BET_POT(4)→2, ALL_IN(5)→3
-    _CPP_TO_PY = np.array([0, 1, 1, 2, 2, 3], dtype=np.int64)
-
-    def _remap_actions(self, a_np: np.ndarray) -> np.ndarray:
-        """Map C++ 6-action indices to Python 4-slot indices."""
-        return self._CPP_TO_PY[np.clip(a_np, 0, 5)]
-
     def _run_cpp_iteration(self) -> None:
+        # C++ uses 4-action enum (0=FOLD_OR_CHECK, 1=CALL, 2=RAISE, 3=ALL_IN)
+        # matching Python slots directly — no remapping needed.
         reg_exp, str_exp = self._cpp.run_iteration(
             self.iterations,
             regret_net=self.regret_net if self.iterations > 0 else None,
@@ -124,13 +122,12 @@ class DeepCFRSolver:
         if len(reg_exp) > 0:
             X, actions, values = self._cpp.to_tensors(reg_exp)
             X_np = X.cpu().numpy()
-            a_np = self._remap_actions(actions.cpu().numpy())
+            a_np = actions.cpu().numpy()
             v_np = values.cpu().numpy().astype(np.float32)
             mask = a_np < self.max_actions
             X_np, a_np, v_np = X_np[mask], a_np[mask], v_np[mask]
             n = len(X_np)
             if n > 0:
-                # Average regrets when multiple C++ actions map to same slot
                 reg_mat = np.zeros((n, self.max_actions), dtype=np.float32)
                 np.add.at(reg_mat, (np.arange(n), a_np), v_np)
                 self.regret_buffer.add_batch(X_np, reg_mat, np.full(n, w, dtype=np.float32))
@@ -138,13 +135,12 @@ class DeepCFRSolver:
         if len(str_exp) > 0:
             X, actions, values = self._cpp.to_tensors(str_exp)
             X_np = X.cpu().numpy()
-            a_np = self._remap_actions(actions.cpu().numpy())
+            a_np = actions.cpu().numpy()
             v_np = values.cpu().numpy().astype(np.float32)
             mask = a_np < self.max_actions
             X_np, a_np, v_np = X_np[mask], a_np[mask], v_np[mask]
             n = len(X_np)
             if n > 0:
-                # Sum probabilities when multiple C++ actions map to same slot
                 str_mat = np.zeros((n, self.max_actions), dtype=np.float32)
                 np.add.at(str_mat, (np.arange(n), a_np), v_np)
                 self.strategy_buffer.add_batch(X_np, str_mat, np.full(n, w, dtype=np.float32))

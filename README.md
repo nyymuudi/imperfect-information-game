@@ -150,21 +150,26 @@ Tabular CFR stores exact regrets per info set — precise but memory-bounded at 
 
 The raw traversal speedup (51.6× on Leduc, ~2× end-to-end on NLHE) confirms that Python loop overhead is significant. However, two additional bottlenecks emerged: (1) network inference callback overhead completely negates traversal gains when Python is called per node — LibTorch is mandatory, not optional; (2) buffer insertion (O(N) Python iterations over 50–100k samples/iteration) requires vectorised numpy batch operations to avoid dominating wall time. Both must be addressed simultaneously for meaningful speedup on NLHE-scale games.
 
+### 8. Game–solver semantic mismatch silently corrupts training
+
+The C++ traversal engine initially used 6 actions (fold, check, call, bet-half, bet-pot, all-in) with a fixed 6→4 projection mapping to Python's 4-slot network output. This introduced a systematic training error: two distinct C++ actions (check and call) both mapped to network slot 1, and two bet sizes (50%, 100% pot) both mapped to slot 2. The result was that premium hands like AA converged to 99% passive play (they "learned" that the call/check slot was dominant) despite the correct strategy being aggressive. Fixing the engine to use the identical 4-action space and identical game parameters (200BB stack, 75% pot raise, max 2 raises/street) produced a 2.25× additional throughput gain as a side-effect — a smaller game tree with 4 branches instead of 6.
+
 ## C++ MCCFR Engine with LibTorch
 
-Deep CFR training is bottlenecked by Python's MCCFR traversal loop — thousands of recursive game-tree calls per iteration, each with function-call overhead that CPython cannot eliminate. We replaced the traversal with a C++ engine exposed via pybind11, achieving a **51.6× raw traversal speedup** on Leduc Hold'em and **up to 411 traversals/second** on full NLHE.
+Deep CFR training is bottlenecked by Python's MCCFR traversal loop — thousands of recursive game-tree calls per iteration, each with function-call overhead that CPython cannot eliminate. We replaced the traversal with a C++ engine exposed via pybind11, achieving a **51.6× raw traversal speedup** on Leduc Hold'em and **up to 927 traversals/second** on full NLHE.
 
 ### Performance — HU Postflop NLHE (30 iterations, 500 traversals/iter)
 
-| Backend | Time | Peak trav/s | Strategy evaluation |
+| Backend | Time | Peak trav/s | Notes |
 |---|---|---|---|
-| Python (baseline) | 137s | 219 | Python `get_strategy` |
-| C++ + Python callbacks | 265s | 113 | Python |
-| C++ + LibTorch (CPU train) | 119s | 251 | Python |
-| C++ + LibTorch (MPS train) | 119s | 253 | Python |
-| **C++ + LibTorch + C++ eval** | **117s** | **411** | **C++ `query_strategy`** |
+| Python (baseline) | 137s | 219 | Pure Python MCCFR |
+| C++ + Python callbacks | 265s | 113 | GIL overhead dominates |
+| C++ + LibTorch (CPU) | 119s | 251 | Zero Python callbacks |
+| C++ + LibTorch (MPS) | 119s | 253 | Apple Silicon GPU |
+| C++ + LibTorch + C++ eval | 117s | 411 | C++ strategy evaluation |
+| **C++ + synced game** | **49s** | **927** | **4-action, 200BB, 75% pot** |
 
-The callback version (265s) was *slower* than Python despite a 50× traversal speedup — each tree node required a Python GIL round-trip for network inference, which dominated. LibTorch eliminates this: the regret network is exported as TorchScript, loaded into C++, and called inline during traversal with zero Python involvement.
+The final jump from 411 → 927 trav/s came entirely from fixing the game–solver mismatch: a 4-action tree has fewer branches per node than a 6-action tree, and eliminating the projection mapping layer removed per-sample overhead.
 
 ### Design decisions
 
@@ -172,20 +177,30 @@ The callback version (265s) was *slower* than Python despite a 50× traversal sp
 
 **Vitter reservoir sampling in C++.** The Python `ReservoirBuffer.add()` was called once per sample, O(N) Python iterations per iteration. The C++ engine accumulates samples internally and exports flat float arrays; the Python side uses vectorised numpy batch-insert (`add_batch`) with a single scatter operation.
 
-**NLHEStateEncoder in C++.** The 122-dim state vector (52-bit hole cards + 52-bit board + street + pot/stack features + preflop equity + board strength) is computed from raw `NLHEState` structs during traversal — no Python encoding, no string parsing. The preflop equity is approximated via a closed-form rank/suit formula rather than Monte Carlo lookup, reducing inference latency.
+**NLHEStateEncoder in C++.** The 122-dim state vector (52-bit hole cards + 52-bit board + street + pot/stack features + preflop equity + board strength) is computed from raw `NLHEState` structs during traversal — no Python encoding, no string parsing. Feature layout matches Python `NLHEEncoder` exactly, including opp_stack at [111] and equity at [120-121].
 
 **CUDA kernels (GPU hardware required).** `cuda/reservoir_buffer.cu` implements two kernels: `reservoir_indices_kernel` (parallel Vitter sampling using cuRAND) and `accumulate_regrets_kernel` (atomic-add regret accumulation into a flat table). Both activate automatically when NVCC is present at build time via `#ifdef CFR_CUDA_AVAILABLE`.
 
-### Action space mapping
+**Configurable game parameters.** `NLHEGameConfig` carries stack size, blind sizes, raise fraction, and max raises per street. These are passed from `PostflopNLHE` to the C++ engine at construction, ensuring identical game semantics in both environments:
 
-The C++ NLHE engine exposes 6 actions (FOLD, CHECK, CALL, BET_HALF, BET_POT, ALL_IN) while the Python `PostflopNLHE` game uses 4 context-dependent actions. Training samples are remapped with a fixed projection:
-
+```python
+self._cpp = NLHECppBackend(
+    starting_stack=self.game.starting_stack,     # 200.0
+    raise_fraction=self.game.raise_fractions[0], # 0.75
+    max_raises=self.game.max_raises_per_street,  # 2
+)
 ```
-FOLD(0) → slot 0    CHECK(1) → slot 1    CALL(2) → slot 1
-BET_HALF(3) → slot 2    BET_POT(4) → slot 2    ALL_IN(5) → slot 3
-```
 
-The same mapping is applied in `model_strategy()` (C++) so LibTorch inference produces correct 4-slot probabilities despite the 6-action game tree.
+### Action space
+
+4 context-dependent actions match Python `PostflopNLHE` exactly:
+
+| Slot | No bet | Facing bet | Python action |
+|---|---|---|---|
+| 0 | check | fold | `"c"` / `"f"` |
+| 1 | — | call | `"k"` |
+| 2 | raise (75% pot) | raise (75% pot) | `"r"` |
+| 3 | all-in | all-in | `"a"` |
 
 ### Strategy evaluation in C++
 
@@ -196,10 +211,8 @@ After training, the strategy network is exported as TorchScript and loaded into 
 _export_for_libtorch(solver.strategy_net).save("/tmp/strategy.pt")
 solver._cpp._engine.load_strategy_model("/tmp/strategy.pt")
 probs = solver._cpp._engine.query_preflop_strategy(card1, card2)
-# → [fold%, check/call%, raise%, all-in%]
+# → [fold/check%, call%, raise%, all-in%]
 ```
-
-This replaces `solver.get_strategy(h, 0)` + `game.legal_actions(h)` entirely — no history parsing, no Python game object.
 
 ## Architecture
 
@@ -238,20 +251,20 @@ src/
 │   ├── include/
 │   │   ├── leduc_game.hpp   # Leduc: state, transitions, hand eval, info set key
 │   │   ├── mccfr.hpp        # ReservoirBuffer<T> (Vitter 1985) + LeducMCCFREngine
-│   │   ├── nlhe_game.hpp    # NLHE: 52-card, 4 streets, 7-card hand evaluator
+│   │   ├── nlhe_game.hpp    # NLHE: NLHEGameConfig + 4-action enum + NLHEState
 │   │   ├── nlhe_mccfr.hpp   # NLHEMCCFREngine + strategy model queries
 │   │   └── torch_model.hpp  # TorchModel (LibTorch) + NLHEStateEncoder (122-dim)
 │   ├── src/
 │   │   ├── leduc_game.cpp
 │   │   ├── mccfr.cpp
-│   │   ├── nlhe_game.cpp
-│   │   ├── nlhe_mccfr.cpp
-│   │   ├── torch_model.cpp
+│   │   ├── nlhe_game.cpp    # 4-action game tree, 75% pot sizing, configurable stack
+│   │   ├── nlhe_mccfr.cpp   # Direct 4-slot inference, no action remapping
+│   │   ├── torch_model.cpp  # Encoder matching Python NLHEEncoder exactly
 │   │   └── bindings.cpp     # pybind11 → Python API
 │   ├── cuda/
 │   │   └── reservoir_buffer.cu  # Vitter sampling kernel + regret accumulation
 │   └── tests/
-│       └── test_game.cpp    # 7 standalone C++ tests (no framework)
+│       └── test_game.cpp    # Standalone C++ tests
 │
 ├── main.py                  # Kuhn CLI runner
 └── nlhe_main.py             # NLHE CLI runner
@@ -286,22 +299,23 @@ Any game implementing this interface can be solved by any solver — the solver 
 
 ```
 PostflopNLHE game
-       │
+       │  (starting_stack, raise_fractions, max_raises_per_street)
        ▼
 DeepCFRSolver.solve()
        │
        ├─ use_cpp_engine=False ──► Python _traverse() [recursive, slow]
        │
        └─ use_cpp_engine=True ───► NLHECppBackend._run_iteration()
-                                          │
+                                          │  NLHEGameConfig synced from Python
                                           ▼
                                NLHEMCCFREngine (C++)
                                   ├─ iter 1: run_traversals_uniform()
-                                  │          [no network, uniform strategy]
+                                  │          [uniform strategy, no network]
                                   │
                                   └─ iter 2+: run_traversals_model()
                                              [LibTorch regret network,
-                                              zero Python callbacks]
+                                              zero Python callbacks,
+                                              4-action tree]
                                           │
                                           ▼
                                BufferExport → numpy add_batch()
@@ -353,11 +367,11 @@ python3 -m src.nlhe_main --buckets 8 --iterations 1000
 # Convergence benchmark (CFR vs CFR+ vs MCCFR)
 python3 -m src.analysis.convergence_benchmark
 
-# Deep CFR on Postflop NLHE (C++ engine, MPS if available)
-python3 -m src.deep_cfr.train_postflop --iterations 200 --traversals 500
+# Deep CFR on Postflop NLHE — quick test (49s, 927 trav/s peak)
+python3 -m src.deep_cfr.train_postflop --iterations 30 --traversals 500 --hidden 128
 
 # Full training run (~1h+)
-python3 -m src.deep_cfr.train_postflop --iterations 500 --traversals 1000 --hidden 256
+python3 -m src.deep_cfr.train_postflop --iterations 500 --traversals 1000 --hidden 256 --buffer 500000
 
 # Tests (154 total)
 pytest tests/ -v
