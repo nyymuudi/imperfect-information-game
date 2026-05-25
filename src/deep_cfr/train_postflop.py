@@ -3,29 +3,48 @@
 Train Deep CFR on Postflop Heads-Up NLHE.
 
 Usage:
-    python -m src.deep_cfr.train_postflop [--iterations N] [--traversals T]
+    python3 -m src.deep_cfr.train_postflop [--iterations N] [--traversals T]
 """
 
 import argparse
 import time
 import torch
+import torch.nn as nn
 import numpy as np
 from src.games.postflop_nlhe import PostflopNLHE
 from src.deep_cfr.deep_cfr_solver import DeepCFRSolver
 from src.deep_cfr.state_encoder import NLHEEncoder
-from src.abstraction.equity import card_to_str
+
+
+class _ScriptableNet(nn.Module):
+    """Single-argument wrapper — strips mask param for TorchScript/LibTorch export."""
+    def __init__(self, layers: nn.Sequential):
+        super().__init__()
+        self.layers = layers
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
+
+def _export_for_libtorch(net) -> "torch.jit.ScriptModule":
+    """Export a RegretNetwork or StrategyNetwork for C++ LibTorch inference."""
+    cpu_layers = nn.Sequential(*list(net.net.children()))
+    state = {k: v.detach().to("cpu") for k, v in cpu_layers.state_dict().items()}
+    cpu_layers.load_state_dict(state, assign=True)
+    wrapper = _ScriptableNet(cpu_layers)
+    wrapper.eval()
+    return torch.jit.script(wrapper)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Deep CFR on Postflop NLHE")
     parser.add_argument("--iterations", "-n", type=int, default=50)
     parser.add_argument("--traversals", "-t", type=int, default=200)
-    parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--buffer", type=int, default=200000)
-    parser.add_argument("--stack", type=float, default=200.0)
+    parser.add_argument("--hidden",     type=int, default=128)
+    parser.add_argument("--buffer",     type=int, default=200000)
+    parser.add_argument("--stack",      type=float, default=200.0)
     args = parser.parse_args()
 
-    game = PostflopNLHE(starting_stack=args.stack, max_raises_per_street=2)
+    game    = PostflopNLHE(starting_stack=args.stack, max_raises_per_street=2)
     encoder = NLHEEncoder(starting_stack=args.stack)
 
     solver = DeepCFRSolver(
@@ -37,6 +56,8 @@ def main():
         train_epochs=30,
         train_batch=256,
         traversals_per_iter=args.traversals,
+        use_cpp_engine=True,
+        device="mps" if torch.backends.mps.is_available() else "cpu",
         lr=1e-3,
     )
 
@@ -54,7 +75,7 @@ def main():
               f"MΠ={len(s.strategy_buffer):>7,}, "
               f"time={elapsed:>6.1f}s, {rate:.0f} trav/s")
 
-    strategy_net = solver.solve(
+    solver.solve(
         iterations=args.iterations,
         callback=cb,
         callback_freq=max(1, args.iterations // 20),
@@ -64,8 +85,16 @@ def main():
     print(f"\nCompleted in {elapsed:.1f}s")
     print(f"Samples: MR={len(solver.regret_buffer):,}, MΠ={len(solver.strategy_buffer):,}\n")
 
-    # ── Sample strategies ──
-    rng = np.random.default_rng(42)
+    # ── Export strategy network → LibTorch ────────────────────────────────────
+    strategy_path = "/tmp/cfr_strategy_net.pt"
+    _export_for_libtorch(solver.strategy_net).save(strategy_path)
+    solver._cpp._engine.load_strategy_model(strategy_path)
+    print(f"Strategy model loaded into C++ engine.")
+
+    # ── Evaluate via C++ ──────────────────────────────────────────────────────
+    # Slots: [0]=fold/check, [1]=call/check, [2]=raise, [3]=all-in
+    ACTION_NAMES = ["f", "k", "r", "a"]
+
     print("=" * 60)
     print("PREFLOP OPENING STRATEGIES (SB, sample hands)")
     print("=" * 60)
@@ -76,43 +105,19 @@ def main():
     ]
 
     for hand_str in hand_samples:
-        c1, c2 = hand_str[:2], hand_str[2:4]
-        card1, card2 = (
-            _rank_suit_to_card(c1),
-            _rank_suit_to_card(c2),
-        )
-        # Build a deal with these cards
-        used = {card1, card2}
-        board = []
-        for c in range(52):
-            if c not in used and len(board) < 5:
-                board.append(c)
-                used.add(c)
-            if c not in used and len(board) >= 5:
-                opp = [c]
-                used.add(c)
-                break
-        # Find second opp card
-        for c in range(52):
-            if c not in used:
-                opp.append(c)
-                break
+        card1 = _rank_suit_to_card(hand_str[:2])
+        card2 = _rank_suit_to_card(hand_str[2:4])
+        probs = solver._cpp._engine.query_preflop_strategy(card1, card2)
+        parts = [f"{a}={probs[i]:.0%}" for i, a in enumerate(ACTION_NAMES)]
+        print(f"  {hand_str:>6s}: {'  '.join(parts)}")
 
-        h = ((card1, card2), tuple(opp), tuple(board))
-        strat = solver.get_strategy(h, 0)
-        actions = game.legal_actions(h)
-        parts = [f"{a}={strat[i]:.0%}" for i, a in enumerate(actions)]
-        name = f"{card_to_str(card1)}{card_to_str(card2)}"
-        print(f"  {name:>6s}: {'  '.join(parts)}")
-
-    # Save model
+    # Save
     torch.save(solver.strategy_net.state_dict(), "deep_cfr_strategy.pt")
-    torch.save(solver.regret_net.state_dict(), "deep_cfr_regret.pt")
+    torch.save(solver.regret_net.state_dict(),   "deep_cfr_regret.pt")
     print(f"\nModels saved: deep_cfr_strategy.pt, deep_cfr_regret.pt")
 
 
 def _rank_suit_to_card(s: str) -> int:
-    """Convert 'Ah' → card int."""
     ranks = "23456789TJQKA"
     suits = "cdhs"
     return ranks.index(s[0]) * 4 + suits.index(s[1])

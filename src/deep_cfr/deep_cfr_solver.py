@@ -3,21 +3,6 @@ Deep CFR Solver.
 
 Reference: Steinberger, E. (2019). "Single Deep Counterfactual
 Regret Minimization." arXiv:1901.07621.
-
-Replaces tabular regret/strategy storage with neural networks,
-enabling scaling to games with 10^10+ information sets where
-tabular CFR is infeasible.
-
-Training loop:
-    1. Run MCCFR traversals using regret network for strategy
-    2. Store computed regrets in MR buffer
-    3. Store current strategies in MΠ buffer
-    4. Periodically retrain regret network from MR
-    5. After all iterations: train strategy network from MΠ
-
-The regret network replaces the regret table as the strategy
-source during traversal. The strategy network is the final
-output — the trained Nash equilibrium approximation.
 """
 
 import numpy as np
@@ -32,109 +17,137 @@ from .networks import (
     RegretNetwork, StrategyNetwork,
     train_regret_network, train_strategy_network,
 )
+from .cpp_backend import CppMCCFRBackend, NLHECppBackend, engine_available
 
 
 @dataclass
 class DeepCFRSolver:
-    """
-    Deep CFR solver for any ExtensiveFormGame.
-    
-    Uses neural networks instead of regret tables,
-    enabling scaling beyond tabular CFR's memory limits.
-    """
     game: ExtensiveFormGame
     encoder: StateEncoder
-    max_actions: int = 5          # Maximum legal actions at any node
+    max_actions: int = 5
     buffer_capacity: int = 500000
     hidden_size: int = 256
     train_epochs: int = 100
     train_batch: int = 256
     lr: float = 1e-3
-    traversals_per_iter: int = 100  # MCCFR traversals per training step
+    traversals_per_iter: int = 100
+    use_cpp_engine: bool = False
+    device: str = "cpu"
 
     def __post_init__(self):
         state_sz = self.encoder.state_size()
 
-        # Neural networks
-        self.regret_net = RegretNetwork(state_sz, self.max_actions, self.hidden_size)
-        self.strategy_net = StrategyNetwork(state_sz, self.max_actions, self.hidden_size)
+        self.regret_net   = RegretNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
+        self.strategy_net = StrategyNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
 
-        # Replay buffers
-        self.regret_buffer = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions)
+        self.regret_buffer   = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions)
         self.strategy_buffer = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions)
 
         self.iterations = 0
         self._rng = np.random.default_rng(42)
 
-    def _get_regret_strategy(self, state: np.ndarray, num_actions: int) -> np.ndarray:
-        """
-        Query regret network and apply regret matching.
-        
-        Returns probability distribution over actions.
-        """
-        with torch.no_grad():
-            s = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-            regrets = self.regret_net(s).squeeze(0).numpy()[:num_actions]
+        self._cpp = None
+        if self.use_cpp_engine:
+            if engine_available():
+                from ..games.postflop_nlhe import PostflopNLHE
+                if isinstance(self.game, PostflopNLHE):
+                    self._cpp = NLHECppBackend(
+                        n_traversals=self.traversals_per_iter,
+                        regret_capacity=self.buffer_capacity,
+                        strategy_capacity=self.buffer_capacity,
+                        device=self.device,
+                    )
+                else:
+                    self._cpp = CppMCCFRBackend(
+                        n_traversals=self.traversals_per_iter,
+                        regret_capacity=self.buffer_capacity,
+                        strategy_capacity=self.buffer_capacity,
+                        device=self.device,
+                    )
+            else:
+                import warnings
+                warnings.warn(
+                    "use_cpp_engine=True mutta cfr_engine.so ei löydy.",
+                    RuntimeWarning,
+                )
 
-        # Regret matching: proportional to positive regrets
+    def _get_regret_strategy(self, state: np.ndarray, num_actions: int) -> np.ndarray:
+        with torch.no_grad():
+            s = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            regrets = self.regret_net(s).squeeze(0).cpu().numpy()[:num_actions]
         positive = np.maximum(regrets, 0)
         total = positive.sum()
         if total > 0:
             return positive / total
         return np.ones(num_actions) / num_actions
 
-    def _traverse(
-        self,
-        history: History,
-        traversing_player: int,
-    ) -> float:
-        """
-        External sampling MCCFR traversal using regret network.
-        
-        Same structure as tabular MCCFR but:
-        - Strategy comes from regret network (not table lookup)
-        - Computed regrets stored in MR buffer
-        - Current strategy stored in MΠ buffer
-        """
+    def _traverse(self, history: History, traversing_player: int) -> float:
         if self.game.is_terminal(history):
             return self.game.terminal_payoffs(history)[traversing_player]
 
-        player = self.game.current_player(history)
-        actions = self.game.legal_actions(history)
+        player      = self.game.current_player(history)
+        actions     = self.game.legal_actions(history)
         num_actions = len(actions)
-
-        # Encode state from current player's perspective
-        state = self.encoder.encode(history, player)
-        strategy = self._get_regret_strategy(state, num_actions)
+        state       = self.encoder.encode(history, player)
+        strategy    = self._get_regret_strategy(state, num_actions)
 
         if player == traversing_player:
-            # Store current strategy in MΠ
-            self.strategy_buffer.add(
-                state, strategy, float(self.iterations + 1)
-            )
-
-            # Expand all actions (external sampling)
+            self.strategy_buffer.add(state, strategy, float(self.iterations + 1))
             action_values = np.zeros(num_actions)
             for i, action in enumerate(actions):
                 new_h = self.game.apply_action(history, action)
                 action_values[i] = self._traverse(new_h, traversing_player)
-
-            # Compute regrets
             node_value = (strategy * action_values).sum()
             regrets = action_values - node_value
-
-            # Store regrets in MR
-            self.regret_buffer.add(
-                state, regrets, float(self.iterations + 1)
-            )
-
+            self.regret_buffer.add(state, regrets, float(self.iterations + 1))
             return node_value
-
         else:
-            # Opponent: sample one action
             action_idx = self._rng.choice(num_actions, p=strategy)
             new_h = self.game.apply_action(history, actions[action_idx])
             return self._traverse(new_h, traversing_player)
+
+    # C++ 6-action → Python 4-slot mapping:
+    # FOLD(0)→0, CHECK(1)→1, CALL(2)→1, BET_HALF(3)→2, BET_POT(4)→2, ALL_IN(5)→3
+    _CPP_TO_PY = np.array([0, 1, 1, 2, 2, 3], dtype=np.int64)
+
+    def _remap_actions(self, a_np: np.ndarray) -> np.ndarray:
+        """Map C++ 6-action indices to Python 4-slot indices."""
+        return self._CPP_TO_PY[np.clip(a_np, 0, 5)]
+
+    def _run_cpp_iteration(self) -> None:
+        reg_exp, str_exp = self._cpp.run_iteration(
+            self.iterations,
+            regret_net=self.regret_net if self.iterations > 0 else None,
+        )
+        w = float(self.iterations + 1)
+
+        if len(reg_exp) > 0:
+            X, actions, values = self._cpp.to_tensors(reg_exp)
+            X_np = X.cpu().numpy()
+            a_np = self._remap_actions(actions.cpu().numpy())
+            v_np = values.cpu().numpy().astype(np.float32)
+            mask = a_np < self.max_actions
+            X_np, a_np, v_np = X_np[mask], a_np[mask], v_np[mask]
+            n = len(X_np)
+            if n > 0:
+                # Average regrets when multiple C++ actions map to same slot
+                reg_mat = np.zeros((n, self.max_actions), dtype=np.float32)
+                np.add.at(reg_mat, (np.arange(n), a_np), v_np)
+                self.regret_buffer.add_batch(X_np, reg_mat, np.full(n, w, dtype=np.float32))
+
+        if len(str_exp) > 0:
+            X, actions, values = self._cpp.to_tensors(str_exp)
+            X_np = X.cpu().numpy()
+            a_np = self._remap_actions(actions.cpu().numpy())
+            v_np = values.cpu().numpy().astype(np.float32)
+            mask = a_np < self.max_actions
+            X_np, a_np, v_np = X_np[mask], a_np[mask], v_np[mask]
+            n = len(X_np)
+            if n > 0:
+                # Sum probabilities when multiple C++ actions map to same slot
+                str_mat = np.zeros((n, self.max_actions), dtype=np.float32)
+                np.add.at(str_mat, (np.arange(n), a_np), v_np)
+                self.strategy_buffer.add_batch(X_np, str_mat, np.full(n, w, dtype=np.float32))
 
     def solve(
         self,
@@ -142,44 +155,30 @@ class DeepCFRSolver:
         callback: Optional[callable] = None,
         callback_freq: int = 10,
     ) -> StrategyNetwork:
-        """
-        Run Deep CFR training loop.
-        
-        Args:
-            iterations: Number of CFR meta-iterations.
-                Each meta-iteration does multiple MCCFR traversals
-                then retrains the regret network.
-            callback: Optional fn(solver, iteration) for monitoring.
-            callback_freq: How often to call callback.
-            
-        Returns:
-            Trained StrategyNetwork (the final Nash approximation).
-        """
         num_players = self.game.num_players()
-
-        # Detect game type: sample_deal for large games, initial_histories for small
         has_sample_deal = hasattr(self.game, 'sample_deal')
         if not has_sample_deal:
-            initial_states = self.game.initial_histories()
-            chance_probs = np.array([p for _, p in initial_states])
+            initial_states   = self.game.initial_histories()
+            chance_probs     = np.array([p for _, p in initial_states])
             chance_histories = [h for h, _ in initial_states]
 
         for t in range(1, iterations + 1):
-            # ── Step 1: Generate data via MCCFR traversals ──
-            for _ in range(self.traversals_per_iter):
-                for traversing_player in range(num_players):
-                    if has_sample_deal:
-                        init_h = self.game.sample_deal(self._rng)
-                    else:
-                        idx = self._rng.choice(len(chance_histories), p=chance_probs)
-                        init_h = chance_histories[idx]
-                    self._traverse(init_h, traversing_player)
+            if self._cpp is not None:
+                self._run_cpp_iteration()
+            else:
+                for _ in range(self.traversals_per_iter):
+                    for traversing_player in range(num_players):
+                        if has_sample_deal:
+                            init_h = self.game.sample_deal(self._rng)
+                        else:
+                            idx    = self._rng.choice(len(chance_histories), p=chance_probs)
+                            init_h = chance_histories[idx]
+                        self._traverse(init_h, traversing_player)
 
             self.iterations += 1
 
-            # ── Step 2: Retrain regret network ──
             if len(self.regret_buffer) >= self.train_batch:
-                loss = train_regret_network(
+                train_regret_network(
                     self.regret_net, self.regret_buffer,
                     epochs=self.train_epochs,
                     batch_size=self.train_batch,
@@ -189,7 +188,6 @@ class DeepCFRSolver:
             if callback and t % callback_freq == 0:
                 callback(self, t)
 
-        # ── Step 3: Train final strategy network ──
         print(f"Training strategy network from {len(self.strategy_buffer)} samples...")
         if len(self.strategy_buffer) >= self.train_batch:
             train_strategy_network(
@@ -202,19 +200,11 @@ class DeepCFRSolver:
         return self.strategy_net
 
     def get_strategy(self, history: History, player: int) -> np.ndarray:
-        """
-        Get the trained strategy for a game state.
-        
-        Uses the strategy network (final output).
-        """
-        state = self.encoder.encode(history, player)
+        state       = self.encoder.encode(history, player)
         num_actions = len(self.game.legal_actions(history))
-
         with torch.no_grad():
-            s = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-            # Create action mask
-            mask = torch.zeros(self.max_actions)
+            s    = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            mask = torch.zeros(self.max_actions).to(self.device)
             mask[:num_actions] = 1.0
-            probs = self.strategy_net(s, mask).squeeze(0).numpy()
-
+            probs = self.strategy_net(s, mask).squeeze(0).cpu().numpy()
         return probs[:num_actions]

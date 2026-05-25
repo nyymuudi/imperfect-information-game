@@ -100,9 +100,10 @@ def train_regret_network(
     for epoch in range(epochs):
         states, targets, weights = buffer.sample_batch(batch_size)
 
-        s = torch.tensor(states, dtype=torch.float32)
-        t = torch.tensor(targets, dtype=torch.float32)
-        w = torch.tensor(weights, dtype=torch.float32)
+        device = next(network.parameters()).device
+        s = torch.tensor(states, dtype=torch.float32).to(device)
+        t = torch.tensor(targets, dtype=torch.float32).to(device)
+        w = torch.tensor(weights, dtype=torch.float32).to(device)
 
         pred = network(s)
         # Weighted Huber loss
@@ -142,9 +143,10 @@ def train_strategy_network(
     for epoch in range(epochs):
         states, targets, weights = buffer.sample_batch(batch_size)
 
-        s = torch.tensor(states, dtype=torch.float32)
-        t = torch.tensor(targets, dtype=torch.float32)
-        w = torch.tensor(weights, dtype=torch.float32)
+        device = next(network.parameters()).device
+        s = torch.tensor(states, dtype=torch.float32).to(device)
+        t = torch.tensor(targets, dtype=torch.float32).to(device)
+        w = torch.tensor(weights, dtype=torch.float32).to(device)
 
         pred = network(s)
         # Weighted cross-entropy: -sum(target * log(pred))
@@ -160,3 +162,12 @@ def train_strategy_network(
         final_loss = weighted_loss.item()
 
     return final_loss
+
+class ScriptableNet(torch.nn.Module):
+    """Single-argument wrapper for TorchScript/LibTorch export."""
+    def __init__(self, net: torch.nn.Sequential):
+        super().__init__()
+        self.net = net
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
