@@ -1,13 +1,17 @@
 """
 Experience replay buffers for Deep CFR.
 
-Two separate buffers:
-    MR (Regret Memory): stores (state, regrets, iteration_weight)
-    MΠ (Strategy Memory): stores (state, strategy, iteration_weight)
+Two buffer strategies:
+    Reservoir sampling (mode='reservoir'):
+        Fixed-capacity buffer using Vitter Algorithm R.
+        Maintains a uniform sample over ALL inserted data.
+        Good for tabular CFR where all iterations matter equally.
 
-Uses reservoir sampling to maintain a representative sample
-when the buffer is full, ensuring uniform coverage over all
-iterations without unbounded memory growth.
+    Sliding window (mode='window'):
+        Keeps the K most recent samples only.
+        Old data is overwritten as new data arrives.
+        Better for Deep CFR where fresh traversal data should dominate —
+        avoids stale-data collapse when the buffer fills up.
 
 Reference: Vitter (1985). "Random Sampling with a Reservoir."
 """
@@ -19,15 +23,15 @@ from dataclasses import dataclass
 @dataclass
 class ReservoirBuffer:
     """
-    Fixed-capacity replay buffer with reservoir sampling.
+    Fixed-capacity replay buffer.
 
-    When the buffer is full, new samples replace random existing
-    samples with decreasing probability, maintaining a uniform
-    sample over all inserted data.
+    mode='reservoir': uniform sample over all history (Vitter Algorithm R)
+    mode='window':    circular buffer — K most recent samples only
     """
     capacity: int
     state_size: int
-    action_size: int  # Max number of actions
+    action_size: int
+    mode: str = 'window'   # 'reservoir' | 'window'
 
     def __post_init__(self):
         self.states  = np.zeros((self.capacity, self.state_size),  dtype=np.float32)
@@ -35,100 +39,105 @@ class ReservoirBuffer:
         self.weights = np.zeros(self.capacity,                     dtype=np.float32)
         self.size        = 0
         self.total_added = 0
+        self._head       = 0   # next write position (window mode)
         self._rng = np.random.default_rng(42)
 
+    # ── Single insert ─────────────────────────────────────────────────────────
+
     def add(self, state: np.ndarray, target: np.ndarray, weight: float):
-        """Add a single sample (original interface — unchanged)."""
-        if self.size < self.capacity:
-            idx = self.size
-            self.size += 1
+        if self.mode == 'window':
+            idx = self._head % self.capacity
+            self._head += 1
         else:
-            idx = self._rng.integers(0, self.total_added + 1)
-            if idx >= self.capacity:
-                self.total_added += 1
-                return
+            # Reservoir (Vitter)
+            if self.size < self.capacity:
+                idx = self.size
+            else:
+                idx = int(self._rng.integers(0, self.total_added + 1))
+                if idx >= self.capacity:
+                    self.total_added += 1
+                    return
 
         self.states[idx] = state
         padded = np.zeros(self.action_size, dtype=np.float32)
         padded[:len(target)] = target
         self.targets[idx] = padded
         self.weights[idx] = weight
+        self.size = min(self.size + 1, self.capacity)
         self.total_added += 1
+
+    # ── Batch insert (vectorised) ─────────────────────────────────────────────
 
     def add_batch(self,
                   states:  np.ndarray,
                   targets: np.ndarray,
                   weights: np.ndarray) -> None:
         """
-        Vectorized batch insert — O(1) numpy ops instead of O(N) Python loop.
-
-        Args:
-            states:  [N, state_size]  float32
-            targets: [N, action_size] float32
-            weights: [N]              float32
-
-        Replaces the for-loop in _run_cpp_iteration; critical for C++ backend
-        performance where N can be 50k–100k samples per iteration.
+        Vectorised batch insert — O(1) numpy ops instead of O(N) Python loop.
         """
         n = len(states)
         if n == 0:
             return
 
-        # ── Phase 1: sequential fill into empty slots ─────────────────────────
-        n_fill = min(n, self.capacity - self.size)
-        if n_fill > 0:
-            slots = np.arange(self.size, self.size + n_fill)
-            self.states[slots]  = states[:n_fill]
-            self.targets[slots] = targets[:n_fill]
-            self.weights[slots] = weights[:n_fill]
-            self.size        += n_fill
-            self.total_added += n_fill
+        if self.mode == 'window':
+            # Write sequentially, wrapping around
+            start = self._head % self.capacity
+            end   = start + n
+            if end <= self.capacity:
+                self.states[start:end]  = states
+                self.targets[start:end] = targets
+                self.weights[start:end] = weights
+            else:
+                # Wrap around
+                first = self.capacity - start
+                self.states[start:]  = states[:first]
+                self.targets[start:] = targets[:first]
+                self.weights[start:] = weights[:first]
+                rest = n - first
+                self.states[:rest]  = states[first:]
+                self.targets[:rest] = targets[first:]
+                self.weights[:rest] = weights[first:]
+            self._head       += n
+            self.size         = min(self.size + n, self.capacity)
+            self.total_added += n
 
-        # ── Phase 2: reservoir sampling for overflow ──────────────────────────
-        n_over = n - n_fill
-        if n_over <= 0:
-            return
+        else:
+            # Reservoir sampling batch insert (original logic)
+            n_fill = min(n, self.capacity - self.size)
+            if n_fill > 0:
+                slots = np.arange(self.size, self.size + n_fill)
+                self.states[slots]  = states[:n_fill]
+                self.targets[slots] = targets[:n_fill]
+                self.weights[slots] = weights[:n_fill]
+                self.size        += n_fill
+                self.total_added += n_fill
 
-        # For overflow sample i: draw uniform integer in [0, total_added + i).
-        # Keep if drawn index < capacity.
-        t_base = self.total_added
-        # Generate N random values where draw_i ~ Uniform[0, t_base + i)
-        # Approximation: draw from [0, t_base + N) and scale — exact enough
-        # for large buffers. For exact Vitter, use per-sample bounds below.
-        drawn = self._rng.integers(
-            0,
-            (t_base + np.arange(1, n_over + 1)).astype(np.int64),
-        )
-        keep = np.where(drawn < self.capacity)[0]  # indices into overflow slice
+            n_over = n - n_fill
+            if n_over <= 0:
+                return
 
-        if len(keep) > 0:
-            write_slots    = drawn[keep]                    # where to write in buffer
-            sample_indices = n_fill + keep                  # which incoming samples
-            self.states[write_slots]  = states[sample_indices]
-            self.targets[write_slots] = targets[sample_indices]
-            self.weights[write_slots] = weights[sample_indices]
+            t_base = self.total_added
+            drawn  = self._rng.integers(
+                0, (t_base + np.arange(1, n_over + 1)).astype(np.int64))
+            keep   = np.where(drawn < self.capacity)[0]
 
-        self.total_added += n_over
+            if len(keep) > 0:
+                write_slots    = drawn[keep]
+                sample_indices = n_fill + keep
+                self.states[write_slots]  = states[sample_indices]
+                self.targets[write_slots] = targets[sample_indices]
+                self.weights[write_slots] = weights[sample_indices]
 
-    def sample_batch(
-        self, batch_size: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Sample a random minibatch from the buffer.
+            self.total_added += n_over
 
-        Returns:
-            (states, targets, weights) — numpy arrays of shape
-            (batch_size, ...) ready for neural network training.
-        """
+    # ── Sample ────────────────────────────────────────────────────────────────
+
+    def sample_batch(self, batch_size: int
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.size == 0:
             raise ValueError("Cannot sample from empty buffer")
-
         indices = self._rng.integers(0, self.size, size=min(batch_size, self.size))
-        return (
-            self.states[indices],
-            self.targets[indices],
-            self.weights[indices],
-        )
+        return (self.states[indices], self.targets[indices], self.weights[indices])
 
     def __len__(self):
         return self.size
@@ -136,3 +145,4 @@ class ReservoirBuffer:
     def clear(self):
         self.size        = 0
         self.total_added = 0
+        self._head       = 0

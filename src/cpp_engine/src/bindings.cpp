@@ -89,7 +89,7 @@ PYBIND11_MODULE(cfr_engine, m) {
     m.attr("BET_ROUND2") = BET_ROUND2;
 
     // ════════════════════════════════════════════════════════════════════════
-    // NLHE — 4-action space matching Python PostflopNLHE
+    // NLHE — 4-action space, state-vector buffers
     // ════════════════════════════════════════════════════════════════════════
     py::enum_<NLHEAction>(m, "NLHEAction")
         .value("NLHE_FOLD_OR_CHECK", NLHE_FOLD_OR_CHECK)
@@ -98,7 +98,6 @@ PYBIND11_MODULE(cfr_engine, m) {
         .value("NLHE_ALL_IN",        NLHE_ALL_IN)
         .export_values();
 
-    // Expose int values for Python action indexing
     m.attr("NLHE_FOLD_OR_CHECK") = (int)NLHE_FOLD_OR_CHECK;
     m.attr("NLHE_CALL")          = (int)NLHE_CALL;
     m.attr("NLHE_RAISE")         = (int)NLHE_RAISE;
@@ -111,6 +110,17 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def_readwrite("bb",             &NLHEGameConfig::bb)
         .def_readwrite("raise_fraction", &NLHEGameConfig::raise_fraction)
         .def_readwrite("max_raises",     &NLHEGameConfig::max_raises);
+
+    // NLHEBufferExport — flat state vectors, no string parsing needed
+    py::class_<NLHEBufferExport>(m, "NLHEBufferExport")
+        .def_readonly("states",     &NLHEBufferExport::states)
+        .def_readonly("actions",    &NLHEBufferExport::actions)
+        .def_readonly("values",     &NLHEBufferExport::values)
+        .def_readonly("iterations", &NLHEBufferExport::iterations)
+        .def_readonly("n_samples",  &NLHEBufferExport::n_samples)
+        .def_property_readonly("state_size",
+            [](const NLHEBufferExport&){ return (size_t)NLHEBufferExport::state_size; })
+        .def("__len__", &NLHEBufferExport::__len__);
 
     py::class_<NLHETraversalConfig>(m, "NLHETraversalConfig")
         .def(py::init<>())
@@ -133,10 +143,8 @@ PYBIND11_MODULE(cfr_engine, m) {
              &NLHEMCCFREngine::run_traversals_uniform,
              py::arg("traversing_player"),
              py::call_guard<py::gil_scoped_release>())
-        .def("load_model",
-             &NLHEMCCFREngine::load_model,
-             py::arg("path"))
-        .def("model_loaded",     &NLHEMCCFREngine::model_loaded)
+        .def("load_model",           &NLHEMCCFREngine::load_model)
+        .def("model_loaded",         &NLHEMCCFREngine::model_loaded)
         .def("run_traversals_model",
              &NLHEMCCFREngine::run_traversals_model,
              py::arg("traversing_player"),

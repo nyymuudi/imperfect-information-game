@@ -15,65 +15,56 @@ namespace cfr {
 //   [0:52]    hole cards one-hot
 //   [52:104]  visible board cards one-hot
 //   [104:108] street one-hot (0=preflop,1=flop,2=turn,3=river)
-//   [108]     pot / (2 * starting_stack)        [NORM = 400 for 200BB]
+//   [108]     pot / (2 * starting_stack)
 //   [109]     to_call / (2 * starting_stack)
 //   [110]     my_stack / starting_stack
-//   [111]     opp_stack / starting_stack        ← matches Python [111]
+//   [111]     opp_stack / starting_stack
 //   [112:120] action history (last 8 actions, ACTION_ENC values)
-//   [120]     preflop equity                    ← matches Python [120]
-//   [121]     board_strength                    ← matches Python [121]
+//   [120]     preflop equity
+//   [121]     board_strength
 
 void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
-    const float STACK = state.cfg.starting_stack;   // 200
-    const float NORM  = 2.0f * STACK;               // 400
+    const float STACK = state.cfg.starting_stack;
+    const float NORM  = 2.0f * STACK;
 
     std::fill(out, out + STATE_SIZE, 0.0f);
 
-    // ── Hole cards ────────────────────────────────────────────────────────────
     int c0 = state.hole_cards[player][0];
     int c1 = state.hole_cards[player][1];
     if(c0 >= 0 && c0 < 52) out[c0] = 1.0f;
     if(c1 >= 0 && c1 < 52) out[c1] = 1.0f;
 
-    // ── Visible board cards ───────────────────────────────────────────────────
     int n_visible = BOARD_CARDS_BY_STREET[state.street];
     for(int i = 0; i < n_visible; ++i) {
         int card = state.board[i];
         if(card >= 0 && card < 52) out[52 + card] = 1.0f;
     }
 
-    // ── Street one-hot ────────────────────────────────────────────────────────
     int street = std::min((int)state.street, 3);
     out[104 + street] = 1.0f;
 
-    // ── Pot/stack features ────────────────────────────────────────────────────
     float to_call = state.street_invest[1-player] - state.street_invest[player];
     to_call = std::max(0.0f, to_call);
-    out[108] = std::min(state.pot             / NORM,  1.0f);
-    out[109] = std::min(to_call               / NORM,  1.0f);
-    out[110] = std::min(state.stacks[player]  / STACK, 1.0f);
-    out[111] = std::min(state.stacks[1-player]/ STACK, 1.0f);  // opp stack
+    out[108] = std::min(state.pot              / NORM,  1.0f);
+    out[109] = std::min(to_call                / NORM,  1.0f);
+    out[110] = std::min(state.stacks[player]   / STACK, 1.0f);
+    out[111] = std::min(state.stacks[1-player] / STACK, 1.0f);
 
-    // ── Action history (last 8 actions, ACTION_ENC encoded) ──────────────────
-    // Python: action_history[112:120], 8 slots
-    static constexpr int HIST_START  = 112;
-    static constexpr int HIST_SLOTS  = 8;   // matches Python HISTORY_LEN=8
+    static constexpr int HIST_START = 112;
+    static constexpr int HIST_SLOTS = 8;
     int hist_begin = std::max(0, state.action_count - HIST_SLOTS);
     for(int i = hist_begin; i < state.action_count; ++i) {
-        int slot = HIST_START + (i - hist_begin);
+        int slot  = HIST_START + (i - hist_begin);
         int8_t act = state.action_history[i];
         if(act >= 0 && act < 4)
             out[slot] = NLHE_ACTION_ENC[act];
     }
 
-    // ── Preflop equity [120] ──────────────────────────────────────────────────
     int r0 = card_rank(c0), r1 = card_rank(c1);
     int s0 = card_suit(c0), s1 = card_suit(c1);
     int rh = std::max(r0,r1), rl = std::min(r0,r1);
     bool suited = (s0 == s1) && (c0 != c1);
     out[120] = preflop_equity(rh, rl, suited);
-
-    // ── Board strength [121] ──────────────────────────────────────────────────
     out[121] = board_strength(state, player);
 }
 
@@ -105,6 +96,7 @@ torch::Tensor NLHEStateEncoder::encode_tensor(const NLHEState& state, int player
 #endif
 
 // ── TorchModel ────────────────────────────────────────────────────────────────
+
 bool TorchModel::load(const std::string& path) {
 #ifdef CFR_TORCH_AVAILABLE
     try {
@@ -134,15 +126,18 @@ std::vector<float> TorchModel::forward(const std::vector<float>& sv, int max_act
 std::vector<float> TorchModel::forward_tensor(torch::Tensor input, int max_actions) const {
     if(!loaded_) return {};
     torch::NoGradGuard ng;
-    auto out = module_.forward({input}).toTensor().squeeze(0).slice(0,0,max_actions);
-    auto pos = out.clamp_min(0.0f);
+    auto out = module_.forward({input}).toTensor().squeeze(0).slice(0, 0, max_actions);
+
+    // Regret matching: clamp negative regrets to 0, normalise
+    auto pos   = out.clamp_min(0.0f);
     float total = pos.sum().item<float>();
+
     std::vector<float> probs(max_actions);
     if(total > 1e-7f) {
-        auto p = pos/total;
-        std::copy(p.data_ptr<float>(), p.data_ptr<float>()+max_actions, probs.begin());
+        auto p = pos / total;
+        std::copy(p.data_ptr<float>(), p.data_ptr<float>() + max_actions, probs.begin());
     } else {
-        std::fill(probs.begin(), probs.end(), 1.0f/max_actions);
+        std::fill(probs.begin(), probs.end(), 1.0f / max_actions);
     }
     return probs;
 }

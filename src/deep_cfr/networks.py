@@ -81,6 +81,7 @@ def train_regret_network(
     epochs: int = 100,
     batch_size: int = 256,
     lr: float = 1e-3,
+    optimizer=None,  # persistent optimizer — momentum survives across iterations
 ) -> float:
     """
     Train regret network on replay buffer data.
@@ -88,20 +89,23 @@ def train_regret_network(
     Uses iteration-weighted Huber loss (Linear CFR principle):
     later iterations get more weight since their regrets
     are computed from better strategies.
+
+    Pass a persistent optimizer to retain Adam momentum across
+    iterations — avoids cold-start on every network update.
     
     Returns average loss over final epoch.
     """
     if len(buffer) < batch_size:
         return 0.0
 
-    optimizer = torch.optim.Adam(network.parameters(), lr=lr)
-    final_loss = 0.0
+    if optimizer is None:
+        optimizer = torch.optim.Adam(network.parameters(), lr=lr)
 
+    final_loss = 0.0
     for epoch in range(epochs):
         states, targets, weights = buffer.sample_batch(batch_size)
-
         device = next(network.parameters()).device
-        s = torch.tensor(states, dtype=torch.float32).to(device)
+        s = torch.tensor(states,  dtype=torch.float32).to(device)
         t = torch.tensor(targets, dtype=torch.float32).to(device)
         w = torch.tensor(weights, dtype=torch.float32).to(device)
 
@@ -112,8 +116,8 @@ def train_regret_network(
 
         optimizer.zero_grad()
         weighted_loss.backward()
+        torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
         optimizer.step()
-
         final_loss = weighted_loss.item()
 
     return final_loss
@@ -125,26 +129,30 @@ def train_strategy_network(
     epochs: int = 300,
     batch_size: int = 256,
     lr: float = 1e-3,
+    optimizer=None,  # persistent optimizer
 ) -> float:
     """
     Train strategy network on strategy memory.
     
     Uses iteration-weighted cross-entropy loss.
     This is trained ONCE at the end of all CFR iterations.
+
+    Pass a persistent optimizer to retain Adam momentum across
+    iterations — avoids cold-start on every network update.
     
     Returns average loss over final epoch.
     """
     if len(buffer) < batch_size:
         return 0.0
 
-    optimizer = torch.optim.Adam(network.parameters(), lr=lr)
-    final_loss = 0.0
+    if optimizer is None:
+        optimizer = torch.optim.Adam(network.parameters(), lr=lr)
 
+    final_loss = 0.0
     for epoch in range(epochs):
         states, targets, weights = buffer.sample_batch(batch_size)
-
         device = next(network.parameters()).device
-        s = torch.tensor(states, dtype=torch.float32).to(device)
+        s = torch.tensor(states,  dtype=torch.float32).to(device)
         t = torch.tensor(targets, dtype=torch.float32).to(device)
         w = torch.tensor(weights, dtype=torch.float32).to(device)
 
@@ -158,10 +166,10 @@ def train_strategy_network(
         optimizer.zero_grad()
         weighted_loss.backward()
         optimizer.step()
-
         final_loss = weighted_loss.item()
 
     return final_loss
+
 
 class ScriptableNet(torch.nn.Module):
     """Single-argument wrapper for TorchScript/LibTorch export."""

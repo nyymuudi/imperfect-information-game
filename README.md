@@ -6,84 +6,13 @@ A constructive complexity analysis demonstrating how Nash equilibrium computatio
 
 How does solving imperfect-information games become harder as you add cards, betting rounds, players, and information asymmetry? This project answers that question empirically by implementing the same domain-agnostic CFR solver across a progression of games — mirroring the historical trajectory of the academic literature from Kuhn (1950) through Libratus (Brown & Sandholm, 2017).
 
-The key insight: **CFR is game-agnostic.** It doesn't know anything about poker. It operates on any extensive-form game with imperfect information through a generic interface, converging to a Nash equilibrium at a known rate. By scaling the game while holding the algorithm constant, we isolate exactly which complexity dimensions drive computational cost.
+The key insight: **CFR is game-agnostic.** It operates on any extensive-form game with imperfect information through a generic interface, converging to a Nash equilibrium at a known rate. By scaling the game while holding the algorithm constant, we isolate exactly which complexity dimensions drive computational cost.
 
-## Diagrams
+### Why Deep CFR?
 
-### Algorithm Overview — Solver–Game Separation
-
-```mermaid
-graph TD
-    subgraph Games["Games — ExtensiveFormGame interface"]
-        K["KuhnPoker\n3 cards · 12 info sets\n0.97ms/iter"]
-        L["LeducHoldem\n6 cards · 288 info sets\n193ms/iter"]
-        N["PreflopNLHE\n169→8 buckets · 240 info sets\n112ms/iter"]
-        P["PostflopNLHE\n52 cards · ~10¹⁴ info sets\nDeep CFR only"]
-    end
-
-    subgraph Interface["ExtensiveFormGame"]
-        I["legal_actions(h)\napply_action(h,a)\nterminal_payoffs(h)\ninfo_set_key(h,p)"]
-    end
-
-    subgraph Solvers["Solvers"]
-        CFR["CFR / CFR+ / Linear CFR\nfull tree · O(1/T) convergence"]
-        MC["MCCFR\nsampled tree · O(1/√T) · 4.5× faster/iter"]
-        DC["DeepCFRSolver\nneural regret + strategy nets\nscales to 10¹⁰⁺ info sets"]
-    end
-
-    K & L & N & P --> Interface
-    Interface --> CFR & MC & DC
-
-    style Interface fill:#1e3a5f,color:#fff,stroke:#3b82f6
-    style Games fill:#1a2e1a,color:#fff,stroke:#22c55e
-    style Solvers fill:#2d1b1b,color:#fff,stroke:#ef4444
-```
-
-### Deep CFR Training Loop — C++ Backend
-
-```mermaid
-flowchart TD
-    A(["Start iteration t"]) --> B
-
-    B["PostflopNLHE\n200BB · 75% pot · 4 actions\nSB=1 BB=2"]
-
-    B --> C{{"use_cpp_engine?"}}
-
-    C -- "No (Python)" --> D["Python _traverse()\nrecursive · slow\n~219 trav/s"]
-    C -- "Yes (C++)" --> E
-
-    subgraph CPP["C++ NLHEMCCFREngine"]
-        E{{"iter == 1?"}}
-        E -- "Yes" --> F["run_traversals_uniform()\nuniform strategy · no network"]
-        E -- "No" --> G["run_traversals_model()\nLibTorch inline inference\nzero Python callbacks\n~927 trav/s"]
-        F & G --> H["ReservoirBuffer\nVitter Algorithm R\nregret + strategy samples"]
-    end
-
-    D --> I
-    H --> I["numpy add_batch()\nvectorised reservoir insert\nO(1) per batch"]
-
-    I --> J["train_regret_network()\nHuber loss · MPS/CPU\nlinear output"]
-
-    J --> K["export TorchScript\n_ScriptableNet wrapper\ndetach().to('cpu')"]
-
-    K --> L["load_model()\nC++ loads .pt\nready for next iteration"]
-
-    L --> M{{"t < iterations?"}}
-    M -- "Yes" --> A
-    M -- "No" --> N["train_strategy_network()\ncross-entropy · 300 epochs"]
-
-    N --> O(["Strategy ready\nquery_preflop_strategy()"])
-
-    style CPP fill:#1e3a5f,color:#fff,stroke:#3b82f6
-    style F fill:#1a2e1a,color:#fff,stroke:#22c55e
-    style G fill:#1a2e1a,color:#fff,stroke:#22c55e
-    style D fill:#2d1b1b,color:#fff,stroke:#ef4444
-```
-
+Tabular CFR converges exactly but stores one regret value per information set in memory. This is feasible for Kuhn (12 info sets) and Leduc (288), but full HU NLHE has ~10¹⁴ information sets — several orders of magnitude beyond any table. **Deep CFR** (Steinberger, 2019) replaces tables with neural networks that generalize across game states, removing the memory ceiling at the cost of function approximation error. The C++ MCCFR engine, LibTorch integration, and state-vector buffers documented here exist specifically to make Deep CFR tractable on consumer hardware — reducing training time from hours to minutes while preserving correct game semantics.
 
 ## Results
-
-![Results](convergence_comparison.png)
 
 ### Game Complexity Scaling
 
@@ -110,7 +39,7 @@ flowchart TD
 
 ### Deep CFR — Neural Network-Based Solver
 
-Deep CFR (Steinberger, 2019) replaces tabular regret/strategy storage with neural networks, enabling scaling to games where tabular CFR is infeasible. Validated on Leduc Hold'em (288 info sets) against tabular CFR:
+Validated on Leduc Hold'em (288 info sets) against tabular CFR:
 
 | Hand | Deep CFR (100 iter) | Tabular CFR | GTO Logic |
 |---|---|---|---|
@@ -120,38 +49,30 @@ Deep CFR (Steinberger, 2019) replaces tabular regret/strategy storage with neura
 
 Deep CFR independently learns the correct value-bluff structure without any poker domain knowledge — using only the 20-dimensional state vector from the neural network encoder.
 
-**Postflop NLHE** (preflop through river, 52 cards, ~10¹⁴ info sets) is trained with Deep CFR using:
-- 122-dimensional state vector (52-bit hole cards + 52-bit board + street/pot/stack/equity features)
-- Reservoir sampling replay buffers (MR for regrets, MΠ for strategies)
-- Regret network (Huber loss) + Strategy network (cross-entropy with softmax)
-- External Sampling MCCFR for data generation
-
-Early training results on HU Preflop NLHE (200 iterations, 500 traversals/iter, 122-dim state with equity features):
+Results on HU Postflop NLHE after 1000 iterations (500 traversals/iter, hidden=256, 200BB):
 
 ```
 SB Opening Strategy (Heads-Up):
-    AhAs: fold  4%  call 52%  raise 36%  allin  8%
-    KhKs: fold  4%  call 56%  raise 31%  allin  9%
-    AhKh: fold  4%  call 54%  raise 34%  allin  8%
-    QhQs: fold  4%  call 52%  raise 34%  allin 10%
-    JhTs: fold  7%  call 51%  raise 30%  allin 12%
-    9h8h: fold  9%  call 43%  raise 33%  allin 14%
-    Kd4s: fold  8%  call 42%  raise 36%  allin 14%
-    9s3d: fold 13%  call 38%  raise 35%  allin 14%
-    7h2d: fold 14%  call 34%  raise 37%  allin 15%
+    AhAs: fold  0%  call 50%  raise 50%  allin  0%
+    KhKs: fold  0%  call 62%  raise 38%  allin  0%
+    QhQs: fold  0%  call 37%  raise 63%  allin  0%
+    JhTs: fold  0%  call 54%  raise 46%  allin  0%
+    9h8h: fold  0%  call 65%  raise 35%  allin  0%
+    9s3d: fold  0%  call 89%  raise 11%  allin  0%
+    7h2d: fold  0%  call100%  raise  0%  allin  0%
 ```
 
-Note: These are heads-up strategies where ~70-80% of hands are playable. The fold rates are lower than full-table GTO because the opponent pool is one player, not eight. The equity feature (preflop hand strength as explicit input) reduced premium fold rates from 13% → 4% compared to raw one-hot encoding alone. Full convergence requires 1000+ iterations.
+Premium hands (AA, KK, QQ) raise 38–63%, connectors mix raise/call, weak hands predominantly call. Fold frequencies for the weakest hands remain underrepresented at 1000 iterations — full convergence requires more compute.
 
 ### Convergence Visualization
 
 ![Convergence Comparison](convergence_comparison-1.png)
 
-**Left — vs iterations:** CFR and CFR+ converge smoothly to ~0.003 exploitability in 10k iterations. MCCFR requires ~50k iterations for comparable quality, with visible sampling variance (shaded band = min/max across 5 random seeds).
+**Left — vs iterations:** CFR and CFR+ converge smoothly to ~0.003 exploitability in 10k iterations. MCCFR requires ~50k iterations for comparable quality, with visible sampling variance.
 
-**Center — vs wall-clock time:** With equivalent compute budget (~10s), CFR achieves lower exploitability than MCCFR on Kuhn Poker. This reverses on larger games where full tree traversal dominates.
+**Center — vs wall-clock time:** With equivalent compute budget, CFR achieves lower exploitability than MCCFR on Kuhn Poker. This reverses on larger games where full tree traversal dominates.
 
-**Right — cost per iteration:** MCCFR is 4.5× cheaper per iteration (0.21ms vs 0.97ms) because it samples one chance outcome and one opponent action per node instead of exhaustively expanding all branches.
+**Right — cost per iteration:** MCCFR is 4.5× cheaper per iteration (0.21ms vs 0.97ms) because it samples one chance outcome and one opponent action per node.
 
 ### Kuhn Poker Nash Equilibrium
 
@@ -192,100 +113,76 @@ The solver independently discovers the **polarized range structure** — the sam
 
 ### 1. Computational cost scales with tree size, not info set count
 
-NLHE has fewer info sets (240) than Leduc (288) due to abstraction, yet costs 112ms/iter vs 193ms/iter. The difference comes from initial state count: Leduc pre-expands 120 chance combinations vs NLHE's 64 bucket pairs. **The bottleneck is tree traversal volume, not strategic complexity.**
+NLHE has fewer info sets (240) than Leduc (288) due to abstraction, yet costs 112ms/iter vs 193ms/iter. The bottleneck is initial state count: Leduc pre-expands 120 chance combinations vs NLHE's 64 bucket pairs. **The bottleneck is tree traversal volume, not strategic complexity.**
 
 ### 2. Linear averaging is the single most impactful algorithmic improvement
 
-Across all games and variants, weighting strategy accumulation by iteration number (Linear CFR, Brown & Sandholm 2019) improves convergence more than CFR+ regret clamping. The improvement is from O(1/√T) to O(1/T) — a theoretical guarantee, not an empirical artifact.
+Weighting strategy accumulation by iteration number (Linear CFR, Brown & Sandholm 2019) improves convergence from O(1/√T) to O(1/T) — a theoretical guarantee, not an empirical artifact. This outperforms CFR+ regret clamping across all tested games.
 
 ### 3. MCCFR's advantage is game-size-dependent
 
-On Kuhn Poker (12 info sets, 30 terminals), MCCFR's 4.5× iteration speed advantage is overwhelmed by its variance penalty. Full tree traversal is so cheap that sampling noise hurts more than it helps. This tradeoff reverses on larger games where full traversal is prohibitively expensive — which is exactly why Libratus and Pluribus use MCCFR variants, not vanilla CFR.
+On Kuhn Poker (12 info sets), MCCFR's 4.5× iteration speed advantage is overwhelmed by sampling variance. Full tree traversal is so cheap that noise hurts more than it helps. This tradeoff reverses on larger games — which is exactly why Libratus and Pluribus use MCCFR variants, not vanilla CFR.
 
 ### 4. Card abstraction enables tractability but introduces approximation error
 
-NLHE's 169 canonical hands compressed to 8 equity buckets makes CFR feasible, but the solver can only distinguish 8 "hand strengths." A hand like ATs (bucket 5) plays identically to AKo despite different postflop potential. Finer abstractions (more buckets, equity distribution clustering) reduce this error at the cost of larger game trees.
+NLHE's 169 canonical hands compressed to 8 equity buckets makes CFR feasible, but a hand like ATs (bucket 5) plays identically to AKo despite different postflop potential. Finer abstractions reduce this error at the cost of larger game trees.
 
 ### 5. The solver discovers known poker theory without domain knowledge
 
-The CFR solver receives zero poker knowledge — no concept of "bluffing," "value betting," or "trapping." Yet it independently discovers:
-- **Polarized ranges:** betting with the strongest AND weakest hands, checking the middle
-- **β = 3α invariant:** value-to-bluff ratio of 3:1 (Kuhn)
-- **Indifference principle:** mixing frequencies that make opponents indifferent between calling and folding
-
-These emergent properties validate the solver's correctness and demonstrate that GTO play arises from mathematical structure, not human intuition.
+The CFR solver receives zero poker knowledge. Yet it independently discovers polarized ranges (betting with strongest AND weakest hands), the β = 3α value-to-bluff ratio in Kuhn, and mixing frequencies that make opponents indifferent. GTO play arises from mathematical structure, not human intuition.
 
 ### 6. Deep CFR bridges tabular and neural approaches
 
-Tabular CFR stores exact regrets per info set — precise but memory-bounded at ~10⁶ info sets. Deep CFR replaces tables with neural networks that generalize across similar game states, enabling scaling to 10¹⁰+ info sets. The tradeoff: function approximation error replaces exact computation, requiring more training iterations but removing the memory bottleneck entirely. Validated on Leduc: Deep CFR (100 iterations, 81k samples) recovers the same value-bluff structure as tabular CFR (200 iterations, exact).
+Tabular CFR is memory-bounded at ~10⁶ info sets. Deep CFR removes the memory ceiling via neural generalization, at the cost of function approximation error requiring more training iterations. Validated on Leduc: Deep CFR (100 iterations, 81k samples) recovers the same value-bluff structure as tabular CFR (200 iterations, exact).
 
-### 7. Traversal speed is not the only bottleneck in Deep CFR
+### 7. Traversal speed requires end-to-end optimization
 
-The raw traversal speedup (51.6× on Leduc, ~2× end-to-end on NLHE) confirms that Python loop overhead is significant. However, two additional bottlenecks emerged: (1) network inference callback overhead completely negates traversal gains when Python is called per node — LibTorch is mandatory, not optional; (2) buffer insertion (O(N) Python iterations over 50–100k samples/iteration) requires vectorised numpy batch operations to avoid dominating wall time. Both must be addressed simultaneously for meaningful speedup on NLHE-scale games.
-
-### 8. Game–solver semantic mismatch silently corrupts training
-
-The C++ traversal engine initially used 6 actions (fold, check, call, bet-half, bet-pot, all-in) with a fixed 6→4 projection mapping to Python's 4-slot network output. This introduced a systematic training error: two distinct C++ actions (check and call) both mapped to network slot 1, and two bet sizes (50%, 100% pot) both mapped to slot 2. The result was that premium hands like AA converged to 99% passive play (they "learned" that the call/check slot was dominant) despite the correct strategy being aggressive. Fixing the engine to use the identical 4-action space and identical game parameters (200BB stack, 75% pot raise, max 2 raises/street) produced a 2.25× additional throughput gain as a side-effect — a smaller game tree with 4 branches instead of 6.
+The raw traversal speedup (51.6× on Leduc) does not translate directly to end-to-end speedup. Two additional bottlenecks must be addressed simultaneously: (1) Python GIL overhead on per-node network inference eliminates the traversal gain entirely — LibTorch inline inference is mandatory; (2) O(N) Python buffer insertion dominates at 50–100k samples/iteration and requires vectorised numpy batch operations.
 
 ## C++ MCCFR Engine with LibTorch
 
-Deep CFR training is bottlenecked by Python's MCCFR traversal loop — thousands of recursive game-tree calls per iteration, each with function-call overhead that CPython cannot eliminate. We replaced the traversal with a C++ engine exposed via pybind11, achieving a **51.6× raw traversal speedup** on Leduc Hold'em and **up to 927 traversals/second** on full NLHE.
+### Performance
 
-### Performance — HU Postflop NLHE (30 iterations, 500 traversals/iter)
+| Backend | Peak trav/s | Key change |
+|---|---|---|
+| Python baseline | 219 | Pure Python MCCFR |
+| C++ + Python callbacks | 113 | GIL overhead dominates |
+| C++ + LibTorch | 251 | Zero Python callbacks |
+| C++ + MPS training | 253 | Apple Silicon GPU |
+| C++ + C++ eval | 411 | C++ strategy queries |
+| C++ + game sync | **927** | 4-action tree, 200BB, 75% pot |
+| + state-vector buffer | ~800* | Training = inference features |
 
-| Backend | Time | Peak trav/s | Notes |
-|---|---|---|---|
-| Python (baseline) | 137s | 219 | Pure Python MCCFR |
-| C++ + Python callbacks | 265s | 113 | GIL overhead dominates |
-| C++ + LibTorch (CPU) | 119s | 251 | Zero Python callbacks |
-| C++ + LibTorch (MPS) | 119s | 253 | Apple Silicon GPU |
-| C++ + LibTorch + C++ eval | 117s | 411 | C++ strategy evaluation |
-| **C++ + synced game** | **49s** | **927** | **4-action, 200BB, 75% pot** |
-
-The final jump from 411 → 927 trav/s came entirely from fixing the game–solver mismatch: a 4-action tree has fewer branches per node than a 6-action tree, and eliminating the projection mapping layer removed per-sample overhead.
+*Thermal throttling on MacBook Air after ~150 iterations reduces sustained throughput.
 
 ### Design decisions
 
-**LibTorch over Python callbacks.** The naive approach — call the PyTorch regret network as a Python callback from C++ — is slower than pure Python because GIL acquisition at every tree node dominates the traversal cost. LibTorch loads the TorchScript model directly into C++, enabling inline inference with zero Python runtime involvement from iteration 2 onward.
+**State-vector buffers.** Buffer samples store the full 122-dim state vector (float[122]) rather than info-set key strings. The previous string-based approach silently zeroed 9 of 122 features (to_call, my_stack, opp_stack, equity, board_strength) during parsing, causing the regret network to train on incomplete information. Fixing this enabled raise frequencies to differentiate by hand strength (AA 50%, QQ 63%).
 
-**Vitter reservoir sampling in C++.** The Python `ReservoirBuffer.add()` was called once per sample, O(N) Python iterations per iteration. The C++ engine accumulates samples internally and exports flat float arrays; the Python side uses vectorised numpy batch-insert (`add_batch`) with a single scatter operation.
+**LibTorch over Python callbacks.** GIL acquisition at every tree node completely negates traversal gains. LibTorch loads the TorchScript model directly into C++, enabling inline inference with zero Python involvement from iteration 2 onward.
 
-**NLHEStateEncoder in C++.** The 122-dim state vector (52-bit hole cards + 52-bit board + street + pot/stack features + preflop equity + board strength) is computed from raw `NLHEState` structs during traversal — no Python encoding, no string parsing. Feature layout matches Python `NLHEEncoder` exactly, including opp_stack at [111] and equity at [120-121].
+**Configurable game parameters via NLHEGameConfig.** Stack size, blind sizes, raise fraction, and max raises are passed from `PostflopNLHE` to the C++ engine at construction, ensuring identical game semantics in both environments. A prior mismatch (6-action C++ tree vs 4-action Python game) caused premium hands to converge to passive play — fixing it produced a 2× throughput gain as a side-effect.
 
-**CUDA kernels (GPU hardware required).** `cuda/reservoir_buffer.cu` implements two kernels: `reservoir_indices_kernel` (parallel Vitter sampling using cuRAND) and `accumulate_regrets_kernel` (atomic-add regret accumulation into a flat table). Both activate automatically when NVCC is present at build time via `#ifdef CFR_CUDA_AVAILABLE`.
+**Vitter reservoir sampling in C++.** The C++ engine accumulates samples internally and exports flat float arrays. The Python side uses vectorised `add_batch()` with a single scatter operation instead of O(N) per-sample inserts.
 
-**Configurable game parameters.** `NLHEGameConfig` carries stack size, blind sizes, raise fraction, and max raises per street. These are passed from `PostflopNLHE` to the C++ engine at construction, ensuring identical game semantics in both environments:
+### Lessons learned from Deep CFR at scale
 
-```python
-self._cpp = NLHECppBackend(
-    starting_stack=self.game.starting_stack,     # 200.0
-    raise_fraction=self.game.raise_fractions[0], # 0.75
-    max_raises=self.game.max_raises_per_street,  # 2
-)
-```
+**Game–solver semantic mismatch silently corrupts training.** An initial 6→4 action projection mapped both "check" and "call" to slot 1, and both 50% and 100% pot bets to slot 2. This statistical conflation produced degenerate strategies. The fix requires identical action spaces end-to-end.
+
+**Training and inference feature mismatch causes collapse.** When training features differ from inference features (even silently), the regret network's outputs become uncorrelated with actual regrets. End-to-end feature consistency is a hard requirement.
+
+**The buffer:traversal ratio determines convergence stability.** With 500k reservoir buffer and 500 traversals/iter (0.2% refresh rate), the regret network trains on predominantly stale data and converges to degenerate solutions. Experiments showed that refreshing ~10% of the buffer per iteration (buffer ≈ 10 × traversals_per_iter × 2) prevents staleness while maintaining gradient stability. The strategy buffer benefits from larger capacity to accumulate the time-average strategy across all iterations.
 
 ### Action space
 
-4 context-dependent actions match Python `PostflopNLHE` exactly:
+4 context-dependent actions matching Python `PostflopNLHE` exactly:
 
 | Slot | No bet | Facing bet | Python action |
 |---|---|---|---|
 | 0 | check | fold | `"c"` / `"f"` |
 | 1 | — | call | `"k"` |
-| 2 | raise (75% pot) | raise (75% pot) | `"r"` |
+| 2 | raise (configurable % pot) | raise | `"r"` |
 | 3 | all-in | all-in | `"a"` |
-
-### Strategy evaluation in C++
-
-After training, the strategy network is exported as TorchScript and loaded into `NLHEMCCFREngine`:
-
-```python
-# Export and query — no Python game object needed
-_export_for_libtorch(solver.strategy_net).save("/tmp/strategy.pt")
-solver._cpp._engine.load_strategy_model("/tmp/strategy.pt")
-probs = solver._cpp._engine.query_preflop_strategy(card1, card2)
-# → [fold/check%, call%, raise%, all-in%]
-```
 
 ## Architecture
 
@@ -303,11 +200,11 @@ src/
 │   └── mccfr.py             # External Sampling Monte Carlo CFR
 │
 ├── deep_cfr/
-│   ├── deep_cfr_solver.py   # Deep CFR training loop (MCCFR + neural networks)
+│   ├── deep_cfr_solver.py   # Deep CFR training loop
 │   ├── networks.py          # RegretNetwork (Huber) + StrategyNetwork (softmax)
-│   ├── replay_buffer.py     # Reservoir sampling buffers + vectorised add_batch
+│   ├── replay_buffer.py     # Reservoir + sliding-window buffers, add_batch
 │   ├── state_encoder.py     # LeducEncoder (20-dim) + NLHEEncoder (122-dim)
-│   ├── cpp_backend.py       # C++ engine interface: CppMCCFRBackend, NLHECppBackend
+│   ├── cpp_backend.py       # C++ engine interface + export_for_libtorch
 │   └── train_postflop.py    # Postflop NLHE training runner
 │
 ├── abstraction/
@@ -316,38 +213,29 @@ src/
 │
 ├── analysis/
 │   ├── convergence.py       # Exploitability, Nash verification, tracking
-│   └── convergence_benchmark.py  # Solver variant comparison & visualization
+│   └── convergence_benchmark.py
 │
 ├── cpp_engine/              # C++ MCCFR backend (pybind11 + LibTorch + CUDA)
-│   ├── CMakeLists.txt       # Auto-detects LibTorch (PyTorch) and NVCC
-│   ├── scripts/build.sh     # One-command build
+│   ├── CMakeLists.txt       # Auto-detects LibTorch and NVCC
+│   ├── scripts/build.sh
 │   ├── include/
-│   │   ├── leduc_game.hpp   # Leduc: state, transitions, hand eval, info set key
-│   │   ├── mccfr.hpp        # ReservoirBuffer<T> (Vitter 1985) + LeducMCCFREngine
-│   │   ├── nlhe_game.hpp    # NLHE: NLHEGameConfig + 4-action enum + NLHEState
-│   │   ├── nlhe_mccfr.hpp   # NLHEMCCFREngine + strategy model queries
-│   │   └── torch_model.hpp  # TorchModel (LibTorch) + NLHEStateEncoder (122-dim)
+│   │   ├── leduc_game.hpp
+│   │   ├── mccfr.hpp        # ReservoirBuffer<T> (Vitter 1985)
+│   │   ├── nlhe_game.hpp    # NLHEGameConfig + 4-action enum + NLHEState
+│   │   ├── nlhe_mccfr.hpp   # NLHERegretSample { float state[122] }
+│   │   └── torch_model.hpp  # TorchModel + NLHEStateEncoder (122-dim)
 │   ├── src/
-│   │   ├── leduc_game.cpp
-│   │   ├── mccfr.cpp
-│   │   ├── nlhe_game.cpp    # 4-action game tree, 75% pot sizing, configurable stack
-│   │   ├── nlhe_mccfr.cpp   # Direct 4-slot inference, no action remapping
+│   │   ├── nlhe_game.cpp    # 4-action tree, configurable sizing
+│   │   ├── nlhe_mccfr.cpp   # State-vector samples, direct 4-slot inference
 │   │   ├── torch_model.cpp  # Encoder matching Python NLHEEncoder exactly
-│   │   └── bindings.cpp     # pybind11 → Python API
-│   ├── cuda/
-│   │   └── reservoir_buffer.cu  # Vitter sampling kernel + regret accumulation
-│   └── tests/
-│       └── test_game.cpp    # Standalone C++ tests
+│   │   └── bindings.cpp
+│   └── cuda/
+│       └── reservoir_buffer.cu  # Vitter sampling + regret accumulation kernels
 │
-├── main.py                  # Kuhn CLI runner
-└── nlhe_main.py             # NLHE CLI runner
+├── main.py
+└── nlhe_main.py
 
-tests/
-├── test_kuhn_cfr.py         # 41 tests
-├── test_leduc.py            # 30 tests
-├── test_nlhe.py             # 43 tests
-└── test_postflop.py         # 40 tests
-                               154 total
+tests/   # 154 tests across 4 files
 ```
 
 ### Solver–game separation
@@ -356,95 +244,86 @@ The `ExtensiveFormGame` abstract class ensures solvers never access game-specifi
 
 ```python
 class ExtensiveFormGame(ABC):
-    def num_players(self) -> int: ...
-    def initial_histories(self) -> list[tuple[History, float]]: ...
-    def is_terminal(self, history) -> bool: ...
-    def terminal_payoffs(self, history) -> tuple[float, ...]: ...
-    def current_player(self, history) -> int: ...
-    def info_set_key(self, history, player) -> InfoSetKey: ...
     def legal_actions(self, history) -> list[Action]: ...
     def apply_action(self, history, action) -> History: ...
+    def terminal_payoffs(self, history) -> tuple[float, ...]: ...
+    def info_set_key(self, history, player) -> InfoSetKey: ...
+    # + num_players, initial_histories, is_terminal, current_player
 ```
 
-Any game implementing this interface can be solved by any solver — the solver never accesses cards, ranks, or game-specific state.
+Any game implementing this interface can be solved by any solver — Kuhn through full NLHE, tabular CFR through Deep CFR.
 
 ### Deep CFR training pipeline
 
-```
-PostflopNLHE game
-       │  (starting_stack, raise_fractions, max_raises_per_street)
-       ▼
-DeepCFRSolver.solve()
-       │
-       ├─ use_cpp_engine=False ──► Python _traverse() [recursive, slow]
-       │
-       └─ use_cpp_engine=True ───► NLHECppBackend._run_iteration()
-                                          │  NLHEGameConfig synced from Python
-                                          ▼
-                               NLHEMCCFREngine (C++)
-                                  ├─ iter 1: run_traversals_uniform()
-                                  │          [uniform strategy, no network]
-                                  │
-                                  └─ iter 2+: run_traversals_model()
-                                             [LibTorch regret network,
-                                              zero Python callbacks,
-                                              4-action tree]
-                                          │
-                                          ▼
-                               BufferExport → numpy add_batch()
-                                          │
-                                          ▼
-                               train_regret_network() [MPS/CPU]
-                                          │
-                                          ▼
-                               export TorchScript → load_model()
-                                    [next iteration]
+```mermaid
+flowchart TD
+    A(["Start iteration t"]) --> B
+
+    B["PostflopNLHE\n200BB · configurable raise · 4 actions"]
+    B --> E
+
+    subgraph CPP["C++ NLHEMCCFREngine"]
+        E{{"iter == 1?"}}
+        E -- "Yes" --> F["run_traversals_uniform()"]
+        E -- "No" --> G["run_traversals_model()\nLibTorch · zero Python callbacks"]
+        F & G --> H["NLHERegretSample\nfloat state[122] + action + regret"]
+    end
+
+    H --> I["numpy add_batch()\nvectorised buffer insert"]
+    I --> J["train_regret_network()\nHuber loss · MPS/CPU"]
+    J --> K["export_for_libtorch()\nTorchScript → load_model()"]
+    K --> M{{"t < iterations?"}}
+    M -- "Yes" --> A
+    M -- "No" --> N["train_strategy_network()\ncross-entropy · 300 epochs"]
+    N --> O(["Strategy ready"])
+
+    style CPP fill:#1e3a5f,color:#fff,stroke:#3b82f6
 ```
 
 ## Theoretical Background
 
-### Counterfactual Regret Minimization
+**CFR** (Zinkevich et al., 2007) iteratively traverses the game tree, computes counterfactual values at each information set, and updates strategy proportional to accumulated positive regret. The average strategy converges to Nash at O(1/√T).
 
-CFR (Zinkevich et al., 2007) iteratively traverses the game tree, computes counterfactual values at each information set, and updates strategy proportional to accumulated positive regret. The average strategy converges to Nash at O(1/√T).
-
-**CFR+** (Tammelin, 2014) clamps cumulative regrets to ≥ 0 after each iteration, preventing negative regret accumulation from polluting future strategies.
+**CFR+** (Tammelin, 2014) clamps cumulative regrets to ≥ 0, preventing negative accumulation from polluting future strategies.
 
 **Linear CFR** (Brown & Sandholm, 2019) weights strategy accumulation by iteration number, improving convergence to O(1/T).
 
 **MCCFR** (Lanctot et al., 2009) samples chance outcomes and opponent actions instead of traversing the full tree. External Sampling MCCFR expands all traversing player actions but samples one opponent action per node.
 
-**Deep CFR** (Steinberger, 2019) replaces tabular regret/strategy storage with neural networks. A regret network predicts counterfactual regrets (Huber loss, linear output), while a strategy network learns the average policy (cross-entropy, softmax output). MCCFR generates training data stored in reservoir-sampled replay buffers. This enables solving games with 10¹⁰+ information sets where tabular storage is infeasible.
+**Deep CFR** (Steinberger, 2019) replaces tabular regret/strategy storage with neural networks — a regret network (Huber loss, linear output) and a strategy network (cross-entropy, softmax output). MCCFR generates training data stored in reservoir-sampled replay buffers. This enables solving games with 10¹⁰+ information sets where tabular storage is infeasible.
 
-### Abstraction
-
-Full NLHE has ~10¹⁴ information sets. The Abstraction-Solving-Translation pipeline:
-1. **Card abstraction:** 169 hands → k equity buckets via Monte Carlo equity clustering
-2. **Action abstraction:** continuous sizing → discrete actions {fold, call, raise, all-in}
-3. **Solve** the abstracted game
-4. **Translate** bucket strategies back to specific hands
+**Abstraction pipeline:** 169 canonical hands → k equity buckets (card abstraction) + continuous bet sizing → discrete actions (action abstraction). The solver operates on the abstracted game; strategies translate back to specific hands via the bucket mapping.
 
 ## Usage
 
 ```bash
 pip install numpy pytest matplotlib torch
 
-# Build C++ engine (required for Deep CFR with use_cpp_engine=True)
+# Build C++ engine
 cd src/cpp_engine && bash scripts/build.sh && cd ../..
 
 # Kuhn solver (tabular CFR)
 python3 -m src.main --iterations 10000
 
-# Preflop NLHE solver (tabular CFR + abstraction)
+# Preflop NLHE (tabular CFR + abstraction)
 python3 -m src.nlhe_main --buckets 8 --iterations 1000
 
 # Convergence benchmark (CFR vs CFR+ vs MCCFR)
 python3 -m src.analysis.convergence_benchmark
 
-# Deep CFR on Postflop NLHE — quick test (49s, 927 trav/s peak)
-python3 -m src.deep_cfr.train_postflop --iterations 30 --traversals 500 --hidden 128
+# Deep CFR — quick test (~150s)
+python3 -m src.deep_cfr.train_postflop \
+  --iterations 100 --traversals 500 --hidden 256
 
-# Full training run (~1h+)
-python3 -m src.deep_cfr.train_postflop --iterations 500 --traversals 1000 --hidden 256 --buffer 500000
+# Full training run
+python3 -m src.deep_cfr.train_postflop \
+  --iterations 1000 --traversals 500 --hidden 256 \
+  --buffer 500000 --epochs 20
+
+# Separate regret/strategy buffer sizes
+python3 -m src.deep_cfr.train_postflop \
+  --iterations 1000 --traversals 500 --hidden 256 \
+  --buffer 10000 --strategy-buffer 200000 --epochs 50
 
 # Tests (154 total)
 pytest tests/ -v

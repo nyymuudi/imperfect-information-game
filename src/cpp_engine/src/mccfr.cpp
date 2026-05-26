@@ -43,7 +43,7 @@ std::vector<T> ReservoirBuffer<T>::sample_batch(size_t n, std::mt19937& rng) con
     return batch;
 }
 
-// Explicit instantiations
+// Explicit instantiations — Leduc
 template class ReservoirBuffer<RegretSample>;
 template class ReservoirBuffer<StrategySample>;
 
@@ -57,7 +57,6 @@ MCCFREngine::MCCFREngine(const TraversalConfig& config)
       deals_(LeducGame::all_deals())
 {}
 
-// Uniform random strategy (tabular mode, no network needed).
 void MCCFREngine::run_traversals_uniform(int traversing_player) {
     StrategyFn uniform_fn = [](const std::string&,
                                 const std::vector<Action>& actions) {
@@ -70,24 +69,18 @@ void MCCFREngine::run_traversals_uniform(int traversing_player) {
 void MCCFREngine::run_traversals(int traversing_player,
                                   const StrategyFn& strategy_fn) {
     std::uniform_int_distribution<size_t> deal_dist(0, deals_.size() - 1);
-
     for (int t = 0; t < config_.n_traversals; ++t) {
-        // Sample a random deal
         const LeducDeal& deal = deals_[deal_dist(rng_)];
         LeducState root = LeducGame::initial_state(deal);
         traverse(root, traversing_player, 1.0f, 1.0f, strategy_fn);
     }
 }
 
-// ── External Sampling Traversal ───────────────────────────────────────────────
-
 std::vector<float> MCCFREngine::regret_match(
     const std::string& info_set,
     const std::vector<Action>& legal_actions,
     const StrategyFn& strategy_fn)
 {
-    // Use the strategy function (wraps the regret network) to get probabilities.
-    // The network already outputs a valid strategy via regret matching internally.
     return strategy_fn(info_set, legal_actions);
 }
 
@@ -98,9 +91,7 @@ float MCCFREngine::traverse(
     float             reach_prob_opponent,
     const StrategyFn& strategy_fn)
 {
-    // ── Terminal ──────────────────────────────────────────────────────────────
     if (state.terminal) {
-        // payoff_p0 is P0's payoff; adjust for traversing player
         return (traversing_player == 0) ? state.payoff_p0 : -state.payoff_p0;
     }
 
@@ -109,23 +100,19 @@ float MCCFREngine::traverse(
     const int  n_actions = static_cast<int>(legal.size());
     const std::string iset = LeducGame::info_set_key(state, p);
 
-    // ── Opponent node (external sampling: sample one action) ──────────────────
     if (p != traversing_player) {
         std::vector<float> probs = regret_match(iset, legal, strategy_fn);
-
-        // Sample one action from opponent's strategy
         std::discrete_distribution<int> dist(probs.begin(), probs.end());
         int sampled_idx = dist(rng_);
         Action sampled_action = legal[sampled_idx];
 
-        // Optionally record strategy sample for strategy buffer
         if (config_.collect_strategy) {
             for (int a = 0; a < n_actions; ++a) {
                 StrategySample ss{};
                 std::strncpy(ss.info_set, iset.c_str(), 31);
-                ss.action    = static_cast<int8_t>(legal[a]);
+                ss.action      = static_cast<int8_t>(legal[a]);
                 ss.probability = probs[a] * reach_prob_opponent;
-                ss.iteration = config_.iteration;
+                ss.iteration   = config_.iteration;
                 strategy_buf_.insert(ss);
             }
         }
@@ -137,11 +124,9 @@ float MCCFREngine::traverse(
                         strategy_fn);
     }
 
-    // ── Traverser node (explore all actions) ──────────────────────────────────
     std::vector<float> probs = regret_match(iset, legal, strategy_fn);
     std::vector<float> action_values(n_actions, 0.0f);
 
-    // Evaluate all actions
     for (int a = 0; a < n_actions; ++a) {
         LeducState next = LeducGame::apply_action(state, legal[a]);
         action_values[a] = traverse(next, traversing_player,
@@ -150,13 +135,10 @@ float MCCFREngine::traverse(
                                      strategy_fn);
     }
 
-    // Node value (expected utility under current strategy)
     float node_value = 0.0f;
-    for (int a = 0; a < n_actions; ++a) {
+    for (int a = 0; a < n_actions; ++a)
         node_value += probs[a] * action_values[a];
-    }
 
-    // Compute and store counterfactual regrets
     for (int a = 0; a < n_actions; ++a) {
         float cf_regret = reach_prob_opponent * (action_values[a] - node_value);
         RegretSample rs{};
@@ -170,16 +152,11 @@ float MCCFREngine::traverse(
     return node_value;
 }
 
-// ── Buffer Export ─────────────────────────────────────────────────────────────
-
 MCCFREngine::BufferExport MCCFREngine::export_regret_buffer() const {
     BufferExport exp;
     const size_t n = regret_buf_.size();
-    exp.info_sets.reserve(n);
-    exp.actions.reserve(n);
-    exp.values.reserve(n);
-    exp.iterations.reserve(n);
-
+    exp.info_sets.reserve(n); exp.actions.reserve(n);
+    exp.values.reserve(n);    exp.iterations.reserve(n);
     const auto* data = regret_buf_.data();
     for (size_t i = 0; i < n; ++i) {
         exp.info_sets.push_back(std::string(data[i].info_set));
@@ -193,11 +170,8 @@ MCCFREngine::BufferExport MCCFREngine::export_regret_buffer() const {
 MCCFREngine::BufferExport MCCFREngine::export_strategy_buffer() const {
     BufferExport exp;
     const size_t n = strategy_buf_.size();
-    exp.info_sets.reserve(n);
-    exp.actions.reserve(n);
-    exp.values.reserve(n);
-    exp.iterations.reserve(n);
-
+    exp.info_sets.reserve(n); exp.actions.reserve(n);
+    exp.values.reserve(n);    exp.iterations.reserve(n);
     const auto* data = strategy_buf_.data();
     for (size_t i = 0; i < n; ++i) {
         exp.info_sets.push_back(std::string(data[i].info_set));
@@ -208,4 +182,12 @@ MCCFREngine::BufferExport MCCFREngine::export_strategy_buffer() const {
     return exp;
 }
 
+// Explicit instantiations — NLHE state-vector buffer types
+} // namespace cfr
+
+#include "nlhe_mccfr.hpp"
+
+namespace cfr {
+template class ReservoirBuffer<NLHERegretSample>;
+template class ReservoirBuffer<NLHEStrategySample>;
 } // namespace cfr

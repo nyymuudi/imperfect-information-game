@@ -26,6 +26,7 @@ class DeepCFRSolver:
     encoder: StateEncoder
     max_actions: int = 5
     buffer_capacity: int = 500000
+    strategy_buffer_capacity: int = 0     # 0 = same as buffer_capacity
     hidden_size: int = 256
     train_epochs: int = 100
     train_batch: int = 256
@@ -35,13 +36,15 @@ class DeepCFRSolver:
     device: str = "cpu"
 
     def __post_init__(self):
-        state_sz = self.encoder.state_size()
+        state_sz  = self.encoder.state_size()
+        strat_cap = self.strategy_buffer_capacity or self.buffer_capacity
 
         self.regret_net   = RegretNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
         self.strategy_net = StrategyNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
 
-        self.regret_buffer   = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions)
-        self.strategy_buffer = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions)
+        # Reservoir sampling — uniform over all history, matches original Deep CFR
+        self.regret_buffer   = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions, mode='reservoir')
+        self.strategy_buffer = ReservoirBuffer(strat_cap,            state_sz, self.max_actions, mode='reservoir')
 
         self.iterations = 0
         self._rng = np.random.default_rng(42)
@@ -51,11 +54,10 @@ class DeepCFRSolver:
             if engine_available():
                 from ..games.postflop_nlhe import PostflopNLHE
                 if isinstance(self.game, PostflopNLHE):
-                    # Pass game parameters to C++ engine so it matches Python exactly
                     self._cpp = NLHECppBackend(
                         n_traversals=self.traversals_per_iter,
                         regret_capacity=self.buffer_capacity,
-                        strategy_capacity=self.buffer_capacity,
+                        strategy_capacity=strat_cap,
                         device=self.device,
                         starting_stack=self.game.starting_stack,
                         raise_fraction=self.game.raise_fractions[0],
@@ -65,7 +67,7 @@ class DeepCFRSolver:
                     self._cpp = CppMCCFRBackend(
                         n_traversals=self.traversals_per_iter,
                         regret_capacity=self.buffer_capacity,
-                        strategy_capacity=self.buffer_capacity,
+                        strategy_capacity=strat_cap,
                         device=self.device,
                     )
             else:
@@ -111,8 +113,6 @@ class DeepCFRSolver:
             return self._traverse(new_h, traversing_player)
 
     def _run_cpp_iteration(self) -> None:
-        # C++ uses 4-action enum (0=FOLD_OR_CHECK, 1=CALL, 2=RAISE, 3=ALL_IN)
-        # matching Python slots directly — no remapping needed.
         reg_exp, str_exp = self._cpp.run_iteration(
             self.iterations,
             regret_net=self.regret_net if self.iterations > 0 else None,
@@ -174,6 +174,7 @@ class DeepCFRSolver:
             self.iterations += 1
 
             if len(self.regret_buffer) >= self.train_batch:
+                # Fresh Adam optimizer each iteration — avoids momentum lock-in
                 train_regret_network(
                     self.regret_net, self.regret_buffer,
                     epochs=self.train_epochs,

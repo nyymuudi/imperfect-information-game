@@ -12,6 +12,37 @@ namespace cfr {
 using NLHEStrategyFn = std::function<std::vector<float>(
     const std::string&, const std::vector<NLHEAction>&)>;
 
+// ── NLHE-specific sample types ────────────────────────────────────────────────
+// Store the full 122-dim state vector instead of the info_set string.
+// Training features == inference features — no mismatch possible.
+
+struct NLHERegretSample {
+    float   state[NLHEStateEncoder::STATE_SIZE];
+    int8_t  action;
+    float   regret;
+    int32_t iteration;
+};
+
+struct NLHEStrategySample {
+    float   state[NLHEStateEncoder::STATE_SIZE];
+    int8_t  action;
+    float   probability;
+    int32_t iteration;
+};
+
+// Flat export for Python (pybind11 → numpy).
+// states is a flat float array of shape [n_samples, STATE_SIZE].
+struct NLHEBufferExport {
+    std::vector<float>   states;      // [n_samples * STATE_SIZE]
+    std::vector<int8_t>  actions;     // [n_samples]
+    std::vector<float>   values;      // [n_samples]
+    std::vector<int32_t> iterations;  // [n_samples]
+    size_t n_samples = 0;
+    static constexpr size_t state_size = NLHEStateEncoder::STATE_SIZE;
+    size_t __len__() const { return n_samples; }
+};
+
+// ── Traversal config ──────────────────────────────────────────────────────────
 struct NLHETraversalConfig {
     int      n_traversals      = 500;
     int      iteration         = 0;
@@ -19,10 +50,11 @@ struct NLHETraversalConfig {
     size_t   strategy_capacity = 1 << 20;
     bool     collect_strategy  = true;
     uint64_t seed              = 42;
-    int      max_actions       = 4;   // matches Python 4-action space
-    NLHEGameConfig game_cfg;          // passed to initial_state
+    int      max_actions       = 4;
+    NLHEGameConfig game_cfg;
 };
 
+// ── Engine ────────────────────────────────────────────────────────────────────
 class NLHEMCCFREngine {
 public:
     explicit NLHEMCCFREngine(const NLHETraversalConfig& config);
@@ -48,23 +80,22 @@ public:
     void   set_iteration(int it) { config_.iteration = it; }
     size_t regret_buffer_size()   const { return regret_buf_.size(); }
     size_t strategy_buffer_size() const { return strategy_buf_.size(); }
-    MCCFREngine::BufferExport export_regret_buffer()   const;
-    MCCFREngine::BufferExport export_strategy_buffer() const;
+    NLHEBufferExport export_regret_buffer()   const;
+    NLHEBufferExport export_strategy_buffer() const;
 
 private:
     float traverse_cb(const NLHEState&, int, float, float, const NLHEStrategyFn&);
     float traverse_model(const NLHEState&, int, float, float);
-    // No mapping needed: C++ uses 4 actions natively
     std::vector<float> model_strategy(const NLHEState&, int,
                                        const std::vector<NLHEAction>&);
     std::vector<float> uniform_strategy(int n);
 
-    NLHETraversalConfig             config_;
-    ReservoirBuffer<RegretSample>   regret_buf_;
-    ReservoirBuffer<StrategySample> strategy_buf_;
-    std::mt19937                    rng_;
-    TorchModel                      model_;
-    TorchModel                      strategy_model_;
+    NLHETraversalConfig                 config_;
+    ReservoirBuffer<NLHERegretSample>   regret_buf_;
+    ReservoirBuffer<NLHEStrategySample> strategy_buf_;
+    std::mt19937                        rng_;
+    TorchModel                          model_;
+    TorchModel                          strategy_model_;
 };
 
 } // namespace cfr

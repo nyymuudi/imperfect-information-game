@@ -9,42 +9,29 @@ Usage:
 import argparse
 import time
 import torch
-import torch.nn as nn
 import numpy as np
 from src.games.postflop_nlhe import PostflopNLHE
 from src.deep_cfr.deep_cfr_solver import DeepCFRSolver
 from src.deep_cfr.state_encoder import NLHEEncoder
-
-
-class _ScriptableNet(nn.Module):
-    """Single-argument wrapper — strips mask param for TorchScript/LibTorch export."""
-    def __init__(self, layers: nn.Sequential):
-        super().__init__()
-        self.layers = layers
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
-
-
-def _export_for_libtorch(net) -> "torch.jit.ScriptModule":
-    """Export a RegretNetwork or StrategyNetwork for C++ LibTorch inference."""
-    cpu_layers = nn.Sequential(*list(net.net.children()))
-    state = {k: v.detach().to("cpu") for k, v in cpu_layers.state_dict().items()}
-    cpu_layers.load_state_dict(state, assign=True)
-    wrapper = _ScriptableNet(cpu_layers)
-    wrapper.eval()
-    return torch.jit.script(wrapper)
+from src.deep_cfr.cpp_backend import export_for_libtorch
 
 
 def main():
     parser = argparse.ArgumentParser(description="Deep CFR on Postflop NLHE")
-    parser.add_argument("--iterations", "-n", type=int, default=50)
-    parser.add_argument("--traversals", "-t", type=int, default=200)
-    parser.add_argument("--hidden",     type=int, default=128)
-    parser.add_argument("--buffer",     type=int, default=200000)
-    parser.add_argument("--stack",      type=float, default=200.0)
+    parser.add_argument("--iterations",      "-n", type=int,   default=50)
+    parser.add_argument("--traversals",      "-t", type=int,   default=200)
+    parser.add_argument("--hidden",               type=int,   default=128)
+    parser.add_argument("--buffer",               type=int,   default=500000)
+    parser.add_argument("--strategy-buffer",      type=int,   default=0,
+                        help="Strategy buffer capacity (0 = same as --buffer)")
+    parser.add_argument("--stack",                type=float, default=200.0)
+    parser.add_argument("--raise-fraction",       type=float, default=0.75,
+                        help="Raise size as fraction of pot (default: 0.75)")
+    parser.add_argument("--epochs",               type=int,   default=20)
     args = parser.parse_args()
 
-    game    = PostflopNLHE(starting_stack=args.stack, max_raises_per_street=2)
+    game    = PostflopNLHE(starting_stack=args.stack, max_raises_per_street=2,
+                           raise_fractions=(args.raise_fraction,))
     encoder = NLHEEncoder(starting_stack=args.stack)
 
     solver = DeepCFRSolver(
@@ -52,8 +39,9 @@ def main():
         encoder=encoder,
         max_actions=4,
         buffer_capacity=args.buffer,
+        strategy_buffer_capacity=args.strategy_buffer,
         hidden_size=args.hidden,
-        train_epochs=30,
+        train_epochs=args.epochs,
         train_batch=256,
         traversals_per_iter=args.traversals,
         use_cpp_engine=True,
@@ -61,10 +49,11 @@ def main():
         lr=1e-3,
     )
 
+    strat_cap = args.strategy_buffer or args.buffer
     print(f"Deep CFR on HU Postflop NLHE")
-    print(f"  Stack: {args.stack:.0f}BB | Iterations: {args.iterations}")
+    print(f"  Stack: {args.stack:.0f}BB | Raise: {args.raise_fraction:.0%} pot | Iterations: {args.iterations}")
     print(f"  Traversals/iter: {args.traversals} | Hidden: {args.hidden}")
-    print(f"  Buffer capacity: {args.buffer:,}\n")
+    print(f"  Buffer: regret={args.buffer:,}  strategy={strat_cap:,} | Train epochs: {args.epochs}\n")
 
     t0 = time.time()
 
@@ -85,16 +74,13 @@ def main():
     print(f"\nCompleted in {elapsed:.1f}s")
     print(f"Samples: MR={len(solver.regret_buffer):,}, MΠ={len(solver.strategy_buffer):,}\n")
 
-    # ── Export strategy network → LibTorch ────────────────────────────────────
+    # Export strategy network
     strategy_path = "/tmp/cfr_strategy_net.pt"
-    _export_for_libtorch(solver.strategy_net).save(strategy_path)
+    export_for_libtorch(solver.strategy_net).save(strategy_path)
     solver._cpp._engine.load_strategy_model(strategy_path)
-    print(f"Strategy model loaded into C++ engine.")
+    print("Strategy model loaded into C++ engine.")
 
-    # ── Evaluate via C++ ──────────────────────────────────────────────────────
-    # Slots: [0]=fold/check, [1]=call/check, [2]=raise, [3]=all-in
     ACTION_NAMES = ["f", "k", "r", "a"]
-
     print("=" * 60)
     print("PREFLOP OPENING STRATEGIES (SB, sample hands)")
     print("=" * 60)
@@ -103,7 +89,6 @@ def main():
         "AhAs", "KhKs", "AhKh", "AhKd", "QhQs",
         "JhTs", "9h8h", "Kd4s", "9s3d", "7h2d",
     ]
-
     for hand_str in hand_samples:
         card1 = _rank_suit_to_card(hand_str[:2])
         card2 = _rank_suit_to_card(hand_str[2:4])
@@ -111,7 +96,6 @@ def main():
         parts = [f"{a}={probs[i]:.0%}" for i, a in enumerate(ACTION_NAMES)]
         print(f"  {hand_str:>6s}: {'  '.join(parts)}")
 
-    # Save
     torch.save(solver.strategy_net.state_dict(), "deep_cfr_strategy.pt")
     torch.save(solver.regret_net.state_dict(),   "deep_cfr_regret.pt")
     print(f"\nModels saved: deep_cfr_strategy.pt, deep_cfr_regret.pt")
