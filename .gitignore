@@ -12,3 +12,8 @@ build/
 *.so
 src/cpp_engine/build/
 blueprints/
+
+# Next.js
+web/.next/
+web/node_modules/
+web/.env.local
