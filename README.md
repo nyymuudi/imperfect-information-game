@@ -1,7 +1,5 @@
 # Imperfect-Information Game Solving: From Kuhn to NLHE
 
-https://vercel.com/nyymuudis-projects/imperfect-information-game
-
 A constructive complexity analysis demonstrating how Nash equilibrium computation scales across game complexity axes using Counterfactual Regret Minimization (CFR).
 
 ## Motivation
