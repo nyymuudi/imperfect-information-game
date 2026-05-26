@@ -147,12 +147,12 @@ class Blueprint:
         p = Path(path)
         p.mkdir(parents=True, exist_ok=True)
 
-        cpu_net = self._net.to("cpu")
+        import copy
+        cpu_net = copy.deepcopy(self._net).to("cpu")
         cpu_net.eval()
 
         # 1. state_dict — always works, device-agnostic
         torch.save(cpu_net.state_dict(), p / self.WEIGHTS_FILE)
-        self._net.to(self._device)
 
         # 2. ONNX — stable API, C++ ONNX Runtime compatible
         try:
