@@ -14,8 +14,6 @@ blueprints/
  
 # ONNX — exclude training artefacts but allow web model
 blueprints/**/*.onnx
-*.onnx
-!web/public/models/strategy_net.onnx
  
 # Next.js
 web/.next/
