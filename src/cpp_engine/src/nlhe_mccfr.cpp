@@ -73,7 +73,7 @@ float NLHEMCCFREngine::traverse_cb(
         if(config_.collect_strategy)
             for(int a=0;a<n;++a){
                 NLHEStrategySample ss{};
-                NLHEStateEncoder::encode(state, p, ss.state);  // full 122-dim vector
+                NLHEStateEncoder::encode(state, p, ss.state);
                 ss.action=static_cast<int8_t>(legal[a]);
                 ss.probability=probs[a]*r_opp;
                 ss.iteration=config_.iteration;
@@ -93,7 +93,7 @@ float NLHEMCCFREngine::traverse_cb(
     for(int a=0;a<n;++a) nv+=probs[a]*vals[a];
     for(int a=0;a<n;++a){
         NLHERegretSample rs{};
-        NLHEStateEncoder::encode(state, p, rs.state);  // full 122-dim vector
+        NLHEStateEncoder::encode(state, p, rs.state);
         rs.action=static_cast<int8_t>(legal[a]);
         rs.regret=r_opp*(vals[a]-nv);
         rs.iteration=config_.iteration;
@@ -188,32 +188,53 @@ NLHEBufferExport NLHEMCCFREngine::export_strategy_buffer() const {
 }
 
 // ── Strategy queries ──────────────────────────────────────────────────────────
+// Uses OnnxStrategyModel (strategy_model_) — not TorchModel.
+// encode_vec() produces float[122] directly; forward() calls ONNX Runtime.
+// No CFR_TORCH_AVAILABLE guard needed here.
+
 std::vector<float> NLHEMCCFREngine::query_strategy(
-    int hole0,int hole1,int street,
+    int hole0, int hole1, int street,
     const std::vector<int>& board,
-    float pot,float to_call,float my_stack) const
+    float pot, float to_call, float my_stack) const
 {
-    if(!strategy_model_.loaded()) return std::vector<float>(4,0.25f);
-    NLHEState s{}; s.cfg=config_.game_cfg;
-    s.hole_cards[0][0]=(int8_t)hole0; s.hole_cards[0][1]=(int8_t)hole1;
-    s.hole_cards[1][0]=0; s.hole_cards[1][1]=1;
-    s.street=(int8_t)street;
-    for(int i=0;i<5&&i<(int)board.size();++i) s.board[i]=(int8_t)board[i];
-    s.pot=pot; s.stacks[0]=my_stack; s.stacks[1]=s.cfg.starting_stack;
-    s.street_invest[0]=(to_call>0)?0.0f:s.cfg.sb;
-    s.street_invest[1]=(to_call>0)?to_call:s.cfg.bb;
-    s.current_player=0; s.action_count=0;
-#ifdef CFR_TORCH_AVAILABLE
-    auto input=NLHEStateEncoder::encode_tensor(s,0);
-    return strategy_model_.forward_tensor(input,4);
-#else
-    return std::vector<float>(4,0.25f);
-#endif
+    if (!strategy_model_.loaded())
+        return std::vector<float>(4, 0.25f);
+
+    NLHEState s{};
+    s.cfg                 = config_.game_cfg;
+    s.hole_cards[0][0]    = (int8_t)hole0;
+    s.hole_cards[0][1]    = (int8_t)hole1;
+    s.hole_cards[1][0]    = 0;
+    s.hole_cards[1][1]    = 1;
+    s.street              = (int8_t)std::min(street, 3);
+    for (int i = 0; i < 5 && i < (int)board.size(); ++i)
+        s.board[i]        = (int8_t)board[i];
+    s.pot                 = pot;
+    s.stacks[0]           = my_stack;
+    s.stacks[1]           = s.cfg.starting_stack;
+    s.street_invest[0]    = (to_call > 0) ? 0.0f : s.cfg.sb;
+    s.street_invest[1]    = (to_call > 0) ? to_call : s.cfg.bb;
+    s.current_player      = 0;
+    s.action_count        = 0;
+
+    // encode_vec() is always available (no LibTorch dependency)
+    std::vector<float> state_vec = NLHEStateEncoder::encode_vec(s, 0);
+
+    // OnnxStrategyModel::forward() — guarded by CFR_ORT_AVAILABLE internally
+    return strategy_model_.forward(state_vec, 4);
 }
 
-std::vector<float> NLHEMCCFREngine::query_preflop_strategy(int hole0,int hole1) const {
-    const auto& c=config_.game_cfg;
-    return query_strategy(hole0,hole1,0,{},c.sb+c.bb,c.bb-c.sb,c.starting_stack-c.sb);
+std::vector<float> NLHEMCCFREngine::query_preflop_strategy(
+    int hole0, int hole1) const
+{
+    const auto& c = config_.game_cfg;
+    return query_strategy(
+        hole0, hole1,
+        /*street=*/0, /*board=*/{},
+        c.sb + c.bb,
+        c.bb - c.sb,
+        c.starting_stack - c.sb
+    );
 }
 
 } // namespace cfr

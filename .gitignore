@@ -2,10 +2,13 @@ __pycache__/
 *.pyc
 *.pyo
 *.pt
+*.onnx
 *.log
+.DS_Store
 .pytest_cache/
 *.egg-info/
 dist/
 build/
-.DS_Store*.so
+*.so
 src/cpp_engine/build/
+blueprints/

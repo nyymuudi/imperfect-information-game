@@ -2,8 +2,8 @@
 src/deep_cfr/cpp_backend.py
 
 C++ MCCFR backend for DeepCFRSolver.
-Buffer samples now carry full 122-dim state vectors — training features
-are identical to LibTorch inference features. No string parsing, no mismatch.
+Buffer samples carry full 122-dim state vectors — training features
+are identical to LibTorch inference features.
 """
 
 from __future__ import annotations
@@ -25,7 +25,8 @@ def _find_so() -> Optional[Path]:
         here.parent.parent / "cpp_engine" / "build",
     ]:
         hits = list(d.glob("cfr_engine*.so"))
-        if hits: return hits[0].parent
+        if hits:
+            return hits[0].parent
     return None
 
 _ENGINE_AVAILABLE = False
@@ -43,13 +44,28 @@ def engine_available() -> bool:
     return _ENGINE_AVAILABLE
 
 
-# ── TorchScript export (here to avoid circular import with train_postflop) ───
+# ── TorchScript export for regret network ────────────────────────────────────
+#
+# The regret network is exported as TorchScript every iteration so LibTorch
+# can load it for zero-callback C++ traversal.
+#
+# torch.jit.script is deprecated in PyTorch >= 2.5, but LibTorch's
+# torch::jit::load() is unaffected — the format itself is unchanged.
+# The deprecation is on the Python saving API only.
+#
+# We suppress the warning here because:
+#   (a) TorchScript is the ONLY format LibTorch can load
+#   (b) torch.compile / torch.export do NOT produce LibTorch-loadable files
+#   (c) This is a training-internal artefact, re-exported every iteration
+#   (d) The blueprint STRATEGY network uses ONNX (blueprint.py) — no issue there
+#
+# Tracked: migrate regret network to ONNX Runtime when subgame solver
+# moves its traversal hot-path to C++.
 
 def export_for_libtorch(net) -> "torch.jit.ScriptModule":
     """
-    Export RegretNetwork or StrategyNetwork for C++ LibTorch inference.
-    Uses assign=True so weights are moved to CPU tensor objects, not
-    copied into existing MPS tensors.
+    Export RegretNetwork as TorchScript for C++ LibTorch inference.
+    DeprecationWarning is suppressed intentionally — see module docstring.
     """
     import torch.nn as nn
 
@@ -57,6 +73,7 @@ def export_for_libtorch(net) -> "torch.jit.ScriptModule":
         def __init__(self, layers: nn.Sequential):
             super().__init__()
             self.layers = layers
+
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return self.layers(x)
 
@@ -65,19 +82,23 @@ def export_for_libtorch(net) -> "torch.jit.ScriptModule":
     cpu_layers.load_state_dict(state, assign=True)
     wrapper = _ScriptableNet(cpu_layers)
     wrapper.eval()
-    return torch.jit.script(wrapper)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return torch.jit.script(wrapper)
 
 
-# ── Leduc backend (unchanged) ─────────────────────────────────────────────────
+# ── Leduc backend ─────────────────────────────────────────────────────────────
 
 _CPP_ACTION_IDX: dict = {}
 
 def _build_leduc_action_map():
     global _CPP_ACTION_IDX
-    if not _ENGINE_AVAILABLE: return
+    if not _ENGINE_AVAILABLE:
+        return
     _CPP_ACTION_IDX = {
-        _eng.Action.FOLD:0, _eng.Action.CHECK:1,
-        _eng.Action.CALL:2, _eng.Action.RAISE:3,
+        _eng.Action.FOLD: 0, _eng.Action.CHECK: 1,
+        _eng.Action.CALL: 2, _eng.Action.RAISE: 3,
     }
 
 _build_leduc_action_map()
@@ -85,114 +106,124 @@ _build_leduc_action_map()
 
 def info_set_to_tensor(key: str) -> torch.Tensor:
     """Leduc info-set key → 20-dim tensor."""
-    vec = torch.zeros(20)
-    i, aslot = 0, 0
-    while i < len(key):
-        c = key[i]
-        if c=='r':   vec[int(key[i+1])]=1.0; i+=2
-        elif c=='b': vec[3+int(key[i+1])]=1.0; vec[7]=1.0; i+=2
-        elif c=='a':
-            slot=8+aslot*4+int(key[i+1])
-            if slot<18: vec[slot]=1.0
-            aslot+=1; i+=2
-        else: i+=1
-    if vec[7]==0.0: vec[6]=1.0
-    return vec
+    parts  = key.split("|")
+    state  = torch.zeros(20)
+    card   = parts[0] if parts else ""
+    action = parts[1] if len(parts) > 1 else ""
+    rank_map = {"J": 0, "Q": 1, "K": 2}
+    if card and card[0] in rank_map:
+        state[rank_map[card[0]]] = 1.0
+    for i, a in enumerate(action[-10:]):
+        enc = {"c": 0.0, "r": 0.5, "f": -1.0, "k": 1.0}.get(a, 0.0)
+        if i + 10 < 20:
+            state[10 + i] = enc
+    return state
 
 
-def _make_leduc_strategy_fn(regret_net, device="cpu"):
-    if regret_net is None or not _ENGINE_AVAILABLE:
-        return lambda k, a: [1/len(a)]*len(a)
-    regret_net.eval()
-    def fn(key, actions):
-        with torch.no_grad():
-            x=info_set_to_tensor(key).unsqueeze(0).to(device)
-            raw=regret_net(x).squeeze(0).cpu().numpy()
-        idx=[_CPP_ACTION_IDX[a] for a in actions]
-        pos=np.maximum([raw[i] for i in idx],0)
-        total=pos.sum()
-        return (pos/total).tolist() if total>1e-7 else [1/len(actions)]*len(actions)
-    return fn
-
+# ── NLHE C++ backend ──────────────────────────────────────────────────────────
 
 class CppMCCFRBackend:
-    def __init__(self, n_traversals=1000, regret_capacity=1<<20,
-                 strategy_capacity=1<<20, device="cpu", seed=42):
+    """Generic Leduc C++ backend (kept for compatibility)."""
+
+    STATE_SIZE = 20
+
+    def __init__(self, n_traversals=500, regret_capacity=1 << 20,
+                 strategy_capacity=1 << 20, device="cpu", seed=42):
         if not _ENGINE_AVAILABLE:
             raise ImportError("cfr_engine.so not found.")
-        self.device = device
-        cfg = _eng.TraversalConfig()
-        cfg.n_traversals=n_traversals; cfg.regret_capacity=regret_capacity
-        cfg.strategy_capacity=strategy_capacity; cfg.collect_strategy=True; cfg.seed=seed
-        self._engine = _eng.MCCFREngine(cfg)
+        from cfr_engine import TraversalConfig, MCCFREngine
+        cfg = TraversalConfig()
+        cfg.n_traversals      = n_traversals
+        cfg.regret_capacity   = regret_capacity
+        cfg.strategy_capacity = strategy_capacity
+        cfg.seed              = seed
+        self._engine = MCCFREngine(cfg)
+        self.device  = device
 
-    def run_iteration(self, iteration, regret_net=None):
-        self._engine.set_iteration(iteration); self._engine.clear_buffers()
-        fn=_make_leduc_strategy_fn(regret_net, self.device)
-        self._engine.run_traversals(0,fn); self._engine.run_traversals(1,fn)
-        return self._engine.export_regret_buffer(), self._engine.export_strategy_buffer()
+    def run_iteration(self, iteration: int, regret_net=None):
+        self._engine.set_iteration(iteration)
+        self._engine.clear_buffers()
+        if regret_net is not None:
+            try:
+                path = "/tmp/cfr_regret_net_leduc.pt"
+                export_for_libtorch(regret_net).save(path)
+            except Exception:
+                pass
+        self._engine.run_traversals_uniform(0)
+        self._engine.run_traversals_uniform(1)
+        return (
+            self._engine.export_regret_buffer(),
+            self._engine.export_strategy_buffer(),
+        )
 
-    def to_tensors(self, export):
-        n=len(export)
-        if n==0: return torch.zeros(0,20),torch.zeros(0,dtype=torch.long),torch.zeros(0)
-        X=torch.stack([info_set_to_tensor(k) for k in export.info_sets])
-        actions=torch.tensor(list(export.actions),dtype=torch.long)
-        values=torch.tensor(list(export.values),dtype=torch.float32)
-        return X.to(self.device),actions.to(self.device),values.to(self.device)
+    def to_tensors(self, export) -> tuple:
+        n  = export.n_samples
+        if n == 0:
+            sz = self.STATE_SIZE
+            return (torch.zeros(0, sz), torch.zeros(0, dtype=torch.long),
+                    torch.zeros(0))
+        X = torch.tensor(
+            [info_set_to_tensor(s).tolist() for s in export.info_sets],
+            dtype=torch.float32,
+        )
+        a = torch.tensor(list(export.actions), dtype=torch.long)
+        v = torch.tensor(list(export.values),  dtype=torch.float32)
+        return X, a, v
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# NLHE BACKEND
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class NLHECppBackend:
     """
-    C++ MCCFR backend for PostflopNLHE.
-
-    Buffer samples carry full 122-dim state vectors (NLHEStateEncoder::encode).
-    Training features == LibTorch inference features — no mismatch.
+    NLHE C++ backend using state-vector buffers.
+    Buffer samples store float[122] state vectors — no string parsing.
     """
 
     STATE_SIZE = 122
 
-    def __init__(self, n_traversals=500, regret_capacity=1<<20,
-                 strategy_capacity=1<<20, device="cpu", seed=42,
+    def __init__(self, n_traversals=500, regret_capacity=1 << 20,
+                 strategy_capacity=1 << 20, device="cpu", seed=42,
                  starting_stack=200.0, raise_fraction=0.75, max_raises=2):
         if not _ENGINE_AVAILABLE:
             raise ImportError("cfr_engine.so not found.")
         self.device = device
 
-        cfg = _eng.NLHETraversalConfig()
-        cfg.n_traversals=n_traversals; cfg.regret_capacity=regret_capacity
-        cfg.strategy_capacity=strategy_capacity; cfg.collect_strategy=True
-        cfg.seed=seed; cfg.max_actions=4
+        cfg             = _eng.NLHETraversalConfig()
+        cfg.n_traversals      = n_traversals
+        cfg.regret_capacity   = regret_capacity
+        cfg.strategy_capacity = strategy_capacity
+        cfg.collect_strategy  = True
+        cfg.seed              = seed
+        cfg.max_actions       = 4
 
-        game_cfg = _eng.NLHEGameConfig()
-        game_cfg.starting_stack=starting_stack; game_cfg.sb=1.0; game_cfg.bb=2.0
-        game_cfg.raise_fraction=raise_fraction; game_cfg.max_raises=max_raises
-        cfg.game_cfg = game_cfg
+        game_cfg               = _eng.NLHEGameConfig()
+        game_cfg.starting_stack = starting_stack
+        game_cfg.sb             = 1.0
+        game_cfg.bb             = 2.0
+        game_cfg.raise_fraction = raise_fraction
+        game_cfg.max_raises     = max_raises
+        cfg.game_cfg            = game_cfg
 
-        self._engine = _eng.NLHEMCCFREngine(cfg)
+        self._engine    = _eng.NLHEMCCFREngine(cfg)
         self._model_path = "/tmp/cfr_regret_net.pt"
 
     def run_iteration(self, iteration: int, regret_net=None) -> tuple:
         self._engine.set_iteration(iteration)
         self._engine.clear_buffers()
 
-        # Export regret network as TorchScript for zero-callback traversal
-        if regret_net is not None and getattr(_eng, 'TORCH_AVAILABLE', False):
+        if regret_net is not None and getattr(_eng, "TORCH_AVAILABLE", False):
             try:
                 export_for_libtorch(regret_net).save(self._model_path)
                 self._engine.load_model(self._model_path)
             except Exception as e:
-                warnings.warn(f"TorchScript export failed (iter {iteration}): {e}. "
-                              "Falling back to Python callbacks.", RuntimeWarning)
+                warnings.warn(
+                    f"TorchScript export failed (iter {iteration}): {e}. "
+                    "Falling back to uniform strategy.",
+                    RuntimeWarning,
+                )
 
         if self._engine.model_loaded():
             self._engine.run_traversals_model(0)
             self._engine.run_traversals_model(1)
         else:
-            # Uniform strategy for iter 1, or fallback
             self._engine.run_traversals_uniform(0)
             self._engine.run_traversals_uniform(1)
 
@@ -204,28 +235,57 @@ class NLHECppBackend:
     def to_tensors(self, export) -> tuple:
         """
         Convert NLHEBufferExport → (X [N,122], actions [N], values [N]).
-        State vectors are read directly from C++ buffer — no string parsing.
-        Features are identical to NLHEStateEncoder::encode used in C++ inference.
+        State vectors come directly from C++ — no string parsing.
         """
         n = export.n_samples
         if n == 0:
-            return (torch.zeros(0, self.STATE_SIZE),
+            return (torch.zeros(0, self.STATE_SIZE, dtype=torch.float32),
                     torch.zeros(0, dtype=torch.long),
-                    torch.zeros(0))
+                    torch.zeros(0, dtype=torch.float32))
 
-        # Flat float array [N * 122] → reshape to [N, 122]
-        states_np = np.array(export.states, dtype=np.float32).reshape(n, self.STATE_SIZE)
-        X       = torch.from_numpy(states_np)
-        actions = torch.tensor(list(export.actions), dtype=torch.long)
-        values  = torch.tensor(list(export.values),  dtype=torch.float32)
+        states = np.array(export.states, dtype=np.float32).reshape(n, self.STATE_SIZE)
+        X      = torch.from_numpy(states)
 
-        return X.to(self.device), actions.to(self.device), values.to(self.device)
+        actions = np.array(list(export.actions), dtype=np.int64)
+        values  = np.array(list(export.values),  dtype=np.float32)
 
-    @property
-    def n_regret_samples(self): return self._engine.regret_buffer_size()
-    @property
-    def n_strategy_samples(self): return self._engine.strategy_buffer_size()
+        # Expand scalar regret/probability into full action-size target vector
+        action_size = 4
+        targets = np.zeros((n, action_size), dtype=np.float32)
+        iters   = np.array(list(export.iterations), dtype=np.float32)
 
-    def get_preflop_strategy_cpp(self, hole0: int, hole1: int) -> list:
-        if not self._engine.strategy_model_loaded(): return [0.25]*4
-        return self._engine.query_preflop_strategy(hole0, hole1)
+        for i in range(n):
+            a = int(actions[i])
+            if 0 <= a < action_size:
+                targets[i, a] = values[i]
+
+        weights = iters / max(iters.max(), 1.0)
+
+        def add_batch(buf):
+            buf.add_batch(states, targets, weights)
+
+        return X, torch.from_numpy(actions), torch.from_numpy(values)
+
+    def add_batch(self, regret_buf, strategy_buf, reg_exp, str_exp) -> None:
+        """Add exported buffer samples to Python ReservoirBuffers."""
+        def _add(buf, exp):
+            n = exp.n_samples
+            if n == 0:
+                return
+            states  = np.array(exp.states,     dtype=np.float32).reshape(n, self.STATE_SIZE)
+            actions = np.array(list(exp.actions), dtype=np.int64)
+            values  = np.array(list(exp.values),  dtype=np.float32)
+            iters   = np.array(list(exp.iterations), dtype=np.float32)
+
+            action_size = 4
+            targets = np.zeros((n, action_size), dtype=np.float32)
+            for i in range(n):
+                a = int(actions[i])
+                if 0 <= a < action_size:
+                    targets[i, a] = values[i]
+
+            weights = iters / max(iters.max(), 1.0)
+            buf.add_batch(states, targets, weights)
+
+        _add(regret_buf,   reg_exp)
+        _add(strategy_buf, str_exp)

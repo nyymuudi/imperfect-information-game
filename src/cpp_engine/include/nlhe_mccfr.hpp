@@ -13,8 +13,6 @@ using NLHEStrategyFn = std::function<std::vector<float>(
     const std::string&, const std::vector<NLHEAction>&)>;
 
 // ── NLHE-specific sample types ────────────────────────────────────────────────
-// Store the full 122-dim state vector instead of the info_set string.
-// Training features == inference features — no mismatch possible.
 
 struct NLHERegretSample {
     float   state[NLHEStateEncoder::STATE_SIZE];
@@ -30,19 +28,18 @@ struct NLHEStrategySample {
     int32_t iteration;
 };
 
-// Flat export for Python (pybind11 → numpy).
-// states is a flat float array of shape [n_samples, STATE_SIZE].
 struct NLHEBufferExport {
-    std::vector<float>   states;      // [n_samples * STATE_SIZE]
-    std::vector<int8_t>  actions;     // [n_samples]
-    std::vector<float>   values;      // [n_samples]
-    std::vector<int32_t> iterations;  // [n_samples]
+    std::vector<float>   states;
+    std::vector<int8_t>  actions;
+    std::vector<float>   values;
+    std::vector<int32_t> iterations;
     size_t n_samples = 0;
     static constexpr size_t state_size = NLHEStateEncoder::STATE_SIZE;
     size_t __len__() const { return n_samples; }
 };
 
 // ── Traversal config ──────────────────────────────────────────────────────────
+
 struct NLHETraversalConfig {
     int      n_traversals      = 500;
     int      iteration         = 0;
@@ -55,27 +52,31 @@ struct NLHETraversalConfig {
 };
 
 // ── Engine ────────────────────────────────────────────────────────────────────
+
 class NLHEMCCFREngine {
 public:
     explicit NLHEMCCFREngine(const NLHETraversalConfig& config);
 
-    // Traversal
+    // ── Traversal (regret network = TorchScript via LibTorch) ────────────────
     void run_traversals(int traversing_player, const NLHEStrategyFn& fn);
     void run_traversals_uniform(int traversing_player);
-    bool load_model(const std::string& path);
+    bool load_model(const std::string& path);          // loads regret TorchScript
     bool model_loaded() const { return model_.loaded(); }
     void run_traversals_model(int traversing_player);
 
-    // Strategy evaluation
+    // ── Strategy queries (blueprint = ONNX via ONNX Runtime) ─────────────────
+    // load_strategy_model() expects a .onnx file (from Blueprint.save()).
     bool load_strategy_model(const std::string& path);
     bool strategy_model_loaded() const { return strategy_model_.loaded(); }
+
     std::vector<float> query_strategy(
         int hole0, int hole1, int street,
         const std::vector<int>& board,
         float pot, float to_call, float my_stack) const;
+
     std::vector<float> query_preflop_strategy(int hole0, int hole1) const;
 
-    // Buffers
+    // ── Buffers ───────────────────────────────────────────────────────────────
     void   clear_buffers()       { regret_buf_.clear(); strategy_buf_.clear(); }
     void   set_iteration(int it) { config_.iteration = it; }
     size_t regret_buffer_size()   const { return regret_buf_.size(); }
@@ -94,8 +95,9 @@ private:
     ReservoirBuffer<NLHERegretSample>   regret_buf_;
     ReservoirBuffer<NLHEStrategySample> strategy_buf_;
     std::mt19937                        rng_;
-    TorchModel                          model_;
-    TorchModel                          strategy_model_;
+
+    TorchModel         model_;           // regret net  — TorchScript (LibTorch)
+    OnnxStrategyModel  strategy_model_;  // strategy net — ONNX (ONNX Runtime)
 };
 
 } // namespace cfr

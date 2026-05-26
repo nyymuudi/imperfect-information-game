@@ -17,8 +17,9 @@ else()
 endif()
 
 # ── Optional LibTorch ─────────────────────────────────────────────────────────
-# Locate via installed PyTorch: python3 -c "import torch; print(torch.utils.cmake_prefix_path)"
-# Or set manually: cmake -DCMAKE_PREFIX_PATH=/path/to/libtorch ..
+# Used for: regret network inference during MCCFR traversal (hot path).
+# Locate: python3 -c "import torch; print(torch.utils.cmake_prefix_path)"
+# Or set: cmake -DCMAKE_PREFIX_PATH=/path/to/libtorch ..
 find_package(Torch QUIET)
 if(Torch_FOUND)
     add_compile_definitions(CFR_TORCH_AVAILABLE)
@@ -27,6 +28,67 @@ if(Torch_FOUND)
 else()
     message(STATUS "LibTorch not found — model-based traversal disabled")
     message(STATUS "  To enable: cmake -DCMAKE_PREFIX_PATH=$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)') ..")
+endif()
+
+# ── Optional ONNX Runtime ─────────────────────────────────────────────────────
+# Used for: blueprint strategy network inference (subgame solving).
+# The strategy network is exported as ONNX from blueprint.py.
+#
+# Install (macOS):  brew install onnxruntime
+# Install (Linux):  apt install libonnxruntime-dev
+#                   OR download from https://github.com/microsoft/onnxruntime/releases
+# Override:         cmake -DONNXRUNTIME_ROOT=/path/to/ort ..
+
+set(ONNXRUNTIME_ROOT "$ENV{ONNXRUNTIME_ROOT}" CACHE PATH
+    "ONNX Runtime root (auto-detected from homebrew if empty)")
+
+# Search paths: user override → homebrew Apple Silicon → homebrew Intel → system
+set(_ORT_SEARCH_PATHS
+    "${ONNXRUNTIME_ROOT}"
+    "/opt/homebrew"
+    "/usr/local"
+    "/usr/local/opt/onnxruntime"
+    "/usr"
+)
+
+set(ONNXRUNTIME_INCLUDE_DIR "")
+set(ONNXRUNTIME_LIB         "")
+
+foreach(_ORT_PATH ${_ORT_SEARCH_PATHS})
+    # Header location varies by install method
+    foreach(_INC_SUFFIX
+        "include/onnxruntime/core/session"
+        "include/onnxruntime"
+        "include"
+    )
+        if(EXISTS "${_ORT_PATH}/${_INC_SUFFIX}/onnxruntime_cxx_api.h")
+            set(ONNXRUNTIME_INCLUDE_DIR "${_ORT_PATH}/${_INC_SUFFIX}")
+            break()
+        endif()
+    endforeach()
+
+    if(ONNXRUNTIME_INCLUDE_DIR)
+        find_library(ONNXRUNTIME_LIB onnxruntime
+            HINTS "${_ORT_PATH}/lib"
+            NO_DEFAULT_PATH
+        )
+        if(ONNXRUNTIME_LIB)
+            break()
+        endif()
+        set(ONNXRUNTIME_INCLUDE_DIR "")
+    endif()
+endforeach()
+
+if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE_DIR)
+    add_compile_definitions(CFR_ORT_AVAILABLE)
+    message(STATUS "ONNX Runtime found:")
+    message(STATUS "  Library: ${ONNXRUNTIME_LIB}")
+    message(STATUS "  Include: ${ONNXRUNTIME_INCLUDE_DIR}")
+else()
+    message(STATUS "ONNX Runtime not found — blueprint C++ inference disabled")
+    message(STATUS "  macOS:  brew install onnxruntime")
+    message(STATUS "  Linux:  see https://github.com/microsoft/onnxruntime/releases")
+    message(STATUS "  Custom: cmake -DONNXRUNTIME_ROOT=/path/to/ort ..")
 endif()
 
 # ── pybind11 ──────────────────────────────────────────────────────────────────
@@ -63,6 +125,11 @@ if(Torch_FOUND)
     target_link_libraries(cfr_engine PRIVATE ${TORCH_LIBRARIES})
 endif()
 
+if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE_DIR)
+    target_include_directories(cfr_engine PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+    target_link_libraries(cfr_engine PRIVATE ${ONNXRUNTIME_LIB})
+endif()
+
 # ── Test binary ───────────────────────────────────────────────────────────────
 add_executable(test_engine
     tests/test_game.cpp
@@ -73,6 +140,10 @@ add_executable(test_engine
 target_include_directories(test_engine PRIVATE include)
 if(Torch_FOUND)
     target_link_libraries(test_engine PRIVATE ${TORCH_LIBRARIES})
+endif()
+if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE_DIR)
+    target_include_directories(test_engine PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+    target_link_libraries(test_engine PRIVATE ${ONNXRUNTIME_LIB})
 endif()
 
 install(TARGETS cfr_engine DESTINATION .)

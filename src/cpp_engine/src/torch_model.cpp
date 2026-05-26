@@ -2,26 +2,20 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 
 #ifdef CFR_TORCH_AVAILABLE
 #include <torch/script.h>
 #endif
 
+#ifdef CFR_ORT_AVAILABLE
+#include <onnxruntime_cxx_api.h>
+#endif
+
 namespace cfr {
 
 // ── NLHEStateEncoder ──────────────────────────────────────────────────────────
-//
-// Tensor layout (122 dims) — matches Python NLHEEncoder EXACTLY:
-//   [0:52]    hole cards one-hot
-//   [52:104]  visible board cards one-hot
-//   [104:108] street one-hot (0=preflop,1=flop,2=turn,3=river)
-//   [108]     pot / (2 * starting_stack)
-//   [109]     to_call / (2 * starting_stack)
-//   [110]     my_stack / starting_stack
-//   [111]     opp_stack / starting_stack
-//   [112:120] action history (last 8 actions, ACTION_ENC values)
-//   [120]     preflop equity
-//   [121]     board_strength
+// NLHE_ACTION_ENC is defined in nlhe_game.hpp — do NOT redefine here.
 
 void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     const float STACK = state.cfg.starting_stack;
@@ -46,7 +40,7 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     float to_call = state.street_invest[1-player] - state.street_invest[player];
     to_call = std::max(0.0f, to_call);
     out[108] = std::min(state.pot              / NORM,  1.0f);
-    out[109] = std::min(to_call                / NORM,  1.0f);
+    out[109] = std::min(to_call               / NORM,  1.0f);
     out[110] = std::min(state.stacks[player]   / STACK, 1.0f);
     out[111] = std::min(state.stacks[1-player] / STACK, 1.0f);
 
@@ -54,10 +48,10 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     static constexpr int HIST_SLOTS = 8;
     int hist_begin = std::max(0, state.action_count - HIST_SLOTS);
     for(int i = hist_begin; i < state.action_count; ++i) {
-        int slot  = HIST_START + (i - hist_begin);
+        int slot   = HIST_START + (i - hist_begin);
         int8_t act = state.action_history[i];
         if(act >= 0 && act < 4)
-            out[slot] = NLHE_ACTION_ENC[act];
+            out[slot] = NLHE_ACTION_ENC[act];   // defined in nlhe_game.hpp
     }
 
     int r0 = card_rank(c0), r1 = card_rank(c1);
@@ -128,7 +122,6 @@ std::vector<float> TorchModel::forward_tensor(torch::Tensor input, int max_actio
     torch::NoGradGuard ng;
     auto out = module_.forward({input}).toTensor().squeeze(0).slice(0, 0, max_actions);
 
-    // Regret matching: clamp negative regrets to 0, normalise
     auto pos   = out.clamp_min(0.0f);
     float total = pos.sum().item<float>();
 
@@ -142,5 +135,119 @@ std::vector<float> TorchModel::forward_tensor(torch::Tensor input, int max_actio
     return probs;
 }
 #endif
+
+// ── OnnxStrategyModel ─────────────────────────────────────────────────────────
+
+OnnxStrategyModel::OnnxStrategyModel()
+#ifdef CFR_ORT_AVAILABLE
+    : env_(ORT_LOGGING_LEVEL_WARNING, "strategy_model")
+#endif
+{}
+
+bool OnnxStrategyModel::load(const std::string& path) {
+#ifdef CFR_ORT_AVAILABLE
+    try {
+        Ort::SessionOptions opts;
+        opts.SetIntraOpNumThreads(1);
+        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        session_ = std::make_unique<Ort::Session>(env_, path.c_str(), opts);
+        loaded_ = true;
+        return true;
+    } catch (const Ort::Exception&) {
+        loaded_ = false;
+        return false;
+    }
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+std::vector<float> OnnxStrategyModel::forward(
+    const std::vector<float>& state_vec,
+    int max_actions) const
+{
+#ifdef CFR_ORT_AVAILABLE
+    if (!loaded_) return {};
+
+    std::vector<float> mask(4, 0.0f);
+    for (int i = 0; i < max_actions && i < 4; ++i) mask[i] = 1.0f;
+
+    std::vector<int64_t> state_shape = {1, (int64_t)state_vec.size()};
+    std::vector<int64_t> mask_shape  = {1, 4};
+
+    auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+    std::array<Ort::Value, 2> inputs = {
+        Ort::Value::CreateTensor<float>(mem,
+            const_cast<float*>(state_vec.data()), state_vec.size(),
+            state_shape.data(), state_shape.size()),
+        Ort::Value::CreateTensor<float>(mem,
+            mask.data(), mask.size(),
+            mask_shape.data(), mask_shape.size()),
+    };
+
+    const char* input_names[]  = {"state", "action_mask"};
+    const char* output_names[] = {"probs"};
+
+    auto outputs = session_->Run(
+        Ort::RunOptions{nullptr},
+        input_names, inputs.data(), 2,
+        output_names, 1
+    );
+
+    auto* data = outputs[0].GetTensorMutableData<float>();
+    return std::vector<float>(data, data + 4);
+#else
+    (void)state_vec; (void)max_actions;
+    return {};
+#endif
+}
+
+std::vector<float> OnnxStrategyModel::forward_batch(
+    const std::vector<float>& states,
+    const std::vector<int>&   max_actions_vec) const
+{
+#ifdef CFR_ORT_AVAILABLE
+    if (!loaded_) return {};
+
+    int batch      = (int)max_actions_vec.size();
+    int state_size = (int)states.size() / batch;
+
+    std::vector<float> masks(batch * 4, 0.0f);
+    for (int b = 0; b < batch; ++b)
+        for (int a = 0; a < max_actions_vec[b] && a < 4; ++a)
+            masks[b * 4 + a] = 1.0f;
+
+    std::vector<int64_t> state_shape = {batch, state_size};
+    std::vector<int64_t> mask_shape  = {batch, 4};
+
+    auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+    std::array<Ort::Value, 2> inputs = {
+        Ort::Value::CreateTensor<float>(mem,
+            const_cast<float*>(states.data()), states.size(),
+            state_shape.data(), state_shape.size()),
+        Ort::Value::CreateTensor<float>(mem,
+            masks.data(), masks.size(),
+            mask_shape.data(), mask_shape.size()),
+    };
+
+    const char* input_names[]  = {"state", "action_mask"};
+    const char* output_names[] = {"probs"};
+
+    auto outputs = session_->Run(
+        Ort::RunOptions{nullptr},
+        input_names, inputs.data(), 2,
+        output_names, 1
+    );
+
+    auto* data = outputs[0].GetTensorMutableData<float>();
+    return std::vector<float>(data, data + batch * 4);
+#else
+    (void)states; (void)max_actions_vec;
+    return {};
+#endif
+}
 
 } // namespace cfr
