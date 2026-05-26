@@ -2,7 +2,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pt
-*.onnx
 *.log
 .DS_Store
 .pytest_cache/
@@ -12,7 +11,12 @@ build/
 *.so
 src/cpp_engine/build/
 blueprints/
-
+ 
+# ONNX — exclude training artefacts but allow web model
+blueprints/**/*.onnx
+*.onnx
+!web/public/models/strategy_net.onnx
+ 
 # Next.js
 web/.next/
 web/node_modules/

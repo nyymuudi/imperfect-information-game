@@ -163,9 +163,9 @@ body {
 .slider-grid {
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: 2rem;
 }
-.slider-field { display: flex; flex-direction: column; gap: 6px; }
+.slider-field { display: flex; flex-direction: column; gap: 8px; }
 .slider-header {
   display: flex;
   justify-content: space-between;
@@ -201,22 +201,22 @@ body {
 input[type=range] {
   -webkit-appearance: none;
   width: 100%;
-  height: 2px;
+  height: 4px;
   background: var(--border2);
   outline: none;
   cursor: pointer;
 }
 input[type=range]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   background: var(--green);
   cursor: pointer;
   border: none;
-  box-shadow: 0 0 6px rgba(34,197,94,0.4);
+  box-shadow: 0 0 6px rgba(74,222,128,0.4);
 }
 input[type=range]::-webkit-slider-runnable-track {
-  height: 2px;
+  height: 4px;
   background: linear-gradient(to right, var(--green) var(--pct, 0%), var(--border2) var(--pct, 0%));
 }
 
