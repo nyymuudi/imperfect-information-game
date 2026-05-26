@@ -195,7 +195,7 @@ body {
   font-size: 11px;
   color: var(--text3);
   line-height: 1.5;
-  margin-top: -2px;
+  margin-top: 6px;
 }
 
 input[type=range] {
@@ -205,15 +205,15 @@ input[type=range] {
   background: var(--border2);
   outline: none;
   cursor: pointer;
+  margin: 6px 0;
 }
 input[type=range]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 18px;
-  height: 18px;
+  width: 3px;
+  height: 16px;
   background: var(--green);
   cursor: pointer;
   border: none;
-  box-shadow: 0 0 6px rgba(74,222,128,0.4);
 }
 input[type=range]::-webkit-slider-runnable-track {
   height: 4px;
