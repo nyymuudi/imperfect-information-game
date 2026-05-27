@@ -177,7 +177,7 @@ class NLHECppBackend:
     Buffer samples store float[122] state vectors — no string parsing.
     """
 
-    STATE_SIZE = 122
+    STATE_SIZE = 124
 
     def __init__(self, n_traversals=500, regret_capacity=1 << 20,
                  strategy_capacity=1 << 20, device="cpu", seed=42,

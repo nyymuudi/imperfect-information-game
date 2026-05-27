@@ -18,7 +18,7 @@
  *   suit: 0=♣, 1=♦, 2=♥, 3=♠
  */
 
-export const STATE_SIZE = 122
+export const STATE_SIZE = 124
 export const STARTING_STACK = 200.0
 export const BOARD_CARDS_BY_STREET = [0, 3, 4, 5] // indexed by street 0-3
 
@@ -143,6 +143,17 @@ export function encode(input: EncodeInput): Float32Array {
   // [121] board strength
   const visibleBoard = boardCards.slice(0, nVisible)
   out[121] = boardStrength(holeCards, visibleBoard)
+
+  // [122] pot odds — to_call / (pot + to_call)
+  out[122] = pot + toCall > 0
+    ? Math.min(toCall / (pot + toCall), 1.0)
+    : 0.0
+
+  // [123] SPR — pot / effective_stack
+  const effectiveStack = Math.min(myStack, oppStack)
+  out[123] = effectiveStack > 0
+    ? Math.min(pot / (effectiveStack + 1e-7), 1.0)
+    : 0.0
 
   return out
 }

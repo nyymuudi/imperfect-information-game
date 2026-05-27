@@ -16,7 +16,7 @@ import torch.nn as nn
 # ── Minimal stubs so tests run without the full project installed ─────────────
 
 class _FakeStrategyNet(nn.Module):
-    def __init__(self, state_size=122, action_size=4, hidden_size=64):
+    def __init__(self, state_size=124, action_size=4, hidden_size=64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_size, hidden_size), nn.ReLU(),
@@ -64,7 +64,7 @@ class TestBlueprintMetadata:
         loaded = BlueprintMetadata.from_json(meta.to_json())
         assert loaded.iterations == 100
         assert loaded.hidden_size == 256
-        assert loaded.state_size == 122
+        assert loaded.state_size == 124
 
     def test_all_fields_serialised(self):
         meta = BlueprintMetadata(
@@ -133,7 +133,7 @@ class TestBlueprintFromSolver:
             for p in solver.strategy_net.parameters():
                 p.fill_(99.0)
 
-        x    = torch.randn(1, 122)
+        x    = torch.randn(1, 124)
         mask = torch.ones(1, 4)
         probs = bp._net(x.to(bp._device), mask.to(bp._device))
         assert not torch.allclose(probs, torch.full_like(probs, 99.0))
@@ -168,7 +168,7 @@ class TestBlueprintPersistence:
     def test_save_load_roundtrip_weights(self, tmp_path):
         """Weights must survive save → load → inference."""
         bp = self._make_blueprint()
-        state_vec = np.random.randn(122).astype(np.float32)
+        state_vec = np.random.randn(124).astype(np.float32)
         probs_before = bp.query(state_vec, num_actions=3)
 
         bp.save(tmp_path / "bp")
@@ -187,7 +187,7 @@ class TestBlueprintQuery:
         return Blueprint.from_solver(_FakeSolver())
 
     def test_query_returns_valid_distribution(self, bp):
-        state_vec = np.random.randn(122).astype(np.float32)
+        state_vec = np.random.randn(124).astype(np.float32)
         for n in [1, 2, 3, 4]:
             probs = bp.query(state_vec, num_actions=n)
             assert probs.shape == (n,)
@@ -195,27 +195,27 @@ class TestBlueprintQuery:
             assert abs(sum(probs) - 1.0) < 1e-5
 
     def test_query_illegal_action_count_raises(self, bp):
-        state_vec = np.random.randn(122).astype(np.float32)
+        state_vec = np.random.randn(124).astype(np.float32)
         with pytest.raises(AssertionError):
             bp.query(state_vec, num_actions=0)
         with pytest.raises(AssertionError):
             bp.query(state_vec, num_actions=5)
 
     def test_query_batch_shape(self, bp):
-        states = np.random.randn(16, 122).astype(np.float32)
+        states = np.random.randn(16, 124).astype(np.float32)
         counts = [2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2]
         probs = bp.query_batch(states, counts)
         assert probs.shape == (16, 4)
 
     def test_query_batch_valid_distributions(self, bp):
-        states = np.random.randn(8, 122).astype(np.float32)
+        states = np.random.randn(8, 124).astype(np.float32)
         counts = [3] * 8
         probs = bp.query_batch(states, counts)
         row_sums = probs[:, :3].sum(axis=1)
         np.testing.assert_allclose(row_sums, np.ones(8), atol=1e-5)
 
     def test_query_batch_padding_zeroed(self, bp):
-        states = np.random.randn(4, 122).astype(np.float32)
+        states = np.random.randn(4, 124).astype(np.float32)
         counts = [2, 2, 2, 2]
         probs = bp.query_batch(states, counts)
         # Columns 2 and 3 should be zero for num_actions=2
@@ -223,7 +223,7 @@ class TestBlueprintQuery:
 
     def test_query_matches_query_batch(self, bp):
         """Single query and batch query must agree."""
-        state_vec = np.random.randn(122).astype(np.float32)
+        state_vec = np.random.randn(124).astype(np.float32)
         single = bp.query(state_vec, num_actions=3)
         batch  = bp.query_batch(state_vec[None], [3])
         np.testing.assert_allclose(single, batch[0, :3], atol=1e-5)

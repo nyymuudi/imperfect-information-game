@@ -196,11 +196,11 @@ class TestNLHEEncoder:
         self.deal = make_deal("AhKh", "QdJd", "7c8s9cTh2d")
 
     def test_state_size(self):
-        assert self.encoder.state_size() == 122
+        assert self.encoder.state_size() == 124
 
     def test_output_shape(self):
         state = self.encoder.encode(self.deal, 0)
-        assert state.shape == (122,)
+        assert state.shape == (124,)
 
     def test_output_dtype(self):
         state = self.encoder.encode(self.deal, 0)

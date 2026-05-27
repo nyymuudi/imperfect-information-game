@@ -118,7 +118,7 @@ class NLHEEncoder(StateEncoder):
     """
     No-Limit Hold'em state encoder for Deep CFR.
     
-    State vector (120 dimensions):
+    State vector (124 dimensions):
         [0:52]    Private cards (one-hot, 2 bits set)
         [52:104]  Board cards (one-hot, 0-5 bits set)
         [104:108] Street (one-hot: preflop/flop/turn/river)
@@ -175,10 +175,10 @@ class NLHEEncoder(StateEncoder):
         return 0.0
 
     def state_size(self) -> int:
-        return 122
+        return 124
 
     def encode(self, history: History, player: int) -> np.ndarray:
-        state = np.zeros(122, dtype=np.float32)
+        state = np.zeros(124, dtype=np.float32)
 
         # Private cards (one-hot in 52-dim)
         p0_cards = history[0]  # (card1, card2)
@@ -219,6 +219,16 @@ class NLHEEncoder(StateEncoder):
         state[120] = self._get_preflop_equity(my_cards[0], my_cards[1])
         visible_board = history[2][:n_visible] if n_visible > 0 else ()
         state[121] = self._get_board_strength(my_cards, visible_board)
+
+        # dim [122]: pot odds = to_call / (pot + to_call)
+        # Captures the immediate cost of calling relative to the reward.
+        pot_plus_call = pot + to_call
+        state[122] = to_call / pot_plus_call if pot_plus_call > 1e-6 else 0.0
+
+        # dim [123]: SPR = min(stacks) / pot, normalised (cap at 10)
+        # Stack-to-pot ratio: large SPR → post-flop implied odds matter more.
+        eff_stack  = min(my_stack, opp_stack)
+        state[123] = min(eff_stack / pot, 10.0) / 10.0 if pot > 1e-6 else 1.0
 
         return state
 

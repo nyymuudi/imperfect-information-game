@@ -29,7 +29,7 @@ inline float preflop_equity(int rank_high, int rank_low, bool suited) {
 
 class NLHEStateEncoder {
 public:
-    static constexpr int STATE_SIZE = 122;
+    static constexpr int STATE_SIZE = 124;
     static void encode(const NLHEState& state, int player, float* out);
     static std::vector<float> encode_vec(const NLHEState& state, int player);
 

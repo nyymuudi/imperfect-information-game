@@ -21,6 +21,7 @@ const MODEL_PATH =
 
 let _session: ort.InferenceSession | null = null
 let _loading: Promise<ort.InferenceSession> | null = null
+let _queue: Promise<unknown> = Promise.resolve()
 
 export async function getSession(): Promise<ort.InferenceSession> {
   if (_session) return _session
@@ -43,33 +44,25 @@ export async function getSession(): Promise<ort.InferenceSession> {
  * Returns softmax-normalised action probabilities after regret matching.
  */
 export async function queryStrategy(input: EncodeInput): Promise<ActionProbs> {
+  // Serialise all inference calls — onnxruntime-web does not support concurrent session.run
+  const result = await (_queue = _queue.then(() => _infer(input)))
+  return result as ActionProbs
+}
+
+async function _infer(input: EncodeInput): Promise<ActionProbs> {
   const session  = await getSession()
   const stateVec = encode(input)
-  console.log('state nonzero:', Array.from(stateVec).filter(v => v !== 0))
 
   const stateTensor = new ort.Tensor('float32', stateVec, [1, STATE_SIZE])
   const maskData    = new Float32Array([1, 1, 1, 1])
   const maskTensor  = new ort.Tensor('float32', maskData, [1, 4])
-  const feeds       = {
-    state:       stateTensor,
-    action_mask: maskTensor,
-  }
-  const result = await session.run(feeds)
+  const feeds       = { state: stateTensor, action_mask: maskTensor }
+  const output      = await session.run(feeds)
 
-  const logits = result[session.outputNames[0]].data as Float32Array
-  console.log('raw logits:', Array.from(logits))
+  const logits = output[session.outputNames[0]].data as Float32Array
+  const pos    = Array.from(logits.slice(0, 4)).map(v => Math.max(v, 0))
+  const total  = pos.reduce((a, b) => a + b, 0)
+  const probs  = total > 1e-7 ? pos.map(v => v / total) : [0.25, 0.25, 0.25, 0.25]
 
-  // Regret matching: clamp negatives, normalise — mirrors TorchModel::forward_tensor
-  const pos   = Array.from(logits.slice(0, 4)).map(v => Math.max(v, 0))
-  const total = pos.reduce((a, b) => a + b, 0)
-  const probs = total > 1e-7
-    ? pos.map(v => v / total)
-    : [0.25, 0.25, 0.25, 0.25]
-
-  return {
-    fold:  probs[0],
-    call:  probs[1],
-    raise: probs[2],
-    allIn: probs[3],
-  }
+  return { fold: probs[0], call: probs[1], raise: probs[2], allIn: probs[3] }
 }

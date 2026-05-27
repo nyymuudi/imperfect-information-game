@@ -107,40 +107,34 @@ export default function RangeMatrix() {
     startTransition(async () => {
       try {
         const out: Record<string, ActionProbs> = {}
-        const jobs: Promise<void>[] = []
+        const hands: { label: string; card0: number; card1: number }[] = []
 
         for (let ri = 12; ri >= 0; ri--) {
           for (let ci = 12; ci >= 0; ci--) {
             const suited = ri > ci
             const pair   = ri === ci
             const label  = pair ? RANKS[ri] + RANKS[ri] : handLabel(ri, ci, suited)
-
-            const s1   = 0
-            const s2   = suited ? 1 : 2
-            const hi   = pair ? ri : Math.max(ri, ci)
-            const lo   = pair ? ri : Math.min(ri, ci)
-            const card0 = makeCard(hi, s1)
-            const card1 = makeCard(lo, pair ? 1 : s2)
-
+            const s1     = 0
+            const s2     = suited ? 1 : 2
+            const hi     = pair ? ri : Math.max(ri, ci)
+            const lo     = pair ? ri : Math.min(ri, ci)
+            const card0  = makeCard(hi, s1)
+            const card1  = makeCard(lo, pair ? 1 : s2)
             if (visibleBoard.includes(card0) || visibleBoard.includes(card1)) continue
-
-            jobs.push(
-              queryStrategy({
-                holeCards:     [card0, card1],
-                boardCards:    visibleBoard,
-                street,
-                pot,
-                toCall,
-                myStack:       200 - pot / 2,
-                oppStack:      200 - pot / 2,
-                actionHistory: [],
-              }).then(p => { out[label] = p })
-            )
+            hands.push({ label, card0, card1 })
           }
         }
 
-        await Promise.all(jobs)
-        setResults(out)
+        for (const { label, card0, card1 } of hands) {
+          const p = await queryStrategy({
+            holeCards: [card0, card1], boardCards: visibleBoard,
+            street, pot, toCall,
+            myStack: 200 - pot / 2, oppStack: 200 - pot / 2,
+            actionHistory: [],
+          })
+          out[label] = p
+          setResults({ ...out })
+        }
       } catch (e) {
         setError('Model failed to load — check /public/models/strategy_net.onnx')
         console.error(e)
@@ -186,20 +180,30 @@ export default function RangeMatrix() {
       )}
 
       <div className="matrix-controls">
-        <div className="flex gap-3">
-          <label className="bet-field">
-            <span className="slider-label">Pot</span>
-            <input type="number" value={pot} min={2} max={400}
-              onChange={e => setPot(Number(e.target.value))} className="bet-input" style={{ width: 80 }} />
-          </label>
-          <label className="bet-field">
-            <span className="slider-label">To call</span>
-            <input type="number" value={toCall} min={0} max={200}
-              onChange={e => setToCall(Number(e.target.value))} className="bet-input" style={{ width: 80 }} />
-          </label>
+        <div className="slider-grid" style={{ width: '100%' }}>
+          <div className="slider-field">
+            <div className="slider-header">
+              <span className="slider-label">Pot</span>
+              <span><span className="slider-value">{pot}</span><span className="slider-unit"> BB</span></span>
+            </div>
+            <input type="range" min={2} max={400} step={1} value={pot}
+              style={{ '--pct': `${((pot-2)/398*100).toFixed(1)}%` } as React.CSSProperties}
+              onChange={e => setPot(Number(e.target.value))} />
+            <span className="slider-desc">Total chips currently in the middle.</span>
+          </div>
+          <div className="slider-field">
+            <div className="slider-header">
+              <span className="slider-label">To call</span>
+              <span><span className="slider-value">{toCall}</span><span className="slider-unit"> BB</span></span>
+            </div>
+            <input type="range" min={0} max={200} step={1} value={toCall}
+              style={{ '--pct': `${(toCall/200*100).toFixed(1)}%` } as React.CSSProperties}
+              onChange={e => setToCall(Number(e.target.value))} />
+            <span className="slider-desc">Amount to pay to stay in the hand.</span>
+          </div>
         </div>
         <button onClick={runMatrix} disabled={pending} className="query-btn">
-          {pending ? '[ Computing 169 hands… ]' : '[ Generate matrix → ]'}
+          {pending ? `[ Computing… ]` : '[ Generate matrix → ]'}
         </button>
       </div>
 

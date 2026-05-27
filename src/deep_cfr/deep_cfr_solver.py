@@ -175,7 +175,7 @@ class DeepCFRSolver:
 
             if len(self.regret_buffer) >= self.train_batch:
                 # Fresh Adam optimizer each iteration — avoids momentum lock-in
-                train_regret_network(
+                self._last_regret_loss = train_regret_network(
                     self.regret_net, self.regret_buffer,
                     epochs=self.train_epochs,
                     batch_size=self.train_batch,

@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 @dataclass
 class BlueprintMetadata:
-    state_size:          int   = 122
+    state_size:          int   = 124
     action_size:         int   = 4
     hidden_size:         int   = 256
     starting_stack:      float = 200.0

@@ -60,6 +60,16 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     bool suited = (s0 == s1) && (c0 != c1);
     out[120] = preflop_equity(rh, rl, suited);
     out[121] = board_strength(state, player);
+
+    // dim [122]: pot odds = to_call / (pot + to_call)
+    float pot_plus_call = state.pot + to_call;
+    out[122] = (pot_plus_call > 1e-6f) ? (to_call / pot_plus_call) : 0.0f;
+
+    // dim [123]: SPR = min(stacks) / pot, normalised (cap at 10)
+    float eff_stack = std::min(state.stacks[0], state.stacks[1]);
+    out[123] = (state.pot > 1e-6f)
+               ? std::min(eff_stack / state.pot, 10.0f) / 10.0f
+               : 1.0f;
 }
 
 float NLHEStateEncoder::board_strength(const NLHEState& state, int player) {
