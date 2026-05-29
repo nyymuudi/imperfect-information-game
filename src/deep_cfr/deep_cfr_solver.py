@@ -3,6 +3,16 @@ Deep CFR Solver.
 
 Reference: Steinberger, E. (2019). "Single Deep Counterfactual
 Regret Minimization." arXiv:1901.07621.
+
+Buffer strategy (Steinberger 2019, Section 3):
+    Regret buffer  (MR): SlidingWindowBuffer — only fresh data needed.
+        The regret network predicts counterfactual regrets for the
+        CURRENT strategy. Old regrets from early iterations corrupt
+        the gradient signal. FIFO keeps only the last K samples.
+    Strategy buffer (MΠ): ReservoirBuffer — needs full history average.
+        The strategy network approximates the time-average strategy
+        across all iterations, so reservoir sampling over the full
+        history is correct here.
 """
 
 import numpy as np
@@ -42,9 +52,10 @@ class DeepCFRSolver:
         self.regret_net   = RegretNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
         self.strategy_net = StrategyNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
 
-        # Reservoir sampling — uniform over all history, matches original Deep CFR
+        # Regret buffer: SlidingWindowBuffer (FIFO — fresh data only)
+        # Strategy buffer: ReservoirBuffer (full history average)
         self.regret_buffer   = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions, mode='reservoir')
-        self.strategy_buffer = ReservoirBuffer(strat_cap,            state_sz, self.max_actions, mode='reservoir')
+        self.strategy_buffer = ReservoirBuffer(strat_cap, state_sz, self.max_actions, mode='reservoir')
 
         self.iterations = 0
         self._rng = np.random.default_rng(42)

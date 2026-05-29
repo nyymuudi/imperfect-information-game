@@ -1,3 +1,4 @@
+from typing import Optional
 """
 Experience replay buffers for Deep CFR.
 
@@ -146,3 +147,75 @@ class ReservoirBuffer:
         self.size        = 0
         self.total_added = 0
         self._head       = 0
+# ── SlidingWindowBuffer ───────────────────────────────────────────────────────
+
+@dataclass
+class SlidingWindowBuffer:
+    """
+    FIFO sliding window buffer for the regret network.
+
+    Keeps only the K most recent samples. When capacity is reached,
+    the oldest sample is dropped automatically (deque maxlen semantics).
+
+    Rationale (Steinberger 2019, Deep CFR):
+        The regret network needs only FRESH data — its job is to predict
+        counterfactual regrets for the CURRENT strategy, not historical ones.
+        A reservoir buffer over-represents early iterations when the strategy
+        was poor. A sliding window fixes this by always training on the
+        most recent K samples only.
+
+    Interface is identical to ReservoirBuffer so the two are drop-in
+    replaceable in DeepCFRSolver.
+    """
+    capacity:    int
+    state_size:  int
+    action_size: int
+
+    def __post_init__(self):
+        from collections import deque
+        self._states  = deque(maxlen=self.capacity)
+        self._targets = deque(maxlen=self.capacity)
+        self._weights = deque(maxlen=self.capacity)
+
+    def add(self, state: np.ndarray, target: np.ndarray, weight: float):
+        padded = np.zeros(self.action_size, dtype=np.float32)
+        padded[:len(target)] = target
+        self._states.append(state.astype(np.float32))
+        self._targets.append(padded)
+        self._weights.append(float(weight))
+
+    def add_batch(
+        self,
+        states:  np.ndarray,
+        targets: np.ndarray,
+        weights: Optional[np.ndarray] = None,
+    ):
+        n = len(states)
+        w = weights if weights is not None else np.ones(n, dtype=np.float32)
+        for i in range(n):
+            self._states.append(states[i].astype(np.float32))
+            self._targets.append(targets[i].astype(np.float32))
+            self._weights.append(float(w[i]))
+
+    def sample_batch(self, batch_size: int):
+        n = len(self._states)
+        if n == 0:
+            return None
+        k   = min(batch_size, n)
+        idx = np.random.choice(n, size=k, replace=False)
+        states  = np.array([self._states[i]  for i in idx], dtype=np.float32)
+        targets = np.array([self._targets[i] for i in idx], dtype=np.float32)
+        weights = np.array([self._weights[i] for i in idx], dtype=np.float32)
+        return states, targets, weights
+
+    def __len__(self) -> int:
+        return len(self._states)
+
+    def clear(self):
+        self._states.clear()
+        self._targets.clear()
+        self._weights.clear()
+
+    @property
+    def size(self) -> int:
+        return len(self._states)

@@ -174,6 +174,11 @@ def main() -> int:
             f"loss={reg_loss:.4f} | "
             f"t={elapsed:.1f}s"
         )
+        # Checkpoint every 1000 iterations
+        if args.save_blueprint and i % 1000 == 0:
+            ckpt_path = args.save_blueprint + f"_ckpt{i}"
+            Blueprint.from_solver(s, device="cpu").save(ckpt_path)
+            print(f"  [checkpoint saved → {ckpt_path}]")
 
     solver.solve(
         iterations=args.iterations,
