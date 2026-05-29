@@ -1,7 +1,7 @@
 /**
  * TypeScript port of NLHEStateEncoder (src/cpp_engine/src/torch_model.cpp)
  *
- * Tensor layout (122 dims):
+ * Tensor layout (124 dims):
  *   [0:52]    hole cards one-hot
  *   [52:104]  visible board cards one-hot
  *   [104:108] street one-hot (0=preflop, 1=flop, 2=turn, 3=river)
@@ -12,6 +12,8 @@
  *   [112:120] action history — last 8 actions (ACTION_ENC values)
  *   [120]     preflop equity
  *   [121]     board_strength
+ *   [122]     pot odds = to_call / (pot + to_call)
+ *   [123]     SPR = min(stacks) / pot, normalised (cap at 10)
  *
  * Card encoding: card = rank * 4 + suit
  *   rank: 0=2, 1=3, ..., 12=A
@@ -22,12 +24,12 @@ export const STATE_SIZE = 124
 export const STARTING_STACK = 200.0
 export const BOARD_CARDS_BY_STREET = [0, 3, 4, 5] // indexed by street 0-3
 
-// Must match NLHE_ACTION_ENC[] in nlhe_game.hpp — verify against C++ source
+// Verified against NLHE_ACTION_ENC[4] = {0.0f, 0.25f, 0.5f, 1.0f} in nlhe_game.hpp
 // Actions: 0=fold/check, 1=call, 2=raise, 3=all-in
 export const ACTION_ENC: Record<number, number> = {
-  0: 0.25, // fold or check
-  1: 0.5,  // call
-  2: 0.75, // raise
+  0: 0.0,  // fold or check
+  1: 0.25, // call
+  2: 0.5,  // raise
   3: 1.0,  // all-in
 }
 
@@ -97,7 +99,7 @@ export function boardStrength(
 }
 
 /**
- * Encode game state into a 122-dim Float32Array.
+ * Encode game state into a 124-dim Float32Array.
  * Identical layout to NLHEStateEncoder::encode() in torch_model.cpp.
  */
 export function encode(input: EncodeInput): Float32Array {

@@ -164,6 +164,59 @@ PYBIND11_MODULE(cfr_engine, m) {
              py::arg("board"), py::arg("pot"), py::arg("to_call"),
              py::arg("my_stack"));
 
+    // ── NLHEDeal factory ─────────────────────────────────────────────────────
+    // Expose as an opaque handle + factory function; C-style arrays don't bind
+    // cleanly as writable members, so we use a lambda constructor instead.
+    py::class_<NLHEDeal>(m, "NLHEDeal")
+        .def(py::init<>());
+
+    m.def("make_nlhe_deal",
+        [](int h00, int h01, int h10, int h11,
+           const std::vector<int>& board) {
+            NLHEDeal d{};
+            d.hole_cards[0][0] = (int8_t)h00;
+            d.hole_cards[0][1] = (int8_t)h01;
+            d.hole_cards[1][0] = (int8_t)h10;
+            d.hole_cards[1][1] = (int8_t)h11;
+            for (int i = 0; i < 5 && i < (int)board.size(); ++i)
+                d.board[i] = (int8_t)board[i];
+            return d;
+        },
+        py::arg("h00"), py::arg("h01"),
+        py::arg("h10"), py::arg("h11"),
+        py::arg("board"),
+        "Construct an NLHEDeal from card indices.");
+
+    // ── NLHEState (opaque — construct via NLHEGame.initial_state) ────────────
+    py::class_<NLHEState>(m, "NLHEState")
+        .def_readonly("terminal",        &NLHEState::terminal)
+        .def_readonly("pot",             &NLHEState::pot)
+        .def_readonly("street",          &NLHEState::street)
+        .def_readonly("current_player",  &NLHEState::current_player)
+        .def_readonly("action_count",    &NLHEState::action_count)
+        .def("stack", [](const NLHEState& s, int p){ return s.stacks[p]; })
+        .def("street_invest",
+             [](const NLHEState& s, int p){ return s.street_invest[p]; });
+
+    // ── NLHEGame static interface ─────────────────────────────────────────────
+    py::class_<NLHEGame>(m, "NLHEGame")
+        .def_static("initial_state",
+            [](const NLHEDeal& d, const NLHEGameConfig& cfg){
+                return NLHEGame::initial_state(d, cfg);
+            },
+            py::arg("deal"), py::arg("cfg") = NLHEGameConfig{})
+        .def_static("legal_actions", &NLHEGame::legal_actions)
+        .def_static("apply_action",  &NLHEGame::apply_action)
+        .def_static("info_set_key",  &NLHEGame::info_set_key);
+
+    // ── NLHEStateEncoder ──────────────────────────────────────────────────────
+    py::class_<NLHEStateEncoder>(m, "NLHEStateEncoder")
+        .def_static("encode_vec",
+            [](const NLHEState& s, int player){
+                return NLHEStateEncoder::encode_vec(s, player);
+            },
+            py::arg("state"), py::arg("player"));
+
     m.attr("NLHE_STACK")      = NLHE_STACK;
     m.attr("NLHE_BB")         = NLHE_BB;
     m.attr("NLHE_DECK_SIZE")  = NLHE_DECK_SIZE;

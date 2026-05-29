@@ -159,7 +159,7 @@ The raw traversal speedup (51.6× on Leduc) does not translate directly to end-t
 
 ### Design decisions
 
-**State-vector buffers.** Buffer samples store the full 122-dim state vector (float[122]) rather than info-set key strings. The previous string-based approach silently zeroed 9 of 122 features (to_call, my_stack, opp_stack, equity, board_strength) during parsing, causing the regret network to train on incomplete information. Fixing this enabled raise frequencies to differentiate by hand strength (AA 50%, QQ 63%).
+**State-vector buffers.** Buffer samples store the full 124-dim state vector (float[124]) rather than info-set key strings. The previous string-based approach silently zeroed 9 of 122 features (to_call, my_stack, opp_stack, equity, board_strength) during parsing, causing the regret network to train on incomplete information. Fixing this enabled raise frequencies to differentiate by hand strength (AA 50%, QQ 63%).
 
 **LibTorch over Python callbacks.** GIL acquisition at every tree node completely negates traversal gains. LibTorch loads the TorchScript model directly into C++, enabling inline inference with zero Python involvement from iteration 2 onward.
 
@@ -205,7 +205,7 @@ src/
 │   ├── deep_cfr_solver.py   # Deep CFR training loop
 │   ├── networks.py          # RegretNetwork (Huber) + StrategyNetwork (softmax)
 │   ├── replay_buffer.py     # Reservoir + sliding-window buffers, add_batch
-│   ├── state_encoder.py     # LeducEncoder (20-dim) + NLHEEncoder (122-dim)
+│   ├── state_encoder.py     # LeducEncoder (20-dim) + NLHEEncoder (124-dim)
 │   ├── cpp_backend.py       # C++ engine interface + export_for_libtorch
 │   └── train_postflop.py    # Postflop NLHE training runner
 │
@@ -224,8 +224,8 @@ src/
 │   │   ├── leduc_game.hpp
 │   │   ├── mccfr.hpp        # ReservoirBuffer<T> (Vitter 1985)
 │   │   ├── nlhe_game.hpp    # NLHEGameConfig + 4-action enum + NLHEState
-│   │   ├── nlhe_mccfr.hpp   # NLHERegretSample { float state[122] }
-│   │   └── torch_model.hpp  # TorchModel + NLHEStateEncoder (122-dim)
+│   │   ├── nlhe_mccfr.hpp   # NLHERegretSample { float state[124] }
+│   │   └── torch_model.hpp  # TorchModel + NLHEStateEncoder (124-dim)
 │   ├── src/
 │   │   ├── nlhe_game.cpp    # 4-action tree, configurable sizing
 │   │   ├── nlhe_mccfr.cpp   # State-vector samples, direct 4-slot inference
@@ -268,7 +268,7 @@ flowchart TD
         E{{"iter == 1?"}}
         E -- "Yes" --> F["run_traversals_uniform()"]
         E -- "No" --> G["run_traversals_model()\nLibTorch · zero Python callbacks"]
-        F & G --> H["NLHERegretSample\nfloat state[122] + action + regret"]
+        F & G --> H["NLHERegretSample\nfloat state[124] + action + regret"]
     end
 
     H --> I["numpy add_batch()\nvectorised buffer insert"]

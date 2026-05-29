@@ -248,22 +248,6 @@ class NLHECppBackend:
 
         actions = np.array(list(export.actions), dtype=np.int64)
         values  = np.array(list(export.values),  dtype=np.float32)
-
-        # Expand scalar regret/probability into full action-size target vector
-        action_size = 4
-        targets = np.zeros((n, action_size), dtype=np.float32)
-        iters   = np.array(list(export.iterations), dtype=np.float32)
-
-        for i in range(n):
-            a = int(actions[i])
-            if 0 <= a < action_size:
-                targets[i, a] = values[i]
-
-        weights = iters / max(iters.max(), 1.0)
-
-        def add_batch(buf):
-            buf.add_batch(states, targets, weights)
-
         return X, torch.from_numpy(actions), torch.from_numpy(values)
 
     def add_batch(self, regret_buf, strategy_buf, reg_exp, str_exp) -> None:

@@ -255,7 +255,11 @@ std::string NLHEGame::info_set_key(const NLHEState& s, int player) {
     int nv=visible_board_cards(s.street);
     for(int i=0;i<nv;++i)
         oss<<std::hex<<std::setw(2)<<std::setfill('0')<<(int)s.board[i];
-    int pot_bucket=std::min(7,(int)(s.pot/50.0f));  // /50 for 200BB stack
+    // Scale bucket boundaries with starting_stack so all stack sizes
+    // (10BB, 50BB, 200BB) produce meaningful coverage (not all bucket 0).
+    // With starting_stack=200: bucket_width=50 → identical to before.
+    float bucket_width = s.cfg.starting_stack / 4.0f;
+    int pot_bucket = std::min(7, (int)(s.pot / bucket_width));
     oss<<std::dec<<"|P"<<pot_bucket<<"|A";
     for(int i=0;i<s.action_count;++i) oss<<(int)s.action_history[i];
     return oss.str();

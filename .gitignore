@@ -1,21 +1,43 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.pt
-*.log
-.DS_Store
-.pytest_cache/
 *.egg-info/
 dist/
-build/
+.pytest_cache/
+
+# Mallit — generoidaan trainingissa
+*.pt
+*.onnx
+blueprints/
+
+# C++ build
 *.so
 src/cpp_engine/build/
-blueprints/
- 
-# ONNX — exclude training artefacts but allow web model
-blueprints/**/*.onnx
- 
-# Next.js
-web/.next/
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Backup- ja patch-tiedostot
+*.bak
+apply_fixes*.py
+web/apply_fixes*.py
+
+# Logit
+*.log
+
+# Web — Node
 web/node_modules/
+web/.next/
+web/.env*
 web/.env.local
+
+# Colab / Linux
+*.zip
+/content/
+.ipynb_checkpoints/
+
+# IDE
+.vscode/settings.json
+.idea/

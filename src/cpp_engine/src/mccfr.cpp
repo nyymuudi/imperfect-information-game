@@ -11,15 +11,18 @@ namespace cfr {
 
 template <typename T>
 bool ReservoirBuffer<T>::insert(const T& sample) {
-    ++total_seen_;
     if (size_ < capacity_) {
         data_.push_back(sample);
         ++size_;
+        ++total_seen_;
         return true;
     }
-    // Vitter Algorithm R: replace random element with probability cap/total_seen
-    std::uniform_int_distribution<size_t> dist(0, total_seen_ - 1);
+    // Vitter Algorithm R: for the n-th element (n = total_seen_+1),
+    // draw j in [0, total_seen_] (total_seen_+1 outcomes) and keep if j < cap.
+    // P(keep) = capacity_ / (total_seen_+1) — increment AFTER the draw.
+    std::uniform_int_distribution<size_t> dist(0, total_seen_);
     size_t idx = dist(rng_);
+    ++total_seen_;
     if (idx < capacity_) {
         data_[idx] = sample;
         return true;

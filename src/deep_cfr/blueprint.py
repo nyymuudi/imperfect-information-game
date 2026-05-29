@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -174,18 +175,77 @@ class Blueprint:
                 verbose=False,
                 dynamo=False
             )
-        except Exception as exc:  # pragma: no cover
-            print(f"[Blueprint] ONNX export failed: {exc}. "
-                  "C++ inference unavailable; Python query still works.")
+        except Exception as exc:
+            raise RuntimeError(
+                f"[Blueprint] ONNX export failed: {exc}\n"
+                "Web and C++ inference require a valid ONNX file. "
+                "Fix the export error or set require_onnx=False "
+                "if only Python inference is needed."
+            ) from exc
 
         # 3. metadata
         (p / self.METADATA_FILE).write_text(self.metadata.to_json())
+
+        # 4. model_manifest.json — versioned model path for web frontend.
+        #    SHA-256 hash prevents stale browser / CDN cache from serving
+        #    an old model after a retrain.
+        import hashlib, json as _json
+        onnx_path = p / self.ONNX_FILE
+        if onnx_path.exists():
+            digest = hashlib.sha256(onnx_path.read_bytes()).hexdigest()[:12]
+            versioned_name = f"strategy_net.{digest}.onnx"
+            versioned_path = p / versioned_name
+            shutil.copy2(onnx_path, versioned_path)   # keep original too
+            manifest = {
+                "model_path":  f"/models/{versioned_name}",
+                "hash":        digest,
+                "iterations":  self.metadata.iterations,
+                "state_size":  self.metadata.state_size,
+                "timestamp":   self.metadata.timestamp,
+            }
+            (p / "model_manifest.json").write_text(
+                _json.dumps(manifest, indent=2)
+            )
+            print(f"  manifest → model_manifest.json  (hash {digest})")
 
         print(f"[Blueprint] Saved to {p.resolve()}")
         print(f"  state_size={self.metadata.state_size}, "
               f"hidden={self.metadata.hidden_size}, "
               f"iterations={self.metadata.iterations}, "
               f"strategy_samples={self.metadata.strategy_samples:,}")
+
+    def verify(self, path: str | Path) -> dict[str, bool]:
+        """
+        Check that all three artefacts exist and are loadable.
+        Returns {filename: ok} dict.  Raises on critical failures.
+        """
+        p = Path(path)
+        results: dict[str, bool] = {}
+
+        # weights
+        results[self.WEIGHTS_FILE] = (p / self.WEIGHTS_FILE).exists()
+
+        # metadata
+        results[self.METADATA_FILE] = (p / self.METADATA_FILE).exists()
+
+        # ONNX — try to load via onnxruntime if available
+        onnx_path = p / self.ONNX_FILE
+        if not onnx_path.exists():
+            results[self.ONNX_FILE] = False
+        else:
+            try:
+                import onnxruntime as ort
+                ort.InferenceSession(str(onnx_path))
+                results[self.ONNX_FILE] = True
+            except Exception:
+                results[self.ONNX_FILE] = False
+
+        missing = [k for k, v in results.items() if not v]
+        if missing:
+            raise FileNotFoundError(
+                f"[Blueprint.verify] missing or broken artefacts: {missing}"
+            )
+        return results
 
     @classmethod
     def load(cls, path: str | Path, device: Optional[str] = None) -> "Blueprint":

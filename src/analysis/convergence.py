@@ -171,7 +171,7 @@ def verify_kuhn_nash(
         "error": 1.0 - q_check_after_check,
     }
 
-    # Property 8: P0 calls with K facing check-bet
+    # Property 9: P0 calls with K facing check-bet
     k_call_cb = strategy.get("K:cb", np.array([0.5, 0.5]))[1]
     results["P0 K calls check-bet"] = {
         "detail": f"K:cb call = {k_call_cb:.4f}",
@@ -179,7 +179,7 @@ def verify_kuhn_nash(
         "error": 1.0 - k_call_cb,
     }
 
-    # Property 9: P0 folds with J facing check-bet
+    # Property 10: P0 folds with J facing check-bet
     j_fold_cb = strategy.get("J:cb", np.array([0.5, 0.5]))[0]
     results["P0 J folds check-bet"] = {
         "detail": f"J:cb fold = {j_fold_cb:.4f}",
@@ -187,7 +187,7 @@ def verify_kuhn_nash(
         "error": 1.0 - j_fold_cb,
     }
 
-    # Property 10: α ∈ [0, 1/3]
+    # Property 11: α ∈ [0, 1/3]
     results["α in valid range"] = {
         "detail": f"α (J bet prob) = {j_bet:.4f}",
         "match": -tolerance < j_bet < 1/3 + tolerance,

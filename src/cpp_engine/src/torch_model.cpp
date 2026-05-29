@@ -81,7 +81,15 @@ float NLHEStateEncoder::board_strength(const NLHEState& state, int player) {
     for(int i = 0; i < n_visible && i < 5; ++i) cards[2+i] = state.board[i];
     int n = 2 + std::min(n_visible, 5);
     int32_t score = HandEvaluator::evaluate(cards, n);
-    constexpr float MAX_SCORE = static_cast<float>(8 << 24);
+    // True maximum: straight flush (cat 8) with ace-high (rank 12)
+    // = (8 << 24) | (12 << 20) = 146_800_640.
+    // The old value (8 << 24 = 134_217_728) was too low; a royal flush
+    // produced score/MAX > 1.0 before clamping, saturating dim 121.
+    //
+    // KNOWN RESIDUAL: Python _get_board_strength uses evaluate_7card()/6_000_000,
+    // a different evaluator. Both are monotone in [0,1] but not numerically
+    // equivalent for the same hand — see test_encoder_parity.py.
+    constexpr float MAX_SCORE = static_cast<float>((8 << 24) | (12 << 20));
     return std::min((float)score / MAX_SCORE, 1.0f);
 }
 

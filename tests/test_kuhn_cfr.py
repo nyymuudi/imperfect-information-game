@@ -224,6 +224,27 @@ class TestNashVerification:
         j_bet = self.strategy["J:"][1]
         assert -0.01 < j_bet < 1/3 + 0.05
 
+    def test_game_value_converges_to_analytical(self):
+        """
+        Kuhn Pokerin analyyttinen peliarvo on -1/18 ≈ -0.05556 (P0:n EV).
+        Tämä on vahvin yksittäinen korrektiiuustarkistus koko solverille:
+        tarttuu sekä peli- että solverilogiikan virheisiin.
+        Viite: Kuhn (1950), s. 99.
+        """
+        from src.main import best_response_value
+        game     = KuhnPoker()
+        solver   = CFRSolver(game=game, linear_averaging=True)
+        strategy = solver.solve(iterations=20000)
+
+        # Laske P0:n EV parasta vastauslaskennalla
+        ev_p0 = best_response_value(game, 0, strategy)
+        analytical = KuhnPoker.known_game_value()  # -1/18
+
+        assert abs(ev_p0 - analytical) < 0.005, (
+            f"P0 EV={ev_p0:.6f}, odotettu {analytical:.6f} "
+            f"(virhe {abs(ev_p0-analytical):.6f} > 0.005)"
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

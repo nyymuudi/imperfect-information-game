@@ -15,11 +15,4 @@ export const ACTION_LABELS: Record<ActionIndex, string> = {
   3: 'All-in',
 }
 
-export interface SolverRun {
-  id: string
-  created_at: string
-  game: string
-  iterations: number
-  exploitability: number | null
-  model_path: string
-}
+// SolverRun removed — Supabase integration not active.

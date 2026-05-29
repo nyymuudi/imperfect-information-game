@@ -52,9 +52,13 @@ class DeepCFRSolver:
         self.regret_net   = RegretNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
         self.strategy_net = StrategyNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
 
-        # Regret buffer: SlidingWindowBuffer (FIFO — fresh data only)
-        # Strategy buffer: ReservoirBuffer (full history average)
-        self.regret_buffer   = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions, mode='reservoir')
+        # Regret buffer: mode='window' (FIFO — fresh data only).
+        #   Steinberger 2019 §3: the regret network predicts regrets for the
+        #   CURRENT strategy; old data from early iterations corrupts gradients.
+        # Strategy buffer: mode='reservoir' (full history average).
+        #   Approximates time-average strategy over all iterations — correct.
+        self._current_iter   = 0
+        self.regret_buffer   = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions, mode='window')
         self.strategy_buffer = ReservoirBuffer(strat_cap, state_sz, self.max_actions, mode='reservoir')
 
         self.iterations = 0
@@ -84,7 +88,7 @@ class DeepCFRSolver:
             else:
                 import warnings
                 warnings.warn(
-                    "use_cpp_engine=True mutta cfr_engine.so ei löydy.",
+                    "use_cpp_engine=True but cfr_engine.so not found.",
                     RuntimeWarning,
                 )
 
@@ -109,14 +113,14 @@ class DeepCFRSolver:
         strategy    = self._get_regret_strategy(state, num_actions)
 
         if player == traversing_player:
-            self.strategy_buffer.add(state, strategy, float(self.iterations + 1))
+            self.strategy_buffer.add(state, strategy, float(self._current_iter + 1))
             action_values = np.zeros(num_actions)
             for i, action in enumerate(actions):
                 new_h = self.game.apply_action(history, action)
                 action_values[i] = self._traverse(new_h, traversing_player)
             node_value = (strategy * action_values).sum()
             regrets = action_values - node_value
-            self.regret_buffer.add(state, regrets, float(self.iterations + 1))
+            self.regret_buffer.add(state, regrets, float(self._current_iter + 1))
             return node_value
         else:
             action_idx = self._rng.choice(num_actions, p=strategy)
@@ -128,7 +132,7 @@ class DeepCFRSolver:
             self.iterations,
             regret_net=self.regret_net if self.iterations > 0 else None,
         )
-        w = float(self.iterations + 1)
+        w = float(self._current_iter + 1)
 
         if len(reg_exp) > 0:
             X, actions, values = self._cpp.to_tensors(reg_exp)

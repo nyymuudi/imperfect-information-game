@@ -25,7 +25,7 @@ inline float preflop_equity(int rank_high, int rank_low, bool suited) {
 }
 
 // ── NLHEStateEncoder ──────────────────────────────────────────────────────────
-// Produces the same 122-dim tensor as Python NLHEEncoder.
+// Produces the same 124-dim tensor as Python NLHEEncoder (dims 122-123 = pot odds + SPR).
 
 class NLHEStateEncoder {
 public:
@@ -71,7 +71,7 @@ private:
 // Loads a blueprint STRATEGY network from an ONNX file via ONNX Runtime.
 // Used for blueprint querying during subgame solving (not the training loop).
 //
-// Inputs:  "state"       [batch, 122] float32
+// Inputs:  "state"       [batch, 124] float32
 //          "action_mask" [batch, 4]   float32   (1=legal, 0=illegal)
 // Output:  "probs"       [batch, 4]   float32   (masked softmax)
 //
@@ -87,7 +87,7 @@ public:
     bool loaded() const { return loaded_; }
 
     // Single-state inference.
-    // state_vec:   flat float array of length STATE_SIZE (122).
+    // state_vec:   flat float array of length STATE_SIZE (124).
     // max_actions: number of legal actions (1–4); illegal slots masked to 0.
     // Returns:     vector of length 4 (probs[i]=0 for i >= max_actions).
     std::vector<float> forward(const std::vector<float>& state_vec,
