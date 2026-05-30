@@ -107,6 +107,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--load-blueprint",       type=str,   default=None,
                    metavar="PATH",
                    help="Load existing blueprint (skips training)")
+    p.add_argument("--resume-from",          type=str,   default=None,
+                   metavar="CHECKPOINT_PATH",
+                   help="Resume training from a saved checkpoint blueprint")
     p.add_argument("--eval-only",            action="store_true",
                    help="Only run strategy evaluation (requires --load-blueprint)")
 
@@ -133,6 +136,23 @@ def main() -> int:
     if args.eval_only and not args.load_blueprint:
         print("Error: --eval-only requires --load-blueprint")
         return 1
+
+    # ── Resume-from checkpoint ────────────────────────────────────────────────
+    resume_iter = 0
+    resume_strategy_state = None
+    if args.resume_from:
+        try:
+            resume_bp   = Blueprint.load(args.resume_from, device=device)
+            resume_iter = resume_bp.metadata.iterations
+            resume_strategy_state = resume_bp._net.state_dict()
+            print(f"Resuming from checkpoint: iter={resume_iter}")
+            remaining = args.iterations - resume_iter
+            if remaining <= 0:
+                print("Checkpoint is already at target iterations — nothing to do.")
+                evaluate_blueprint(resume_bp, NLHEEncoder(starting_stack=args.stack))
+                return 0
+        except Exception as e:
+            print(f"[warn] Could not load checkpoint: {e}. Starting fresh.")
 
     # ── Training path ─────────────────────────────────────────────────────────
     game = PostflopNLHE(
@@ -185,8 +205,14 @@ def main() -> int:
             Blueprint.from_solver(s, device="cpu").save(ckpt_path)
             print(f"  [checkpoint saved → {ckpt_path}]")
 
+    # Jos resumataan, lataa strategy_net-painot ja aseta iteraatiolaskuri
+    if resume_strategy_state is not None:
+        solver.strategy_net.load_state_dict(resume_strategy_state)
+        solver.iterations = resume_iter
+
+    remaining_iters = args.iterations - resume_iter
     solver.solve(
-        iterations=args.iterations,
+        iterations=remaining_iters,
         callback=callback,
         callback_freq=max(1, args.iterations // 10),
     )
