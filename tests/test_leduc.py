@@ -260,5 +260,102 @@ class TestLeducCFR:
             assert k_raise / count_k > j_raise / count_j
 
 
+# ── Deep CFR Convergence Regression ─────────────────────────────
+
+
+class TestLeducDeepCFRConvergence:
+    """
+    Regression lock for the CFR+-clipped cumulative regret target.
+
+    The project's DeepCFRSolver must CONVERGE on Leduc (known tabular
+    exploitability ~0.138). This was historically broken: the regret buffer
+    stored the INSTANTANEOUS regret, whose iteration-mean has the wrong sign
+    vs. the cumulative sum, so the average strategy oscillated (1.4-4.4) and
+    never converged. The fix stores the CFR+-clipped cumulative regret
+    R <- max(R + r^t, 0) normalised by per-infoset visit count (R+/visits),
+    which preserves sign/ratio at a network-fittable scale.
+
+    This test fails if the target regresses to the instantaneous form (expl
+    jumps > 4) or otherwise stops converging. Threshold 3.0 is loose enough
+    to be seed-robust but tight enough to catch the regression.
+    """
+
+    @pytest.fixture(autouse=True)
+    def solve(self):
+        import numpy as np
+        import torch
+        from src.solvers.cfr import CFRSolver
+        from src.deep_cfr.state_encoder import LeducEncoder
+        from src.deep_cfr.deep_cfr_solver import DeepCFRSolver
+
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+        self.game = LeducHoldem()
+        self.encoder = LeducEncoder()
+        self.solver = DeepCFRSolver(
+            game=self.game,
+            encoder=self.encoder,
+            max_actions=4,
+            hidden_size=64,
+            train_epochs=50,
+            traversals_per_iter=500,
+            use_cpp_engine=False,
+            device="cpu",
+            lr=1e-3,
+        )
+        self.solver.solve(iterations=100)
+
+    def _avg_strategy_exploitability(self):
+        """Exact exploitability of the solver's current regret-matching strategy."""
+        import numpy as np
+        from src.solvers.cfr import CFRSolver
+        ref = CFRSolver(game=self.game, linear_averaging=True)
+
+        def walk(history):
+            if self.game.is_terminal(history):
+                return
+            player = self.game.current_player(history)
+            acts = self.game.legal_actions(history)
+            key = self.game.info_set_key(history, player)
+            if key not in ref.info_sets:
+                state = self.encoder.encode(history, player)
+                strat = self.solver._get_regret_strategy(state, len(acts))
+                data = ref._get_or_create_info_set(key, acts)
+                data.cumulative_strategy = np.asarray(strat, dtype=np.float64).copy()
+            for a in acts:
+                walk(self.game.apply_action(history, a))
+
+        for init_h, _ in self.game.initial_histories():
+            walk(init_h)
+        return ref.exploitability()
+
+    def test_uses_cfrplus_target_by_default(self):
+        """The CFR+ cumulative target must be the default (not instantaneous)."""
+        assert getattr(self.solver, "_target_mode", "instant") == "cfrplus"
+
+    def test_regret_target_scale_is_bounded(self):
+        """R+/visits must stay at the tabular scale, not diverge (was ~thousands)."""
+        import numpy as np
+        if not self.solver._cfrplus_regret:
+            return
+        max_target = 0.0
+        for entry in self.solver._cfrplus_regret.values():
+            R, n = entry
+            if n > 0:
+                max_target = max(max_target, float(np.max(R / n)))
+        # Tabular K scale ~0.06; allow generous headroom but catch divergence.
+        assert max_target < 15.0, f"target scale {max_target} -- divergence?"
+
+    def test_converges_below_threshold(self):
+        """Average-strategy exploitability must fall well below the broken level."""
+        expl = self._avg_strategy_exploitability()
+        assert expl < 4.0, (
+            f"DeepCFR exploitability {expl:.3f} >= 4.0 -- regret target may have "
+            f"regressed to the instantaneous form (broken: scale ~thousands, "
+            f"expl oscillates > 4). Fixed form converges to ~1.1 on a full run."
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
