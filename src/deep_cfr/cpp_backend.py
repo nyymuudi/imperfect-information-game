@@ -2,7 +2,7 @@
 src/deep_cfr/cpp_backend.py
 
 C++ MCCFR backend for DeepCFRSolver.
-Buffer samples carry full 122-dim state vectors — training features
+Buffer samples carry full 124-dim state vectors — training features
 are identical to LibTorch inference features.
 """
 
@@ -61,12 +61,25 @@ def engine_available() -> bool:
 #
 # Tracked: migrate regret network to ONNX Runtime when subgame solver
 # moves its traversal hot-path to C++.
+#
+# CRITICAL FIX (device safety):
+#   The previous implementation built `nn.Sequential(*list(net.net.children()))`,
+#   which REUSES the original layer objects (children() returns references, not
+#   copies). Calling load_state_dict(..., assign=True) on that sequential then
+#   rebinds those shared layers' parameters to CPU tensors — silently moving the
+#   ORIGINAL regret_net to CPU on every iteration. On an MPS/CUDA machine this
+#   meant training quietly fell back to CPU and inference hit a device mismatch.
+#   We now deep-copy the module first so the export never touches the live net.
 
 def export_for_libtorch(net) -> "torch.jit.ScriptModule":
     """
     Export RegretNetwork as TorchScript for C++ LibTorch inference.
     DeprecationWarning is suppressed intentionally — see module docstring.
+
+    Does NOT mutate `net` or move it across devices: it operates on a
+    detached CPU deep-copy.
     """
+    import copy
     import torch.nn as nn
 
     class _ScriptableNet(nn.Module):
@@ -77,9 +90,11 @@ def export_for_libtorch(net) -> "torch.jit.ScriptModule":
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return self.layers(x)
 
-    cpu_layers = nn.Sequential(*list(net.net.children()))
-    state = {k: v.detach().cpu().clone() for k, v in cpu_layers.state_dict().items()}
-    cpu_layers.load_state_dict(state, assign=True)
+    # Deep-copy the inner Sequential so we never alias the live network's
+    # layer objects, then move the COPY to CPU. The original `net` is untouched.
+    cpu_layers = copy.deepcopy(net.net).to("cpu")
+    cpu_layers.eval()
+
     wrapper = _ScriptableNet(cpu_layers)
     wrapper.eval()
 
@@ -174,7 +189,7 @@ class CppMCCFRBackend:
 class NLHECppBackend:
     """
     NLHE C++ backend using state-vector buffers.
-    Buffer samples store float[122] state vectors — no string parsing.
+    Buffer samples store float[124] state vectors — no string parsing.
     """
 
     STATE_SIZE = 124
@@ -234,7 +249,7 @@ class NLHECppBackend:
 
     def to_tensors(self, export) -> tuple:
         """
-        Convert NLHEBufferExport → (X [N,122], actions [N], values [N]).
+        Convert NLHEBufferExport → (X [N,124], actions [N], values [N]).
         State vectors come directly from C++ — no string parsing.
         """
         n = export.n_samples

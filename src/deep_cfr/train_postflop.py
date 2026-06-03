@@ -10,13 +10,24 @@ Usage:
     # Full training run with blueprint save
     python3 -m src.deep_cfr.train_postflop \\
         --iterations 1000 --traversals 500 --hidden 256 \\
-        --buffer 500000 --epochs 20 \\
+        --buffer 10000 --epochs 20 \\
         --save-blueprint blueprints/200bb_75pot_1000iter
 
     # Resume evaluation from saved blueprint
     python3 -m src.deep_cfr.train_postflop \\
         --load-blueprint blueprints/200bb_75pot_1000iter \\
         --eval-only
+
+Notes on buffer sizing:
+    The regret (value) buffer is a RESERVOIR over many iterations, following
+    Deep CFR (Brown et al. 2019) and Single Deep CFR (Steinberger 2019). The
+    value network is re-fitted each iteration on samples drawn from ALL past
+    iterations; that is how it comes to approximate CUMULATIVE counterfactual
+    regret without explicit summation. It must therefore be LARGE — default
+    1_000_000. A small FIFO window (e.g. ~10×traversals) is WRONG: the network
+    would fit only the latest iteration's instantaneous regrets, which is not
+    CFR and does not converge (verified empirically on Leduc). The strategy
+    buffer is likewise a large reservoir (time-average strategy).
 """
 
 import argparse
@@ -29,6 +40,7 @@ from src.deep_cfr.deep_cfr_solver import DeepCFRSolver
 from src.deep_cfr.state_encoder import NLHEEncoder
 from src.deep_cfr.cpp_backend import export_for_libtorch
 from src.deep_cfr.blueprint import Blueprint
+from src.analysis.exploitability import estimate_exploitability
 
 
 # ── Strategy evaluation helpers ───────────────────────────────────────────────
@@ -90,15 +102,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--iterations",      "-n", type=int,   default=50)
     p.add_argument("--traversals",      "-t", type=int,   default=200)
     p.add_argument("--hidden",               type=int,   default=128)
-    p.add_argument("--buffer",               type=int,   default=500_000)
+    p.add_argument("--buffer",               type=int,   default=0,
+                   help="Regret reservoir capacity. 0 = auto (1_000_000). "
+                        "Must be large: it holds value samples across many "
+                        "iterations. See module docstring.")
     p.add_argument("--strategy-buffer",      type=int,   default=0,
-                   help="Strategy buffer capacity (0 = same as --buffer)")
+                   help="Strategy buffer capacity (0 = 1_000_000). Should be large.")
     p.add_argument("--epochs",               type=int,   default=20)
 
     # Game config
     p.add_argument("--stack",                type=float, default=200.0)
     p.add_argument("--raise-fraction",       type=float, default=0.75,
                    help="Raise size as fraction of pot (default: 0.75)")
+
+    # Convergence measurement
+    p.add_argument("--expl-games",           type=int,   default=50,
+                   help="Games per exploitability estimate in callback "
+                        "(0 disables mid-training measurement).")
 
     # Blueprint I/O
     p.add_argument("--save-blueprint",       type=str,   default=None,
@@ -154,6 +174,22 @@ def main() -> int:
         except Exception as e:
             print(f"[warn] Could not load checkpoint: {e}. Starting fresh.")
 
+    # ── Derive buffer sizes ───────────────────────────────────────────────────
+    # Regret (value) buffer is a RESERVOIR over many iterations (Deep CFR /
+    # SD-CFR). It must be LARGE so the network fits cumulative regret across
+    # iterations — NOT a small ~10×traversals window (that only captures the
+    # latest iteration's instantaneous regrets and does not converge).
+    regret_buf = args.buffer if args.buffer > 0 else 1_000_000
+    strat_buf  = args.strategy_buffer if args.strategy_buffer > 0 else 1_000_000
+
+    if args.buffer > 0 and args.buffer < 50_000:
+        print(
+            f"[warn] --buffer {args.buffer:,} is small for a reservoir. The "
+            f"regret network approximates CUMULATIVE regret via a reservoir "
+            f"over many iterations; too small a capacity reintroduces the "
+            f"window pathology (fits only recent iterations). Prefer >= 1e6."
+        )
+
     # ── Training path ─────────────────────────────────────────────────────────
     game = PostflopNLHE(
         starting_stack=args.stack,
@@ -161,14 +197,12 @@ def main() -> int:
         raise_fractions=(args.raise_fraction,),
     )
 
-    strat_cap = args.strategy_buffer or args.buffer
-
     solver = DeepCFRSolver(
         game=game,
         encoder=encoder,
         max_actions=4,
-        buffer_capacity=args.buffer,
-        strategy_buffer_capacity=strat_cap,
+        buffer_capacity=regret_buf,
+        strategy_buffer_capacity=strat_buf,
         hidden_size=args.hidden,
         train_epochs=args.epochs,
         train_batch=256,
@@ -183,8 +217,8 @@ def main() -> int:
           f"Raise: {args.raise_fraction:.0%} pot | "
           f"Iterations: {args.iterations}")
     print(f"  Hidden: {args.hidden} | "
-          f"Regret buf: {args.buffer:,} | "
-          f"Strategy buf: {strat_cap:,}")
+          f"Regret buf: {regret_buf:,} | "
+          f"Strategy buf: {strat_buf:,}")
     print(f"  Device: {device}\n")
 
     t0 = time.time()
@@ -192,11 +226,28 @@ def main() -> int:
     def callback(s, i):
         elapsed = time.time() - t0
         reg_loss = getattr(s, "_last_regret_loss", 0.0)
+
+        # Exploitability of the CURRENT regret-matching strategy.
+        # This is the strategy CFR actually iterates and it updates every
+        # iteration — unlike strategy_net, which is trained only at the end.
+        # Measuring it here gives a true convergence signal mid-training.
+        expl_str = "  expl=  n/a "
+        if args.expl_games > 0:
+            try:
+                cur = s.current_strategy_blueprint()
+                expl = estimate_exploitability(
+                    cur, game, encoder, n_games=args.expl_games, seed=0
+                )
+                expl_str = f"  expl={expl:6.1f} mbb/h"
+            except Exception as e:
+                expl_str = f"  expl=ERR ({type(e).__name__})"
+
         print(
             f"  iter {i:>4d}: "
             f"regret_buf={len(s.regret_buffer):>7,} | "
             f"strat_buf={len(s.strategy_buffer):>7,} | "
-            f"loss={reg_loss:.4f} | "
+            f"loss={reg_loss:.4f}"
+            f"{expl_str} | "
             f"t={elapsed:.1f}s"
         )
         # Checkpoint every 1000 iterations
@@ -233,6 +284,18 @@ def main() -> int:
         bp.save(args.save_blueprint)
     else:
         print("\n[tip] Pass --save-blueprint PATH to persist this run.")
+
+    # ── Final convergence check on the TRAINED strategy network ───────────────
+    # The blueprint wraps strategy_net (now trained). This is the deployable
+    # artefact; its exploitability is the number that matters.
+    try:
+        final_expl = estimate_exploitability(
+            bp, game, encoder, n_games=max(args.expl_games, 200), seed=0
+        )
+        print(f"\nFinal blueprint exploitability: {final_expl:.1f} mbb/hand "
+              f"(untrained ≈ 200–500; target < 100)")
+    except Exception as e:
+        print(f"[warn] Final exploitability measurement failed: {e}")
 
     # ── Evaluate ──────────────────────────────────────────────────────────────
     evaluate_blueprint(bp, encoder)
