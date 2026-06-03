@@ -7,7 +7,7 @@ tree is too large to enumerate (~10^14 information sets).
 
 History encoding:
     (p0_cards, p1_cards, board, action1, action2, ...)
-    
+
     p0_cards: tuple of 2 card ints (0-51)
     p1_cards: tuple of 2 card ints (0-51)
     board:    tuple of 0-5 card ints (grows as streets are dealt)
@@ -22,6 +22,25 @@ Streets determined by board length:
 Card encoding: card = rank * 4 + suit
     rank: 0=2, 1=3, ..., 12=A
     suit: 0=♣, 1=♦, 2=♥, 3=♠
+
+IMPLEMENTATION NOTE — state machine parity with the C++ engine
+--------------------------------------------------------------
+_parse_state is a deterministic replay of the SAME state machine implemented
+in C++ (NLHEGame::apply_action in nlhe_game.cpp). This is required so that the
+Python game tree is bit-identical to the C++ tree used to train the blueprints.
+The key behaviours that distinguish this from a naive "betting round" model:
+
+  * Position: SB (player 0) acts first preflop; BB (player 1) acts first
+    postflop (the button/SB is in position).
+  * CALL always ends the street immediately (advance to next street), including
+    a preflop SB call — the BB does NOT get a subsequent option. This matches
+    the C++ engine (it is non-standard poker, but it is what the engine does,
+    and the engine defines the trained game).
+  * CHECK uses last_aggressor: the first check of a street passes action to the
+    opponent (last_aggressor -1 -> -2); the second check ends the street.
+  * Raise sizing is the standard pot-sized raise on the pot AFTER the call:
+    raise_add = (pot + owe) * frac, then total = owe + raise_add, capped at the
+    stack. bet_amount mirrors NLHEGame::bet_amount.
 """
 
 import numpy as np
@@ -32,18 +51,25 @@ from ..abstraction.equity import evaluate_7card
 
 STREET_NAMES = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}
 
+# Action char <-> meaning. Same external alphabet as before:
+#   'f' fold, 'c' check, 'k' call, 'r' raise, 'a' all-in
+# Internally 'f'/'c' both map to the C++ FOLD_OR_CHECK action (slot 0); which
+# one it is depends on whether there is an outstanding bet (owe > 0).
+
 
 @dataclass
 class PostflopNLHE(ExtensiveFormGame):
     """
-    Full HU NLHE for Deep CFR.
-    
+    Full HU NLHE for Deep CFR. Tree-identical to the C++ NLHEGame engine.
+
     Not compatible with tabular CFR (game tree too large).
     Use DeepCFRSolver which samples chance nodes.
     """
     starting_stack: float = 200.0  # In chips (BB = 2, SB = 1)
-    max_raises_per_street: int = 3
-    # Raise sizes as fraction of pot
+    max_raises_per_street: int = 2  # matches C++ NLHEGameConfig.max_raises
+    sb: float = 1.0
+    bb: float = 2.0
+    # Raise sizes as fraction of pot (pot AFTER the call)
     raise_fractions: tuple[float, ...] = (0.75,)
 
     def num_players(self) -> int:
@@ -61,152 +87,139 @@ class PostflopNLHE(ExtensiveFormGame):
         cards = rng.choice(52, size=9, replace=False)
         p0 = (int(cards[0]), int(cards[1]))
         p1 = (int(cards[2]), int(cards[3]))
-        # Pre-deal the full board (revealed street by street)
         full_board = tuple(int(c) for c in cards[4:9])
         return (p0, p1, full_board)
 
     def _get_actions(self, history: History) -> tuple:
         return history[3:]
 
-    def _visible_board(self, history: History) -> tuple:
-        """Board cards visible at the current street."""
-        full_board = history[2]
-        street = self._current_street(history)
-        if street == "preflop":
-            return ()
-        elif street == "flop":
-            return full_board[:3]
-        elif street == "turn":
-            return full_board[:4]
-        else:  # river
-            return full_board[:5]
-
-    def _current_street(self, history: History) -> str:
-        """Determine current street from action sequence."""
-        actions = self._get_actions(history)
-        streets_completed = 0
-        street_actions = []
-        
-        for a in actions:
-            if a == 'f':
-                break
-            street_actions.append(a)
-            if self._street_betting_complete(street_actions):
-                streets_completed += 1
-                street_actions = []
-
-        return ["preflop", "flop", "turn", "river"][min(streets_completed, 3)]
-
-    def _street_betting_complete(self, street_actions: list) -> bool:
-        """Check if a single street's betting is complete."""
-        if len(street_actions) < 2:
-            return False
-        # Track if there's a pending bet/raise
-        pending = False
-        for a in street_actions:
-            if a == 'r' or a == 'a':
-                pending = True
-            elif a == 'k':
-                pending = False
-        # Street ends when both acted AND no pending action
-        last = street_actions[-1]
-        if last == 'k':
-            return True   # Call resolves a bet → done
-        if last == 'c' and not pending:
-            return True   # Check with nothing pending → done
-        return False
-
+    # ── Core state machine (mirrors C++ NLHEGame::apply_action) ──────────────
     def _parse_state(self, history: History) -> dict:
-        """Full state parse: stacks, pot, street, who acts."""
+        """
+        Deterministic replay of the C++ state machine. Returns the live state
+        AFTER applying every action in the history. The keys returned match the
+        previous public contract (stacks, invested, pot, to_call, street_idx,
+        street_name, raises_this_street, current_player, folded, all_in).
+
+        'invested' is reported as TOTAL invested across the hand
+        (starting_stack - stack), so payoffs and the encoder see cumulative
+        contributions, while 'street_invest' drives call sizing within a street.
+        """
         actions = self._get_actions(history)
-        stacks = [self.starting_stack - 1.0, self.starting_stack - 2.0]
-        invested = [1.0, 2.0]  # Blinds
-        street_idx = 0
-        street_actions = []
+
+        stacks = [self.starting_stack - self.sb, self.starting_stack - self.bb]
+        street_invest = [self.sb, self.bb]
+        pot = self.sb + self.bb
+        street = 0
+        current_player = 0      # SB acts first preflop
         raises_this_street = 0
-        current_player = 0  # SB acts first preflop
-        folded = False
+        last_aggressor = -1     # -1 = no bet yet this street, -2 = one check done
+        folded = [False, False]
         all_in = False
+        terminal = False
+
+        def advance_street():
+            nonlocal street, raises_this_street, last_aggressor, street_invest
+            nonlocal current_player, terminal
+            street += 1
+            raises_this_street = 0
+            last_aggressor = -1
+            street_invest = [0.0, 0.0]
+            if street >= 4:
+                terminal = True          # showdown
+            else:
+                current_player = 1        # BB acts first postflop
+
+        def bet_amount():
+            p = current_player
+            owe = street_invest[1 - p] - street_invest[p]
+            effective_pot = pot + owe     # pot after calling
+            raise_add = effective_pot * self.raise_fractions[0]
+            return min(raise_add, stacks[p] - owe)
 
         for a in actions:
-            if a == 'f':
-                folded = True
+            if terminal:
                 break
-            
-            street_actions.append(a)
-            
-            if a == 'c':
-                pass  # Check
+            p = current_player
+            opp = 1 - p
+            owe = street_invest[opp] - street_invest[p]
+
+            if a == 'f':
+                # Fold (only meaningful when facing a bet)
+                folded[p] = True
+                terminal = True
+                break
+            elif a == 'c':
+                # Check (owe == 0)
+                if last_aggressor == -1:
+                    last_aggressor = -2
+                    current_player = opp
+                else:
+                    advance_street()
             elif a == 'k':
-                # Call
-                call_amt = invested[1 - current_player] - invested[current_player]
-                invested[current_player] += call_amt
-                stacks[current_player] -= call_amt
+                # Call — always ends the street (advance immediately)
+                call_amt = min(owe, stacks[p])
+                stacks[p] -= call_amt
+                street_invest[p] += call_amt
+                pot += call_amt
+                advance_street()
             elif a == 'r':
-                # Raise: to (opponent's invested + raise_size)
-                pot = sum(invested)
-                raise_size = pot * self.raise_fractions[0]
-                # Must first call
-                call_amt = invested[1 - current_player] - invested[current_player]
-                total = call_amt + raise_size
-                total = min(total, stacks[current_player])
-                invested[current_player] += total
-                stacks[current_player] -= total
+                raise_add = bet_amount()
+                total = owe + raise_add
+                total = min(total, stacks[p])
+                stacks[p] -= total
+                street_invest[p] += total
+                pot += total
                 raises_this_street += 1
+                last_aggressor = p
+                current_player = opp
             elif a == 'a':
-                allin = stacks[current_player]
-                invested[current_player] += allin
-                stacks[current_player] = 0
+                allin = stacks[p]
+                stacks[p] = 0.0
+                street_invest[p] += allin
+                pot += allin
                 all_in = True
                 raises_this_street += 1
+                last_aggressor = p
+                current_player = opp
 
-            # Check if street complete
-            if self._street_betting_complete(street_actions):
-                street_idx += 1
-                street_actions = []
-                raises_this_street = 0
-                current_player = 0  # P0 acts first postflop
-                continue
+        p = current_player
+        opp = 1 - p
+        to_call = street_invest[opp] - street_invest[p]
+        invested = [self.starting_stack - stacks[0],
+                    self.starting_stack - stacks[1]]
 
-            current_player = 1 - current_player
-
-        pot = sum(invested)
-        to_call = invested[1 - current_player] - invested[current_player]
-        
         return {
             "stacks": stacks,
             "invested": invested,
+            "street_invest": street_invest,
             "pot": pot,
-            "to_call": max(0, to_call),
-            "street_idx": street_idx,
-            "street_name": ["preflop", "flop", "turn", "river"][min(street_idx, 3)],
+            "to_call": max(0.0, to_call),
+            "street_idx": street,
+            "street_name": ["preflop", "flop", "turn", "river"][min(street, 3)],
             "raises_this_street": raises_this_street,
             "current_player": current_player,
+            "last_aggressor": last_aggressor,
             "folded": folded,
             "all_in": all_in,
-            "street_actions": street_actions,
+            "terminal": terminal,
         }
+
+    def _current_street(self, history: History) -> str:
+        return self._parse_state(history)["street_name"]
+
+    def _visible_board(self, history: History) -> tuple:
+        """Board cards visible at the current street."""
+        full_board = history[2]
+        street = self._parse_state(history)["street_idx"]
+        n = [0, 3, 4, 5][min(street, 3)]
+        return full_board[:n]
 
     def is_terminal(self, history: History) -> bool:
         actions = self._get_actions(history)
         if not actions:
             return False
-        if actions[-1] == 'f':
-            return True
-
-        state = self._parse_state(history)
-        if state["folded"]:
-            return True
-        
-        # All-in called → terminal (run out remaining board)
-        if state["all_in"] and state["to_call"] == 0 and len(state["street_actions"]) >= 2:
-            return True
-
-        # River betting complete → showdown
-        if state["street_idx"] >= 4:
-            return True
-
-        return False
+        return self._parse_state(history)["terminal"]
 
     def terminal_payoffs(self, history: History) -> tuple[float, ...]:
         if not self.is_terminal(history):
@@ -215,37 +228,21 @@ class PostflopNLHE(ExtensiveFormGame):
         state = self._parse_state(history)
         invested = state["invested"]
 
-        # Fold: folder loses their investment, winner gains it
-        if state["folded"]:
-            # Determine who folded from action sequence
-            actions = self._get_actions(history)
-            current = 0
-            street_actions_local = []
-            for a in actions:
-                if a == 'f':
-                    break
-                street_actions_local.append(a)
-                if self._street_betting_complete(street_actions_local):
-                    street_actions_local = []
-                    current = 0
-                    continue
-                current = 1 - current
-            # 'current' is the player who folded
-            folder = current
+        # Fold: folder loses their total investment, winner gains it.
+        if state["folded"][0] or state["folded"][1]:
+            folder = 0 if state["folded"][0] else 1
             winner = 1 - folder
             payoffs = [0.0, 0.0]
             payoffs[folder] = -invested[folder]
             payoffs[winner] = invested[folder]
             return tuple(payoffs)
 
-        # Showdown
+        # Showdown — compare full 7-card hands, winner takes the loser's stake.
         p0_cards = history[0]
         p1_cards = history[1]
-        board = history[2][:5]  # Full board
-
+        board = history[2][:5]
         h0 = evaluate_7card(p0_cards + board)
         h1 = evaluate_7card(p1_cards + board)
-
         if h0 > h1:
             return (float(invested[1]), float(-invested[1]))
         elif h1 > h0:
@@ -254,8 +251,7 @@ class PostflopNLHE(ExtensiveFormGame):
             return (0.0, 0.0)  # Tie
 
     def current_player(self, history: History) -> int:
-        state = self._parse_state(history)
-        return state["current_player"]
+        return self._parse_state(history)["current_player"]
 
     def info_set_key(self, history: History, player: int) -> InfoSetKey:
         """
@@ -270,40 +266,40 @@ class PostflopNLHE(ExtensiveFormGame):
 
     def legal_actions(self, history: History) -> list[Action]:
         state = self._parse_state(history)
+        if state["terminal"]:
+            return []
+
+        p = state["current_player"]
+        owe = state["to_call"]
+        bet = owe > 0.001
+        can_raise = state["raises_this_street"] < self.max_raises_per_street
+        my_stack = state["stacks"][p]
+        pot = state["pot"]
+
+        def bet_amount():
+            effective_pot = pot + owe
+            raise_add = effective_pot * self.raise_fractions[0]
+            return min(raise_add, my_stack - owe)
+
         result = []
-
-        if state["to_call"] > 0:
-            result.append("f")  # Can fold if facing bet
-            result.append("k")  # Call
+        if bet:
+            result.append("f")  # fold
+            result.append("k")  # call
         else:
-            result.append("c")  # Check
+            result.append("c")  # check
 
-        # Raise (if under limit and has chips)
-        if (state["raises_this_street"] < self.max_raises_per_street
-                and state["stacks"][state["current_player"]] > state["to_call"]):
-            result.append("r")
+        if can_raise and my_stack > owe + 0.01:
+            if bet_amount() > 0.01:
+                result.append("r")
 
-        # All-in (always available if has chips)
-        if state["stacks"][state["current_player"]] > 0:
-            if "r" not in result:  # Avoid duplicate when raise = all-in
-                result.append("a")
-            elif state["stacks"][state["current_player"]] > state["to_call"] + state["pot"] * self.raise_fractions[0]:
+        # All-in: available if it differs from the (capped) raise, or no raise.
+        if my_stack > owe + 0.01:
+            allin_add = my_stack - owe
+            raise_add = bet_amount() if (can_raise and my_stack > owe + 0.01) else -1.0
+            if (not can_raise) or allin_add > raise_add + 0.01:
                 result.append("a")
 
         return result
 
     def apply_action(self, history: History, action: Action) -> History:
-        new_h = history + (action,)
-
-        # Check if we need to advance to next street
-        # (street betting complete but game not terminal)
-        if not self.is_terminal(new_h):
-            state = self._parse_state(new_h)
-            # If street just completed and we haven't run out of streets
-            actions = self._get_actions(new_h)
-            if (len(state["street_actions"]) == 0 
-                    and state["street_idx"] > 0
-                    and state["street_idx"] <= 3):
-                pass  # Next street starts, board already pre-dealt
-
-        return new_h
+        return history + (action,)

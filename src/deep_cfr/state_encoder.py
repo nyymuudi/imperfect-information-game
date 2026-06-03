@@ -27,12 +27,12 @@ class StateEncoder(ABC):
     def encode(self, history: History, player: int) -> np.ndarray:
         """
         Encode a history from a player's perspective.
-        
+
         MUST use only information visible to the player:
         - Their own private cards
         - Public information (community cards, action sequence)
         - NOT the opponent's cards
-        
+
         Returns a 1D numpy array of size state_size().
         """
         ...
@@ -41,7 +41,7 @@ class StateEncoder(ABC):
 class LeducEncoder(StateEncoder):
     """
     Leduc Hold'em state encoder.
-    
+
     State vector (20 dimensions):
         [0:3]   Private card rank (one-hot: J=0, Q=1, K=2)
         [3:6]   Community card rank (one-hot, zeros if not revealed)
@@ -117,7 +117,7 @@ class LeducEncoder(StateEncoder):
 class NLHEEncoder(StateEncoder):
     """
     No-Limit Hold'em state encoder for Deep CFR.
-    
+
     State vector (124 dimensions):
         [0:52]    Private cards (one-hot, 2 bits set)
         [52:104]  Board cards (one-hot, 0-5 bits set)
@@ -127,10 +127,21 @@ class NLHEEncoder(StateEncoder):
         [110]     Own stack remaining (normalized)
         [111]     Opponent stack remaining (normalized)
         [112:120] Action history (last 8 actions encoded)
-    
+        [120]     Preflop equity of own hand
+        [121]     Board strength of own hand
+        [122]     Pot odds = to_call / (pot + to_call)
+        [123]     SPR = min(stacks) / pot (capped, normalised)
+
     Card encoding: card = rank * 4 + suit
         rank: 0=2, 1=3, ..., 12=A
         suit: 0=♣, 1=♦, 2=♥, 3=♠
+
+    Betting/street parse: this encoder reads pot, to_call, stacks and street
+    from PostflopNLHE._parse_state — the SAME corrected state machine the C++
+    NLHEGame engine implements — instead of re-deriving them with a separate
+    parser. Keeping a single source of truth is what makes the Python training
+    features bit-match the C++ encoder inference features (the historical
+    "feature mismatch" that caused strategy collapse).
     """
 
     ACTION_ENC = {"f": -1.0, "c": 0.0, "k": 0.25, "r": 0.5, "b": 0.75, "a": 1.0}
@@ -142,10 +153,25 @@ class NLHEEncoder(StateEncoder):
         self.starting_stack = starting_stack
         self.norm = 2 * starting_stack  # Max pot ≈ 2× stacks
         self._equity_sims = equity_sims
+        self._game_cache = None
         if NLHEEncoder._shared_equity_cache is None:
             NLHEEncoder._shared_equity_cache = {}
             self._build_equity_cache()
         self._equity_cache = NLHEEncoder._shared_equity_cache
+
+    def _game(self):
+        """Lazily build a PostflopNLHE matching this encoder's stack, so the
+        encoder reads pot/to_call/street/stacks from the SAME (corrected) state
+        machine the C++ engine uses, rather than re-parsing the history with a
+        separate (and previously divergent) parser."""
+        if self._game_cache is None:
+            from ..games.postflop_nlhe import PostflopNLHE
+            self._game_cache = PostflopNLHE(
+                starting_stack=self.starting_stack,
+                max_raises_per_street=2,
+                raise_fractions=(0.75,),
+            )
+        return self._game_cache
 
     def _build_equity_cache(self):
         """Pre-compute preflop equity for all 169 canonical hands."""
@@ -187,10 +213,16 @@ class NLHEEncoder(StateEncoder):
         state[my_cards[0]] = 1.0
         state[my_cards[1]] = 1.0
 
+        actions = history[3:]
+
+        # Authoritative betting/street state from the corrected state machine
+        # (mirrors C++ NLHEGame). Single source of truth for pot/to_call/street.
+        st = self._game()._parse_state(history)
+        street_idx = st["street_idx"]
+        n_visible = [0, 3, 4, 5][min(street_idx, 3)]
+
         # Board cards (only visible ones based on street)
         board = history[2]  # Full pre-dealt board
-        actions = history[3:]
-        n_visible = self._visible_board_count(actions)
         for card in board[:n_visible]:
             state[52 + card] = 1.0
 
@@ -198,11 +230,11 @@ class NLHEEncoder(StateEncoder):
         street = {0: 0, 3: 1, 4: 2, 5: 3}.get(n_visible, 0)
         state[104 + street] = 1.0
 
-        # Betting info
-        actions = history[3:]
-        pot, to_call, my_stack, opp_stack = self._parse_betting(
-            actions, player, n_visible
-        )
+        # Betting info (read straight from the state machine)
+        pot      = st["pot"]
+        to_call  = st["to_call"]
+        my_stack = st["stacks"][player]
+        opp_stack = st["stacks"][1 - player]
         state[108] = pot / self.norm
         state[109] = to_call / self.norm
         state[110] = my_stack / self.starting_stack
@@ -231,61 +263,3 @@ class NLHEEncoder(StateEncoder):
         state[123] = min(eff_stack / pot, 10.0) / 10.0 if pot > 1e-6 else 1.0
 
         return state
-
-    def _visible_board_count(self, actions: tuple) -> int:
-        """Count how many board cards are visible based on completed streets."""
-        streets_done = 0
-        street_actions = []
-        pending = False
-        for a in actions:
-            if a == 'f':
-                break
-            street_actions.append(a)
-            if a in ('r', 'a'):
-                pending = True
-            elif a == 'k':
-                pending = False
-            # Check if street complete
-            if len(street_actions) >= 2:
-                last = street_actions[-1]
-                if last == 'k' or (last == 'c' and not pending):
-                    streets_done += 1
-                    street_actions = []
-                    pending = False
-        return {0: 0, 1: 3, 2: 4, 3: 5}.get(streets_done, 5)
-
-    def _parse_betting(
-        self, actions: tuple, player: int, n_board: int
-    ) -> tuple[float, float, float, float]:
-        """Parse actions to get pot, to_call, and stack info."""
-        stacks = [self.starting_stack - 1.0, self.starting_stack - 2.0]  # After blinds
-        pot = 3.0  # SB(1) + BB(2)
-        current = 0  # SB acts first preflop
-
-        for a in actions:
-            if a == 'f':
-                break
-            elif a == 'c':
-                pass  # Check, no money change
-            elif a == 'k':
-                # Call: match opponent
-                opp = 1 - current
-                call_amt = max(0, (self.starting_stack - stacks[opp]) -
-                               (self.starting_stack - stacks[current]))
-                stacks[current] -= call_amt
-                pot += call_amt
-            elif isinstance(a, str) and a == 'a':
-                # All-in
-                allin_amt = stacks[current]
-                pot += allin_amt
-                stacks[current] = 0
-            elif isinstance(a, str) and a.startswith('r'):
-                # Raise: 'r' followed by amount or fixed
-                raise_amt = min(pot * 0.75, stacks[current])
-                pot += raise_amt
-                stacks[current] -= raise_amt
-            current = 1 - current
-
-        to_call = max(0, (self.starting_stack - stacks[1-player]) -
-                       (self.starting_stack - stacks[player]))
-        return pot, to_call, stacks[player], stacks[1 - player]

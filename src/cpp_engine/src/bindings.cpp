@@ -22,6 +22,14 @@ PYBIND11_MODULE(cfr_engine, m) {
         .value("CALL",  CALL).value("RAISE", RAISE)
         .export_values();
 
+    // Regret target mode for the CFR+-clipped cumulative target (vs legacy
+    // instantaneous). CFRPLUS is the validated default; INSTANT is kept for
+    // A/B comparison, mirroring DEEPCFR_TARGET=instant on the Python side.
+    py::enum_<RegretTarget>(m, "RegretTarget")
+        .value("CFRPLUS", RegretTarget::CFRPLUS)
+        .value("INSTANT", RegretTarget::INSTANT)
+        .export_values();
+
     py::class_<LeducDeal>(m, "LeducDeal")
         .def_readonly("private_cards", &LeducDeal::private_cards)
         .def_readonly("community_card",&LeducDeal::community_card)
@@ -55,7 +63,8 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def_readwrite("regret_capacity",   &TraversalConfig::regret_capacity)
         .def_readwrite("strategy_capacity", &TraversalConfig::strategy_capacity)
         .def_readwrite("collect_strategy",  &TraversalConfig::collect_strategy)
-        .def_readwrite("seed",              &TraversalConfig::seed);
+        .def_readwrite("seed",              &TraversalConfig::seed)
+        .def_readwrite("target",            &TraversalConfig::target);
 
     py::class_<MCCFREngine::BufferExport>(m, "BufferExport")
         .def_readonly("info_sets",  &MCCFREngine::BufferExport::info_sets)
@@ -72,8 +81,19 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def("run_traversals_uniform", &MCCFREngine::run_traversals_uniform,
              py::arg("traversing_player"),
              py::call_guard<py::gil_scoped_release>())
+        // Deterministic full (vanilla) traversal — used for bit-exact parity
+        // testing of the CFR+ target against the Python reference.
+        .def("run_full_traversal",     &MCCFREngine::run_full_traversal,
+             py::arg("traversing_player"), py::arg("strategy_fn"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("run_full_traversal_uniform", &MCCFREngine::run_full_traversal_uniform,
+             py::arg("traversing_player"),
+             py::call_guard<py::gil_scoped_release>())
         .def("clear_buffers",          &MCCFREngine::clear_buffers)
         .def("set_iteration",          &MCCFREngine::set_iteration)
+        // CFR+ accumulator controls.
+        .def("reset_cfrplus",          &MCCFREngine::reset_cfrplus)
+        .def("emit_cfrplus_targets",   &MCCFREngine::emit_cfrplus_targets)
         .def("export_regret_buffer",   &MCCFREngine::export_regret_buffer)
         .def("export_strategy_buffer", &MCCFREngine::export_strategy_buffer)
         .def("regret_buffer_size",  [](const MCCFREngine& e){ return e.regret_buffer().size(); })
@@ -131,6 +151,7 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def_readwrite("collect_strategy",  &NLHETraversalConfig::collect_strategy)
         .def_readwrite("seed",              &NLHETraversalConfig::seed)
         .def_readwrite("max_actions",       &NLHETraversalConfig::max_actions)
+        .def_readwrite("target",            &NLHETraversalConfig::target)
         .def_readwrite("game_cfg",          &NLHETraversalConfig::game_cfg);
 
     py::class_<NLHEMCCFREngine>(m, "NLHEMCCFREngine")
@@ -149,6 +170,15 @@ PYBIND11_MODULE(cfr_engine, m) {
              &NLHEMCCFREngine::run_traversals_model,
              py::arg("traversing_player"),
              py::call_guard<py::gil_scoped_release>())
+        // Deterministic full traversal on a fixed deal — parity testing of the
+        // NLHE CFR+ target against the Python PostflopNLHE reference.
+        .def("run_full_traversal_deal_uniform",
+             &NLHEMCCFREngine::run_full_traversal_deal_uniform,
+             py::arg("traversing_player"), py::arg("deal"),
+             py::call_guard<py::gil_scoped_release>())
+        // CFR+ accumulator controls.
+        .def("reset_cfrplus",          &NLHEMCCFREngine::reset_cfrplus)
+        .def("emit_cfrplus_targets",   &NLHEMCCFREngine::emit_cfrplus_targets)
         .def("clear_buffers",          &NLHEMCCFREngine::clear_buffers)
         .def("set_iteration",          &NLHEMCCFREngine::set_iteration)
         .def("export_regret_buffer",   &NLHEMCCFREngine::export_regret_buffer)
@@ -165,8 +195,6 @@ PYBIND11_MODULE(cfr_engine, m) {
              py::arg("my_stack"));
 
     // ── NLHEDeal factory ─────────────────────────────────────────────────────
-    // Expose as an opaque handle + factory function; C-style arrays don't bind
-    // cleanly as writable members, so we use a lambda constructor instead.
     py::class_<NLHEDeal>(m, "NLHEDeal")
         .def(py::init<>());
 
