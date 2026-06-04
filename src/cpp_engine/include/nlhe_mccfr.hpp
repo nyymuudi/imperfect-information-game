@@ -90,6 +90,10 @@ public:
 
     // ── CFR+ accumulator controls (mirrors Leduc MCCFREngine) ────────────────
     void   reset_cfrplus() { cfrplus_.clear(); }
+    // Tyhjentää VAIN regret-reservoirin (ei akkumulaattoria, ei
+    // strategy-bufferia). Kutsutaan emit_cfrplus_targets():n alussa,
+    // jotta reservoir sisältää aina vain tuoreimman R^T-snapshotin.
+    void   clear_regret_buffer() { regret_buf_.clear(); }
     void   emit_cfrplus_targets();
 
     // ── Strategy queries (blueprint = ONNX via ONNX Runtime) ─────────────────
