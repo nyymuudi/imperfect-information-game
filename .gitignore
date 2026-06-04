@@ -6,6 +6,9 @@ __pycache__/
 dist/
 .pytest_cache/
 
+# Equity-välimuistit — generoidaan ajonaikaisesti
+src/abstraction/_equity_cache/
+
 # Mallit — generoidaan trainingissa
 *.pt
 *.onnx
