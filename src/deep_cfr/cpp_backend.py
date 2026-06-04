@@ -59,9 +59,6 @@ def engine_available() -> bool:
 #   (c) This is a training-internal artefact, re-exported every iteration
 #   (d) The blueprint STRATEGY network uses ONNX (blueprint.py) — no issue there
 #
-# Tracked: migrate regret network to ONNX Runtime when subgame solver
-# moves its traversal hot-path to C++.
-#
 # CRITICAL FIX (device safety):
 #   The previous implementation built `nn.Sequential(*list(net.net.children()))`,
 #   which REUSES the original layer objects (children() returns references, not
@@ -120,7 +117,7 @@ _build_leduc_action_map()
 
 
 def info_set_to_tensor(key: str) -> torch.Tensor:
-    """Leduc info-set key → 20-dim tensor."""
+    """Leduc info-set key → 20-dim tensor (Leduc encoder layout)."""
     parts  = key.split("|")
     state  = torch.zeros(20)
     card   = parts[0] if parts else ""
@@ -190,6 +187,13 @@ class NLHECppBackend:
     """
     NLHE C++ backend using state-vector buffers.
     Buffer samples store float[124] state vectors — no string parsing.
+
+    Buffer insertion is handled by DeepCFRSolver._run_cpp_iteration, which
+    routes the exported (state, action, value) triples through
+    _collapse_by_state so that one row per unique state carries the FULL
+    per-action target vector. There is intentionally no add_batch helper here:
+    a per-row scatter (one non-zero slot per row) would reintroduce the
+    conflicting-one-hot pathology that _collapse_by_state exists to remove.
     """
 
     STATE_SIZE = 124
@@ -223,6 +227,11 @@ class NLHECppBackend:
     def run_iteration(self, iteration: int, regret_net=None) -> tuple:
         self._engine.set_iteration(iteration)
         self._engine.clear_buffers()
+        # NOTE: do NOT reset_cfrplus() here. The CFR+ accumulator is CUMULATIVE
+        # across iterations (R <- max(R + r^t, 0) per infoset), exactly like the
+        # Python solver's persistent _cfrplus_regret. clear_buffers() empties
+        # only the reservoir; the accumulator must persist so emit_cfrplus_targets
+        # below exports the up-to-date cumulative R/visits each iteration.
 
         if regret_net is not None and getattr(_eng, "TORCH_AVAILABLE", False):
             try:
@@ -241,6 +250,14 @@ class NLHECppBackend:
         else:
             self._engine.run_traversals_uniform(0)
             self._engine.run_traversals_uniform(1)
+
+        # Emit the accumulated CFR+ targets (R/visits, one sample per
+        # (state, action slot)) into the regret buffer for export. Without this
+        # call the regret buffer stays EMPTY in the default CFRPLUS target mode,
+        # because traversal only folds regret into the accumulator — it does not
+        # write to the buffer until emission. (INSTANT mode writes directly and
+        # would not need this, but CFRPLUS is the default.)
+        self._engine.emit_cfrplus_targets()
 
         return (
             self._engine.export_regret_buffer(),
@@ -264,27 +281,3 @@ class NLHECppBackend:
         actions = np.array(list(export.actions), dtype=np.int64)
         values  = np.array(list(export.values),  dtype=np.float32)
         return X, torch.from_numpy(actions), torch.from_numpy(values)
-
-    def add_batch(self, regret_buf, strategy_buf, reg_exp, str_exp) -> None:
-        """Add exported buffer samples to Python ReservoirBuffers."""
-        def _add(buf, exp):
-            n = exp.n_samples
-            if n == 0:
-                return
-            states  = np.array(exp.states,     dtype=np.float32).reshape(n, self.STATE_SIZE)
-            actions = np.array(list(exp.actions), dtype=np.int64)
-            values  = np.array(list(exp.values),  dtype=np.float32)
-            iters   = np.array(list(exp.iterations), dtype=np.float32)
-
-            action_size = 4
-            targets = np.zeros((n, action_size), dtype=np.float32)
-            for i in range(n):
-                a = int(actions[i])
-                if 0 <= a < action_size:
-                    targets[i, a] = values[i]
-
-            weights = iters / max(iters.max(), 1.0)
-            buf.add_batch(states, targets, weights)
-
-        _add(regret_buf,   reg_exp)
-        _add(strategy_buf, str_exp)

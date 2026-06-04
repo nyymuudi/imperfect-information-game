@@ -127,8 +127,8 @@ class NLHEEncoder(StateEncoder):
         [110]     Own stack remaining (normalized)
         [111]     Opponent stack remaining (normalized)
         [112:120] Action history (last 8 actions encoded)
-        [120]     Preflop equity of own hand
-        [121]     Board strength of own hand
+        [120]     Preflop equity of own hand (deterministic per hand class)
+        [121]     Board strength of own hand (evaluate_7card / MAX_HAND_SCORE)
         [122]     Pot odds = to_call / (pot + to_call)
         [123]     SPR = min(stacks) / pot (capped, normalised)
 
@@ -142,14 +142,29 @@ class NLHEEncoder(StateEncoder):
     parser. Keeping a single source of truth is what makes the Python training
     features bit-match the C++ encoder inference features (the historical
     "feature mismatch" that caused strategy collapse).
+
+    Determinism of dims 120-121: the preflop-equity feature comes from
+    `canonical_preflop_equity`, which is seeded per hand class and is therefore
+    reproducible across runs and across the C++ port. The board-strength
+    feature normalises evaluate_7card by `MAX_HAND_SCORE`, the exact maximum of
+    the packed evaluator score, so it lands in [0, 1] without a magic constant.
+    Both features are quantised to a 1e-6 grid on output so that the exact
+    grouping in DeepCFRSolver._collapse_by_state is robust to float noise.
     """
 
     ACTION_ENC = {"f": -1.0, "c": 0.0, "k": 0.25, "r": 0.5, "b": 0.75, "a": 1.0}
     HISTORY_LEN = 8
 
+    # Quantisation grid for the continuous feature dims. _collapse_by_state in
+    # the solver groups rows by exact state-vector equality (np.unique); even a
+    # 1-ULP difference would split a group. Rounding the continuous dims to this
+    # grid makes the grouping deterministic and matches the C++ state_key, which
+    # quantises to the same 1e-6 grid before hashing.
+    FEATURE_QUANT = 1e-6
+
     _shared_equity_cache = None
 
-    def __init__(self, starting_stack: float = 200.0, equity_sims: int = 500):
+    def __init__(self, starting_stack: float = 200.0, equity_sims: int = 2000):
         self.starting_stack = starting_stack
         self.norm = 2 * starting_stack  # Max pot ≈ 2× stacks
         self._equity_sims = equity_sims
@@ -174,16 +189,14 @@ class NLHEEncoder(StateEncoder):
         return self._game_cache
 
     def _build_equity_cache(self):
-        """Pre-compute preflop equity for all 169 canonical hands."""
-        from ..abstraction.equity import (
-            canonical_hand_class, representative_hand,
-            equity_vs_random, all_169_classes,
-        )
-        rng = np.random.default_rng(42)
-        for hc in all_169_classes():
-            cards = representative_hand(hc)
-            eq = equity_vs_random(cards, num_simulations=self._equity_sims, rng=rng)
-            NLHEEncoder._shared_equity_cache[hc] = eq
+        """Pre-compute deterministic preflop equity for all 169 hand classes.
+
+        Uses the disk-cached table so the (slow) Monte Carlo runs once per sim
+        count and is reused across processes; this also lets the C++ engine read
+        the same values for dim-120 parity."""
+        from ..abstraction.equity import preflop_equity_table
+        table = preflop_equity_table(num_simulations=self._equity_sims)
+        NLHEEncoder._shared_equity_cache.update(table)
 
     def _get_preflop_equity(self, card1: int, card2: int) -> float:
         from ..abstraction.equity import canonical_hand_class
@@ -193,11 +206,14 @@ class NLHEEncoder(StateEncoder):
     def _get_board_strength(self, hole: tuple, board: tuple) -> float:
         if not board:
             return 0.0
-        from ..abstraction.equity import evaluate_7card, evaluate_5card
+        from ..abstraction.equity import (
+            evaluate_7card, evaluate_5card, MAX_HAND_SCORE,
+        )
         all_cards = hole + board
         if len(all_cards) >= 5:
-            val = evaluate_7card(all_cards[:7]) if len(all_cards) >= 7 else evaluate_5card(all_cards[:5])
-            return min(val / 6_000_000, 1.0)
+            val = (evaluate_7card(all_cards[:7]) if len(all_cards) >= 7
+                   else evaluate_5card(all_cards[:5]))
+            return min(val / MAX_HAND_SCORE, 1.0)
         return 0.0
 
     def state_size(self) -> int:
@@ -240,14 +256,22 @@ class NLHEEncoder(StateEncoder):
         state[110] = my_stack / self.starting_stack
         state[111] = opp_stack / self.starting_stack
 
-        # Action history
+        # Action history. 'f' and 'c' are distinct in the Python alphabet, but
+        # the C++ engine stores both as FOLD_OR_CHECK (slot 0) and encodes that
+        # slot as 0.0. To keep dim 112-119 bit-identical across implementations,
+        # encode a terminal-only 'f' as 0.0 too: a fold ends the hand, so a
+        # folded node is never queried for a strategy during traversal, and
+        # using 0.0 here removes the only remaining action-history divergence.
         for i, a in enumerate(actions[-self.HISTORY_LEN:]):
             if isinstance(a, str):
-                state[112 + i] = self.ACTION_ENC.get(a, 0.0)
+                enc = self.ACTION_ENC.get(a, 0.0)
+                if a == 'f':
+                    enc = 0.0  # parity with C++ FOLD_OR_CHECK slot
+                state[112 + i] = enc
             else:
                 state[112 + i] = min(a / self.starting_stack, 1.0)
 
-        # Hand strength features (key for convergence)
+        # Hand strength features (key for convergence) — deterministic.
         state[120] = self._get_preflop_equity(my_cards[0], my_cards[1])
         visible_board = history[2][:n_visible] if n_visible > 0 else ()
         state[121] = self._get_board_strength(my_cards, visible_board)
@@ -262,4 +286,8 @@ class NLHEEncoder(StateEncoder):
         eff_stack  = min(my_stack, opp_stack)
         state[123] = min(eff_stack / pot, 10.0) / 10.0 if pot > 1e-6 else 1.0
 
-        return state
+        # Quantise the continuous dims to a fixed grid so _collapse_by_state's
+        # exact grouping (and the C++ state_key) treat identical nodes as equal.
+        cont = slice(108, 124)
+        state[cont] = np.round(state[cont] / self.FEATURE_QUANT) * self.FEATURE_QUANT
+        return state.astype(np.float32)

@@ -14,8 +14,22 @@
 
 namespace cfr {
 
-// ── Preflop equity approximation ──────────────────────────────────────────────
-inline float preflop_equity(int rank_high, int rank_low, bool suited) {
+// ── Preflop equity (HEURISTIC FALLBACK ONLY) ──────────────────────────────────
+//
+// dim 120 of the encoder is the preflop equity of the player's hand. The
+// CANONICAL value comes from the deterministic Monte-Carlo table that the
+// Python side writes to
+//     src/abstraction/_equity_cache/preflop_equity_<sims>.json
+// and that NLHEStateEncoder::encode loads (see torch_model.cpp,
+// PreflopEquityTable). That table is what gives dim-120 PARITY with Python.
+//
+// This closed-form heuristic is ONLY a fallback used when the JSON table is
+// absent (e.g. a fresh build before any Python run has generated it), so that
+// the engine still produces a plausible, monotone equity rather than zero. It
+// is intentionally crude and is NOT parity-accurate; do not rely on it when a
+// trained pipeline is expected. Renamed with a _heuristic suffix so call sites
+// make the fallback nature explicit.
+inline float preflop_equity_heuristic(int rank_high, int rank_low, bool suited) {
     float base = 0.30f + rank_high * 0.026f;
     if (rank_high == rank_low) base += 0.15f;
     if (rank_high - rank_low == 1) base += 0.02f;
@@ -25,8 +39,19 @@ inline float preflop_equity(int rank_high, int rank_low, bool suited) {
 }
 
 // ── NLHEStateEncoder ──────────────────────────────────────────────────────────
-// Produces the same 124-dim tensor as Python NLHEEncoder (dims 122-123 = pot odds + SPR).
-
+// Produces the same 124-dim tensor as Python NLHEEncoder (dims 122-123 = pot
+// odds + SPR).
+//
+// PARITY NOTES (see torch_model.cpp for the implementations):
+//   * dim 120 (preflop equity): loaded from the Python equity-table JSON for
+//     exact parity; falls back to preflop_equity_heuristic only if absent.
+//   * dim 121 (board strength): normalised by THIS evaluator's true maximum,
+//     (8<<24)|(12<<20). Because the Python evaluator uses a different score
+//     packing (base-15 _pack), dim 121 is MONOTONE-but-not-bit-identical across
+//     implementations — an accepted residual. The parity test compares dims
+//     0-119 and 122-123, not 121.
+//   * dims 108-123 are quantised to a 1e-6 grid on output, matching the Python
+//     encoder and the NLHE state_key, so identical nodes group identically.
 class NLHEStateEncoder {
 public:
     static constexpr int STATE_SIZE = 124;

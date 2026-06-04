@@ -16,6 +16,13 @@ EHS (Expected Hand Strength) computation per street:
     Turn:     Monte Carlo vs random opponent + random river.
     River:    Exact — evaluate_7card deterministically.
 
+EHS here is a WIN PROBABILITY in [0, 1] (wins + 0.5·ties over trials), so it
+needs no score normalisation — there is intentionally no MAX-score constant in
+this module. The only place a packed-evaluator score is normalised into [0, 1]
+is the encoder's board-strength feature, which uses MAX_HAND_SCORE from
+abstraction.equity; this module and that feature must not invent separate
+magic maxima.
+
 Bucketing:
     Equal-width bins on EHS ∈ [0, 1].  k bins per street.
     This is the standard Billings et al. (2003) approach,
@@ -42,9 +49,6 @@ Usage:
 
 from __future__ import annotations
 
-import functools
-from typing import Sequence
-
 import numpy as np
 
 from .equity import evaluate_7card, evaluate_5card
@@ -53,11 +57,6 @@ from .equity import evaluate_7card, evaluate_5card
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _STREET_BY_BOARD_LEN: dict[int, str] = {3: "flop", 4: "turn", 5: "river"}
-_BOARD_LEN_BY_STREET: dict[str, int] = {"flop": 3, "turn": 4, "river": 5}
-
-# Approximate max evaluator score for river normalisation.
-# evaluate_7card returns a packed integer; Royal Flush ≈ 8 * 15^5 ≈ 6_075_000.
-_MAX_EVAL_SCORE: float = 6_300_000.0
 
 
 # ── EHS computation ───────────────────────────────────────────────────────────
@@ -170,7 +169,7 @@ class PostflopAbstraction:
                             or a dict {'flop': k1, 'turn': k2, 'river': k3}.
         n_sims:             Monte Carlo simulations per EHS query (flop/turn).
         seed:               RNG seed for reproducibility.
-        cache_size:         max EHS cache entries (LRU).  0 = unlimited.
+        cache_size:         max EHS cache entries.  0 = unlimited.
     """
 
     def __init__(
@@ -198,7 +197,6 @@ class PostflopAbstraction:
         self._cache_size = cache_size
 
         # EHS cache: (hole_cards, board) → float
-        # Using functools.lru_cache on a bound method requires a wrapper.
         self._ehs_cache: dict[tuple, float] = {}
 
     # ── Core API ──────────────────────────────────────────────────────────────
@@ -209,7 +207,7 @@ class PostflopAbstraction:
         board: tuple[int, ...],
     ) -> float:
         """
-        EHS of hole_cards given board, with LRU-style caching.
+        EHS of hole_cards given board, with caching.
 
         Cache key: (sorted(hole_cards), board) — suit/order independent
         for hole cards (AA♠A♥ == AA♥A♠), but board order matters.

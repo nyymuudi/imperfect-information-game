@@ -227,23 +227,56 @@ class TestNashVerification:
     def test_game_value_converges_to_analytical(self):
         """
         Kuhn Pokerin analyyttinen peliarvo on -1/18 ≈ -0.05556 (P0:n EV).
-        Tämä on vahvin yksittäinen korrektiiuustarkistus koko solverille:
+        Tämä on vahvin yksittäinen korrektiivisuustarkistus koko solverille:
         tarttuu sekä peli- että solverilogiikan virheisiin.
         Viite: Kuhn (1950), s. 99.
+
+        PELIARVO vs BEST-RESPONSE:
+        Peliarvo on P0:n EV kun MOLEMMAT pelaavat tasapainostrategiaa — ei
+        best-response-arvo. Se lasketaan suoraan strategiaprofiilin odotusarvona
+        traversoimalla peli niin että kumpikin pelaaja noudattaa
+        keskiarvostrategiaansa (chance-painotettuna). Tämä on info-set-turvallinen
+        (toisin kuin per-historia-maksimoiva best response, joka antaisi
+        pelaajalle selvänäkijän kyvyn imperfect-information-pelissä).
         """
-        from src.main import best_response_value
         game     = KuhnPoker()
         solver   = CFRSolver(game=game, linear_averaging=True)
         strategy = solver.solve(iterations=20000)
 
-        # Laske P0:n EV parasta vastauslaskennalla
-        ev_p0 = best_response_value(game, 0, strategy)
+        ev_p0 = _profile_value_p0(game, strategy)
         analytical = KuhnPoker.known_game_value()  # -1/18
 
         assert abs(ev_p0 - analytical) < 0.005, (
             f"P0 EV={ev_p0:.6f}, odotettu {analytical:.6f} "
             f"(virhe {abs(ev_p0-analytical):.6f} > 0.005)"
         )
+
+
+def _profile_value_p0(game, strategy) -> float:
+    """
+    P0:n odotusarvo kun MOLEMMAT pelaavat annettua keskiarvostrategiaa.
+
+    Suora strategiaprofiilin EV — ei best response. Jokaisessa solmussa
+    toimiva pelaaja noudattaa info-set-avaimen mukaista strategiaansa, ja
+    payoffit painotetaan strategian todennäköisyyksillä ja alkujaon
+    chance-todennäköisyydellä. Info-set-turvallinen Kuhnin kaltaisille
+    imperfect-information-peleille.
+    """
+    def ev(history):
+        if game.is_terminal(history):
+            return game.terminal_payoffs(history)[0]
+        player  = game.current_player(history)
+        actions = game.legal_actions(history)
+        key     = game.info_set_key(history, player)
+        strat   = strategy.get(key)
+        if strat is None:
+            strat = np.ones(len(actions)) / len(actions)
+        return sum(
+            strat[i] * ev(game.apply_action(history, a))
+            for i, a in enumerate(actions)
+        )
+
+    return sum(cp * ev(h) for h, cp in game.initial_histories())
 
 
 if __name__ == "__main__":

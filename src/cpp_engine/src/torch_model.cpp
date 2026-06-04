@@ -3,6 +3,11 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <array>
+#include <fstream>
+#include <mutex>
+#include <unordered_map>
+#include <string>
 
 #ifdef CFR_TORCH_AVAILABLE
 #include <torch/script.h>
@@ -13,6 +18,112 @@
 #endif
 
 namespace cfr {
+
+// ── Canonical preflop equity table (parity with Python) ───────────────────────
+//
+// dim 120 must match Python NLHEEncoder, which fills it from
+// abstraction/equity.canonical_preflop_equity (a deterministic per-class Monte
+// Carlo). Re-running Monte Carlo here would NOT reproduce those exact values,
+// so instead we LOAD the table Python writes to disk
+// (abstraction/_equity_cache/preflop_equity_<sims>.json) and look hands up by
+// canonical class. If the file is absent we fall back to the old heuristic so
+// builds/tests without the table still run — but a trained pipeline always has
+// it, giving exact dim-120 parity.
+//
+// The lookup key is the canonical class string ("AA", "AKs", "72o", ...),
+// identical to Python's canonical_hand_class.
+
+namespace {
+
+const char* RANK_NAMES = "23456789TJQKA";
+
+std::string canonical_class(int rank_high, int rank_low, bool suited, bool pair) {
+    std::string s;
+    s += RANK_NAMES[rank_high];
+    s += RANK_NAMES[rank_low];
+    if (!pair) s += (suited ? 's' : 'o');
+    return s;
+}
+
+class PreflopEquityTable {
+public:
+    static const PreflopEquityTable& instance() {
+        static PreflopEquityTable t;
+        return t;
+    }
+
+    // Returns equity in [0,1] for the given canonical class, or -1 if the
+    // table was not loaded (caller falls back to the heuristic).
+    float lookup(const std::string& cls) const {
+        if (!loaded_) return -1.0f;
+        auto it = table_.find(cls);
+        return (it == table_.end()) ? -1.0f : it->second;
+    }
+
+    bool loaded() const { return loaded_; }
+
+private:
+    PreflopEquityTable() { load(); }
+
+    void load() {
+        // Search the same candidate paths the Python package uses, relative to
+        // a few plausible working directories. Best-effort: silent on failure.
+        const char* candidates[] = {
+            "src/abstraction/_equity_cache/preflop_equity_2000.json",
+            "../src/abstraction/_equity_cache/preflop_equity_2000.json",
+            "../../src/abstraction/_equity_cache/preflop_equity_2000.json",
+            "abstraction/_equity_cache/preflop_equity_2000.json",
+        };
+        for (const char* path : candidates) {
+            if (try_load(path)) { loaded_ = true; return; }
+        }
+        loaded_ = false;
+    }
+
+    // Minimal JSON object parser for {"AA": 0.84, ...} — values are plain
+    // floats, keys are 2-3 char class strings. Avoids a JSON dependency.
+    bool try_load(const char* path) {
+        std::ifstream f(path);
+        if (!f.good()) return false;
+        std::string content((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+        size_t i = 0;
+        const size_t n = content.size();
+        auto skip_ws = [&]() { while (i < n && (content[i]==' '||content[i]=='\n'||
+                                                content[i]=='\t'||content[i]=='\r')) ++i; };
+        skip_ws();
+        if (i >= n || content[i] != '{') return false;
+        ++i;
+        while (i < n) {
+            skip_ws();
+            if (i < n && content[i] == '}') break;
+            if (i >= n || content[i] != '"') return false;
+            ++i;
+            std::string key;
+            while (i < n && content[i] != '"') key += content[i++];
+            if (i >= n) return false;
+            ++i;  // closing quote
+            skip_ws();
+            if (i >= n || content[i] != ':') return false;
+            ++i;
+            skip_ws();
+            size_t start = i;
+            while (i < n && content[i] != ',' && content[i] != '}') ++i;
+            try {
+                float v = std::stof(content.substr(start, i - start));
+                table_[key] = v;
+            } catch (...) { return false; }
+            skip_ws();
+            if (i < n && content[i] == ',') ++i;
+        }
+        return !table_.empty();
+    }
+
+    bool loaded_ = false;
+    std::unordered_map<std::string, float> table_;
+};
+
+}  // namespace
 
 // ── NLHEStateEncoder ──────────────────────────────────────────────────────────
 // NLHE_ACTION_ENC is defined in nlhe_game.hpp — do NOT redefine here.
@@ -54,11 +165,21 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
             out[slot] = NLHE_ACTION_ENC[act];   // defined in nlhe_game.hpp
     }
 
+    // dim [120]: preflop equity. Parity path: look up the deterministic table
+    // Python wrote; only if it is unavailable do we fall back to the heuristic.
     int r0 = card_rank(c0), r1 = card_rank(c1);
     int s0 = card_suit(c0), s1 = card_suit(c1);
     int rh = std::max(r0,r1), rl = std::min(r0,r1);
     bool suited = (s0 == s1) && (c0 != c1);
-    out[120] = preflop_equity(rh, rl, suited);
+    bool pair   = (r0 == r1);
+    float eq = -1.0f;
+    {
+        const auto& tbl = PreflopEquityTable::instance();
+        if (tbl.loaded()) {
+            eq = tbl.lookup(canonical_class(rh, rl, suited, pair));
+        }
+    }
+    out[120] = (eq >= 0.0f) ? eq : preflop_equity_heuristic(rh, rl, suited);
     out[121] = board_strength(state, player);
 
     // dim [122]: pot odds = to_call / (pot + to_call)
@@ -70,6 +191,12 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     out[123] = (state.pot > 1e-6f)
                ? std::min(eff_stack / state.pot, 10.0f) / 10.0f
                : 1.0f;
+
+    // Quantise the continuous dims to the SAME 1e-6 grid the Python encoder
+    // uses on output, so identical nodes hash/group identically across
+    // implementations (DeepCFRSolver._collapse_by_state + NLHE state_key).
+    for (int i = 108; i < STATE_SIZE; ++i)
+        out[i] = std::round(out[i] * 1e6f) / 1e6f;
 }
 
 float NLHEStateEncoder::board_strength(const NLHEState& state, int player) {
@@ -81,14 +208,21 @@ float NLHEStateEncoder::board_strength(const NLHEState& state, int player) {
     for(int i = 0; i < n_visible && i < 5; ++i) cards[2+i] = state.board[i];
     int n = 2 + std::min(n_visible, 5);
     int32_t score = HandEvaluator::evaluate(cards, n);
-    // True maximum: straight flush (cat 8) with ace-high (rank 12)
-    // = (8 << 24) | (12 << 20) = 146_800_640.
-    // The old value (8 << 24 = 134_217_728) was too low; a royal flush
-    // produced score/MAX > 1.0 before clamping, saturating dim 121.
+
+    // NORMALISATION PARITY NOTE
+    // -------------------------
+    // Python normalises evaluate_7card by MAX_HAND_SCORE = _pack(8, 12), where
+    // _pack uses a base-15 positional scheme. This C++ HandEvaluator uses a
+    // different packing (encode_score: category<<24 | ranks<<...), so the raw
+    // integer scores are NOT comparable to Python's even though both rank hands
+    // identically. dim 121 is therefore a MONOTONE-but-not-bit-identical
+    // feature across implementations; this is an accepted residual documented
+    // in tests/test_parity.py (the parity test compares dims 0-111, not 120-121).
     //
-    // KNOWN RESIDUAL: Python _get_board_strength uses evaluate_7card()/6_000_000,
-    // a different evaluator. Both are monotone in [0,1] but not numerically
-    // equivalent for the same hand — see test_encoder_parity.py.
+    // We normalise by THIS evaluator's true maximum — straight flush, ace high:
+    // encode_score(8, {12}) = (8<<24) | (12<<20) — so the value lands in [0,1]
+    // without saturating the top category (the old 8<<24 constant let a royal
+    // flush exceed 1.0 before clamping, collapsing the strongest hands).
     constexpr float MAX_SCORE = static_cast<float>((8 << 24) | (12 << 20));
     return std::min((float)score / MAX_SCORE, 1.0f);
 }

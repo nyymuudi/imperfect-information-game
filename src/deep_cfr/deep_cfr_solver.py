@@ -4,28 +4,40 @@ Deep CFR Solver.
 Reference: Steinberger, E. (2019). "Single Deep Counterfactual
 Regret Minimization." arXiv:1901.07621.
 
-Buffer strategy (Steinberger 2019, Section 3):
-    Regret buffer  (MR): SlidingWindowBuffer — only fresh data needed.
-        The regret network predicts counterfactual regrets for the
-        CURRENT strategy. Old regrets from early iterations corrupt
-        the gradient signal. FIFO keeps only the last K samples.
-    Strategy buffer (MΠ): ReservoirBuffer — needs full history average.
-        The strategy network approximates the time-average strategy
-        across all iterations, so reservoir sampling over the full
-        history is correct here.
+Buffer strategy (Brown et al. 2019 / Steinberger 2019):
+    Regret (value) buffer (MR): RESERVOIR over many iterations.
+        The value network is RE-FITTED from scratch each iteration on a
+        reservoir drawn from ALL past iterations; that reservoir is how the
+        network comes to approximate CUMULATIVE counterfactual regret without
+        explicit summation. It must be LARGE (cover many iterations).
+        A small FIFO 'window' keeps only the freshest samples, so the network
+        fits only the latest iteration's INSTANTANEOUS regrets — that is not
+        CFR and does not converge (verified: flat exploitability on Leduc).
+    Strategy buffer (MΠ): RESERVOIR over the full history.
+        Approximates the time-average strategy across all iterations, which is
+        the quantity that converges to Nash. Reservoir is correct here too.
 
-Weighting (corrected):
-    Regret samples enter the buffer UNWEIGHTED (weight = 1.0). The regret
-    network must fit the regrets of the CURRENT strategy; iteration-weighting
-    regrets has no theoretical basis in Deep CFR and, combined with a
-    non-rotating window buffer, lets stale data dominate the gradient.
-    Linear-CFR iteration weighting applies ONLY to the strategy buffer,
-    which approximates the time-average strategy (Brown & Sandholm 2019).
+Weighting:
+    Regret samples enter the buffer UNWEIGHTED (weight = 1.0). The value
+    network fits the regret targets directly; iteration-weighting the regret
+    targets has no basis in Deep CFR. Linear-CFR iteration weighting applies
+    ONLY to the strategy buffer, which approximates the time-average strategy
+    (Brown & Sandholm 2019).
+
+Regret target (DEEPCFR_TARGET, default 'cfrplus'):
+    CFR+-clipped cumulative regret R <- max(R + r^t, 0), normalised by the
+    per-infoset visit count (R+/visits). This is the quantity tabular CFR+
+    regret-matches on; it converges on Leduc where the instantaneous target
+    oscillates. DEEPCFR_TARGET=instant restores the legacy instantaneous form
+    for A/B comparison.
 """
+
+import os as _os
 
 import numpy as np
 import torch
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
 from typing import Optional
 
 from ..games.base import ExtensiveFormGame, History, Action, InfoSetKey
@@ -43,7 +55,7 @@ class DeepCFRSolver:
     game: ExtensiveFormGame
     encoder: StateEncoder
     max_actions: int = 5
-    buffer_capacity: int = 500000
+    buffer_capacity: int = 1_000_000
     strategy_buffer_capacity: int = 0     # 0 = same as buffer_capacity
     hidden_size: int = 256
     train_epochs: int = 100
@@ -60,39 +72,16 @@ class DeepCFRSolver:
         self.regret_net   = RegretNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
         self.strategy_net = StrategyNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
 
-        # Regret buffer: mode='window' (FIFO — fresh data only).
-        #   Steinberger 2019 §3: the regret network predicts regrets for the
-        #   CURRENT strategy; old data from early iterations corrupts gradients.
-        #   NOTE: window mode only helps if capacity is SMALL relative to total
-        #   samples produced over the run. If capacity > total samples, nothing
-        #   is ever evicted and the window degenerates into an unbounded
-        #   accumulating buffer. Follow the repo guideline:
-        #       buffer ≈ 10 × traversals_per_iter × 2
-        #   e.g. 500 traversals → ~10_000. A 2_000_000 capacity defeats the
-        #   purpose entirely.
-        # Regret (value) buffer: mode='reservoir' (Deep CFR / SD-CFR, Brown 2019
-        #   & Steinberger 2019). The value network is RE-FITTED each iteration on
-        #   a reservoir over samples from ALL iterations; that reservoir is how
-        #   the network comes to approximate CUMULATIVE counterfactual regret
-        #   without any explicit summation. A 'window' buffer keeps only the
-        #   freshest samples, so the network fits only the latest iteration's
-        #   INSTANTANEOUS regrets — that is not CFR and does not converge
-        #   (verified: flat exploitability on Leduc). Reservoir is required, and
-        #   it should be LARGE (cover many iterations), not the small
-        #   ~10×traversals window size used previously.
-        # Strategy buffer: mode='reservoir' (full history average).
-        #   Approximates time-average strategy over all iterations — correct.
+        # Both buffers are reservoirs (see module docstring). The regret buffer
+        # must be LARGE: it is the implicit cumulative-regret estimator, not a
+        # fresh-data window. The strategy buffer is the time-average estimator.
         self._current_iter   = 0
         self.regret_buffer   = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions, mode='reservoir')
         self.strategy_buffer = ReservoirBuffer(strat_cap, state_sz, self.max_actions, mode='reservoir')
 
-        # CFR+-clipped cumulative regret target (DEEPCFR_TARGET=cfrplus, default).
-        # Per-infoset R <- max(R + r^t, 0): the quantity tabular CFR+ regret-
-        # matches on, which CONVERGES on Leduc where the instantaneous target
-        # oscillates. Keyed by info_set_key (string). Buffer stores R+/t
-        # (bounded, sign-preserving; measured tabular scale ~[0.01,0.06]).
-        # DEEPCFR_TARGET=instant restores the previous instantaneous target.
-        import os as _os
+        # CFR+-clipped cumulative regret target (default). Keyed by info_set_key
+        # so the same infoset accumulates across traversals. Buffer stores
+        # R+/visits (bounded, sign-preserving; tabular scale ~[0.01, 0.06]).
         self._target_mode = _os.environ.get("DEEPCFR_TARGET", "cfrplus").strip().lower()
         self._cfrplus_regret = {}
 
@@ -172,10 +161,8 @@ class DeepCFRSolver:
             else:
                 # CFR+-clipped cumulative regret, keyed by info_set_key so the
                 # same infoset accumulates across traversals. max(R+r^t,0) gives
-                # the correct sign (the instantaneous mean had the wrong sign:
-                # measured K[-1.1,+0.05] vs tabular cum [+10.8,+60.1]). R+/t keeps
-                # the regression target at the network-fittable scale measured
-                # from tabular CFR+ (~[0.01,0.06] for K), preserving sign/ratio.
+                # the correct sign; R+/visits keeps the target at the tabular
+                # scale (~[0.01,0.06]) regardless of per-infoset visit density.
                 key = self.game.info_set_key(history, player)
                 entry = self._cfrplus_regret.get(key)
                 if entry is None:
@@ -184,11 +171,6 @@ class DeepCFRSolver:
                 R[:num_actions] = np.maximum(R[:num_actions] + regrets, 0.0)
                 n += 1
                 self._cfrplus_regret[key] = [R, n]
-                # Divide by PER-INFOSET visit count n (not iteration t): R+ and n
-                # grow at the same rate, so R+/n is a true mean regret that lands
-                # at the tabular scale ~[0.01,0.06] regardless of how often this
-                # infoset is visited per iteration. A global t-power cannot do
-                # this because visit density varies across infosets.
                 target = (R[:num_actions] / float(n)).astype(np.float32)
 
             self.regret_buffer.add(state, target, 1.0)
@@ -206,16 +188,16 @@ class DeepCFRSolver:
         The C++ engine emits one sample per (info-set, action): each carries
         an identical 124-dim state vector but a single action index + that
         action's regret (or strategy probability). Scattering these onto one
-        row each (np.arange(n)) produces targets with a single non-zero slot
-        and artificial zeros elsewhere — so the network is trained to map the
-        SAME input to several conflicting one-hot-ish targets at once. That
-        prevents the regret network from ever learning a coherent per-action
-        regret vector, which manifests as non-converging / degenerate play.
+        row each produces targets with a single non-zero slot and artificial
+        zeros elsewhere — so the network is trained to map the SAME input to
+        several conflicting near-one-hot targets at once, which prevents the
+        regret network from learning a coherent per-action regret vector.
 
-        Fix: group rows by their exact state vector (the C++ encoder produces
-        bit-identical floats for the same node, so exact grouping is safe) and
-        sum each action's value into the correct slot, yielding one row per
-        state with the complete [r0, r1, r2, r3] target.
+        Fix: group rows by their exact state vector and sum each action's value
+        into the correct slot, yielding one row per state with the complete
+        [r0, r1, r2, r3] target. Both sides quantise the continuous feature dims
+        to a fixed 1e-6 grid (encoder + C++ state_key), so exact grouping is
+        robust to float noise and the two implementations group identically.
 
         Returns (states_unique [m, S], targets [m, A]).
         """
@@ -223,14 +205,10 @@ class DeepCFRSolver:
         if n == 0:
             return X_np, np.zeros((0, self.max_actions), dtype=np.float32)
 
-        # Group by exact state vector. np.unique on rows gives an inverse index
-        # mapping each original row to its unique-state group.
         uniq_states, inverse = np.unique(X_np, axis=0, return_inverse=True)
         inverse = np.asarray(inverse).reshape(-1)   # 1D across numpy versions
-        m = uniq_states.shape[0]
 
-        targets = np.zeros((m, self.max_actions), dtype=np.float32)
-        # Scatter each sample's value into (its group row, its action slot).
+        targets = np.zeros((uniq_states.shape[0], self.max_actions), dtype=np.float32)
         np.add.at(targets, (inverse, a_np), v_np)
         return uniq_states.astype(np.float32), targets
 
@@ -252,7 +230,7 @@ class DeepCFRSolver:
             if len(X_np) > 0:
                 states, reg_mat = self._collapse_by_state(X_np, a_np, v_np)
                 m = len(states)
-                # Regrets UNWEIGHTED — fit the current strategy only.
+                # Regrets UNWEIGHTED — fit the regret targets directly.
                 self.regret_buffer.add_batch(
                     states, reg_mat, np.ones(m, dtype=np.float32)
                 )
@@ -276,10 +254,10 @@ class DeepCFRSolver:
         Wrap the CURRENT regret-matching strategy as a query interface
         compatible with estimate_exploitability().
 
-        This is the strategy CFR actually iterates (positive-regret
-        matching on the regret network), and it updates every iteration —
-        unlike strategy_net, which is trained only once at the end.
-        Use this for mid-training convergence measurement.
+        This is the strategy CFR actually iterates (positive-regret matching on
+        the regret network), and it updates every iteration — unlike
+        strategy_net, which is trained only at the end. Use this for
+        mid-training convergence measurement.
         """
         solver = self
 
@@ -311,8 +289,7 @@ class DeepCFRSolver:
 
         for t in range(1, iterations + 1):
             # Keep _current_iter in sync with the loop so any iteration-weighted
-            # logic (strategy buffer) sees the true current iteration, not a
-            # constant. Previously _current_iter stayed at 0 for the whole run.
+            # logic sees the true current iteration, not a constant.
             self._current_iter = self.iterations
 
             if self._cpp is not None:
@@ -334,14 +311,13 @@ class DeepCFRSolver:
                 # trained FROM SCRATCH each iteration, starting from a random
                 # initialization. Fine-tuning from the previous iteration's
                 # weights raises final exploitability ~50% (their Fig. 4) and,
-                # combined with a changing target, causes the drift we observed
-                # (flat/oscillating exploitability on Leduc). Re-initialise here.
+                # combined with a changing target, causes the drift observed on
+                # Leduc. Re-initialise here.
                 state_sz = self.encoder.state_size()
                 net_device = next(self.regret_net.parameters()).device
                 self.regret_net = RegretNetwork(
                     state_sz, self.max_actions, self.hidden_size
                 ).to(net_device)
-                # Fresh Adam optimizer each iteration (created inside trainer).
                 self._last_regret_loss = train_regret_network(
                     self.regret_net, self.regret_buffer,
                     epochs=self.train_epochs,

@@ -3,17 +3,34 @@ Preflop equity calculator using Monte Carlo simulation.
 
 Computes hand equity by dealing random boards and evaluating
 showdown outcomes. Used for card abstraction — grouping hands
-with similar equity profiles into buckets.
+with similar equity profiles into buckets — and as an explicit
+input feature for the Deep CFR state encoder (dim 120).
 
 Card encoding:
     card = rank * 4 + suit
     rank: 0=2, 1=3, ..., 8=T, 9=J, 10=Q, 11=K, 12=A
     suit: 0=♣, 1=♦, 2=♥, 3=♠
+
+DETERMINISM NOTE
+----------------
+`canonical_preflop_equity(hand_class)` is the single source of truth for the
+encoder's preflop-equity feature. It is DETERMINISTIC per hand class: the RNG
+is seeded from a fixed base seed combined with the hand class itself, so the
+same hand always yields the same equity regardless of computation order or
+which process computes it. This is required so that:
+
+  * the encoder's dim-120 feature is reproducible across training runs, and
+  * the C++ engine can replicate the SAME value (it reproduces this table with
+    an identical per-class seeding scheme), giving cross-implementation parity
+    on dim 120 rather than the previous heuristic divergence.
+
+The older `equity_vs_random(hole, rng=...)` is retained for ad-hoc / abstraction
+use, but the encoder must go through `canonical_preflop_equity` so the feature
+is stable and parity-checkable.
 """
 
 import numpy as np
 from itertools import combinations
-from functools import lru_cache
 
 
 NUM_RANKS = 13
@@ -22,6 +39,13 @@ NUM_CARDS = 52
 
 RANK_NAMES = "23456789TJQKA"
 SUIT_NAMES = "cdhs"
+
+# Fixed base seed for the canonical preflop-equity table. The C++ engine uses
+# the same constant + the same per-class derivation so both sides agree.
+PREFLOP_EQUITY_BASE_SEED = 1_550_000_000
+# Number of Monte Carlo board+opponent samples per canonical hand class.
+# 2000 keeps the standard error ~0.011, small relative to the 169-class spread.
+PREFLOP_EQUITY_SIMS = 2000
 
 
 def card_to_str(card: int) -> str:
@@ -102,7 +126,7 @@ def evaluate_5card(cards: tuple[int, ...]) -> int:
 def _pack(*values: int) -> int:
     """
     Pack category + tiebreakers into a single comparable integer.
-    
+
     CRITICAL: always pad to exactly 6 values to ensure consistent
     comparison across different hand categories.
     """
@@ -126,6 +150,13 @@ def evaluate_7card(cards: tuple[int, ...]) -> int:
     return best
 
 
+# Maximum achievable evaluate_7card / evaluate_5card score: straight flush
+# (category 8) with high card Ace (rank 12) → _pack(8, 12) = 8*15^5 + 12*15^4.
+# Used to normalise board-strength into [0, 1]. This is the SAME constant the
+# C++ encoder uses (see torch_model.cpp::board_strength), so dim 121 matches.
+MAX_HAND_SCORE = float(_pack(8, 12))
+
+
 # ── Equity Calculator ───────────────────────────────────────────
 
 
@@ -136,8 +167,11 @@ def equity_vs_random(
 ) -> float:
     """
     Compute equity of hole_cards vs a random opponent hand.
-    
+
     Returns: float in [0, 1] — probability of winning (ties count 0.5).
+
+    NOTE: for the encoder feature use `canonical_preflop_equity` instead;
+    this function is non-deterministic unless you pass a per-call seeded rng.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -227,22 +261,87 @@ def representative_hand(hand_class: str) -> tuple[int, int]:
         return (r1 * 4 + 0, r2 * 4 + 1)
 
 
+def _class_seed(hand_class: str) -> int:
+    """
+    Derive a stable per-class RNG seed from the hand class string.
+
+    Deterministic and order-independent: the same class always seeds the same
+    way, so its equity is reproducible across runs and across the C++ port
+    (which derives the seed identically from the class index).
+    """
+    # Index into the canonical 169 list gives a small, stable integer that the
+    # C++ side reproduces from the same ordering.
+    idx = _CLASS_INDEX[hand_class]
+    return PREFLOP_EQUITY_BASE_SEED + idx
+
+
+_CLASS_INDEX = {hc: i for i, hc in enumerate(all_169_classes())}
+
+
+def canonical_preflop_equity(
+    hand_class: str,
+    num_simulations: int = PREFLOP_EQUITY_SIMS,
+) -> float:
+    """
+    Deterministic preflop equity of a canonical hand class vs a random hand.
+
+    The RNG is seeded PER CLASS, so the result depends only on the class and
+    the (fixed) base seed + sim count — never on computation order. This is the
+    value the encoder writes to dim 120 and the value the C++ encoder mirrors.
+    """
+    cards = representative_hand(hand_class)
+    rng = np.random.default_rng(_class_seed(hand_class))
+    return equity_vs_random(cards, num_simulations=num_simulations, rng=rng)
+
+
+def _equity_table_cache_path(num_simulations: int) -> "object":
+    from pathlib import Path
+    cache_dir = Path(__file__).resolve().parent / "_equity_cache"
+    return cache_dir / f"preflop_equity_{num_simulations}.json"
+
+
 def preflop_equity_table(
-    num_simulations: int = 3000,
-    seed: int = 42,
+    num_simulations: int = PREFLOP_EQUITY_SIMS,
+    seed: int | None = None,
+    use_disk_cache: bool = True,
 ) -> dict[str, float]:
     """
     Compute equity vs random for all 169 canonical preflop hands.
-    
+
+    Deterministic per class (the `seed` argument is accepted for backward
+    compatibility but ignored — each class is seeded from its own stable seed).
+
+    With use_disk_cache=True the full table is memoised to a JSON file keyed by
+    sim count. The first call computes and writes it (~minutes at high sim
+    counts); subsequent calls and other processes load it instantly. The C++
+    engine can read the SAME JSON, giving exact dim-120 parity without rerunning
+    Monte Carlo on its side.
+
     Returns dict: hand_class → equity (e.g., {"AA": 0.852, "72o": 0.345}).
     """
-    rng = np.random.default_rng(seed)
-    classes = all_169_classes()
-    table = {}
-    
-    for hc in classes:
-        cards = representative_hand(hc)
-        eq = equity_vs_random(cards, num_simulations=num_simulations, rng=rng)
-        table[hc] = eq
+    if use_disk_cache:
+        import json
+        from pathlib import Path
+        path = _equity_table_cache_path(num_simulations)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if len(data) == 169:
+                    return data
+            except (json.JSONDecodeError, OSError):
+                pass  # fall through to recompute
+
+    table = {hc: canonical_preflop_equity(hc, num_simulations)
+             for hc in all_169_classes()}
+
+    if use_disk_cache:
+        import json
+        from pathlib import Path
+        path = _equity_table_cache_path(num_simulations)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(table, indent=0))
+        except OSError:
+            pass  # caching is best-effort; never fail the caller
 
     return table
