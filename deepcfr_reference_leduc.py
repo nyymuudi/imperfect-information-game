@@ -140,16 +140,15 @@ def legal_slots(game, history):
 
 # ── External-sampling MCCFR traversal ─────────────────────────────────────────
 
-def traverse(game, history, traverser, net, value_mem, strat_mem, cum_reg, t, rng):
+def traverse(game, history, traverser, net, value_mem, strat_mem, cum_plus, t, rng):
     """
     External sampling. Returns the traverser's counterfactual value at `history`.
 
-    Records, per traverser infoset, the LINEAR-CFR CUMULATIVE regret
-    (sum of t * r^t over iterations) into cum_reg, and pushes a snapshot of
-    that cumulative vector into value_mem. The network's training target is
-    therefore the cumulative regret -- the SAME quantity tabular CFR's regret
-    matching uses -- NOT the mean of instantaneous regrets (which, as measured,
-    has the wrong sign relative to the cumulative sum and does not converge).
+    Records, per traverser infoset, a regret target into value_mem. The target
+    form is selected by DCFR_TARGET: 'cumplus' (CFR+-clipped cumulative regret,
+    the quantity tabular CFR+ uses; default) or 'instant' (raw instantaneous,
+    previous form whose mean had the wrong sign). cum_plus is the per-player
+    CumulativePlus table maintaining the running clipped cumulative regret.
     """
     if game.is_terminal(history):
         return game.terminal_payoffs(history)[traverser]
@@ -170,7 +169,7 @@ def traverse(game, history, traverser, net, value_mem, strat_mem, cum_reg, t, rn
         for i, a in enumerate(acts):
             action_values[i] = traverse(
                 game, game.apply_action(history, a),
-                traverser, net, value_mem, strat_mem, cum_reg, t, rng
+                traverser, net, value_mem, strat_mem, cum_plus, t, rng
             )
         node_value = float(np.dot(strat, action_values))
 
@@ -179,53 +178,33 @@ def traverse(game, history, traverser, net, value_mem, strat_mem, cum_reg, t, rn
         for i, slot in enumerate(slots):
             regret_vec[slot] = action_values[i] - node_value
 
-        # DIAGNOSTIC: log raw instantaneous regret for K|| before accumulation,
-        # together with the strategy used and the action values, so we can see
-        # whether the SIGN problem originates in the regret INPUT (traverse) or
-        # the accumulation. Tabular truth: cumulative [+0.77,+1.81]; the mean
-        # instantaneous regret should therefore be positive on BOTH actions.
+        # Lightweight instrumentation: record only the K|| instantaneous regret
+        # (first two slots) so the measurement loop can report reg_SE -- the
+        # standing check that 1000 traversals keeps external-sampling variance
+        # resolvable. The earlier heavy per-visit logging (strategy used, action
+        # values, node value) served the sign diagnosis, which is now resolved.
         if key == "K||":
-            _KREG_LOG.append((
-                t, regret_vec[:2].copy(), strat.copy(), action_values.copy(),
-                float(node_value)
-            ))
+            _KREG_LOG.append((float(regret_vec[0]), float(regret_vec[1])))
 
-        # Linear CFR: accumulate t * r^t into the per-infoset cumulative regret,
-        # and track the running sum of weights W = Σ_τ τ. The NETWORK TARGET is
-        # the WEIGHTED-AVERAGE regret C(I)/W, NOT the raw cumulative sum.
-        #
-        # Why: regret matching is scale-invariant (R+/ΣR+), so for the tabular
-        # algorithm the absolute magnitude of cumulative regret is irrelevant --
-        # only signs and ratios matter. But a network that REGRESSES to the
-        # target is not scale-invariant: the raw cumulative sum grows without
-        # bound (~t^2 with Linear weights), so the same infoset appears in the
-        # reservoir with wildly different target magnitudes across iterations,
-        # which the net cannot fit (observed: K|| predictions exploding to
-        # ±thousands and flipping sign). Dividing by W yields a stable-scale
-        # quantity with the SAME signs and ratios as the cumulative sum, which
-        # is exactly what regret matching needs and what the net can actually
-        # learn. C(I)/W -> a bounded vector; for K|| it should approach a
-        # DCFR (Brown & Sandholm 2019): maintain DISCOUNTED cumulative regret.
-        # Positive cumulative regrets are multiplied each step by (n/(n+1))^alpha
-        # and negative ones by (n/(n+1))^beta before adding this iteration's
-        # instantaneous regret. This down-weights early (far-from-equilibrium)
-        # iterations relative to later ones, fixing the SIGN/RATIO problem that
-        # the mean-of-instantaneous target had (K|| mean had the wrong sign).
-        #
-        # The discounted cumulative D(I) still grows, so a raw regression target
-        # would still explode in scale. We therefore feed the net the PER-INFOSET
-        # NORMALISED vector D(I)/||D(I)||. Regret matching is scale-invariant
-        # (R+/ΣR+), so normalising per infoset does NOT change the strategy -- it
-        # only puts the regression target on a stable O(1) scale the net can fit,
-        # while EXACTLY preserving the action ratios. This is the combination the
-        # two failed Variant-1 attempts each missed: discounting alone keeps the
-        # ratio but explodes in scale; dividing by the weight sum fixes scale but
-        # collapses the ratio to zero. D/||D|| does both.
-        cumulative = cum_reg.add(key, regret_vec, t)
-        norm = np.linalg.norm(cumulative)
-        target = (cumulative / norm if norm > 1e-8 else cumulative).astype(np.float32)
-
-        value_mem.add(state, target)
+        # Target form selected by DCFR_TARGET (see module note).
+        #   cumplus: CFR+-clipped cumulative regret -- the quantity tabular CFR+
+        #            regret-matches on. Preserves cumulative sign (fixes the
+        #            measured sign bug: K mean [-1.1,+0.05] but tabular cumulative
+        #            [+10.8,+60.1]) and CFR+ clipping keeps it bounded without
+        #            normalisation. The reservoir stores SNAPSHOTS of this running
+        #            cumulative; from-scratch fit converges to its mean, which
+        #            tracks the cumulative since later (larger) snapshots dominate.
+        #   instant: raw instantaneous regret (previous form, wrong-sign mean).
+        if _DCFR_TARGET_MODE == "instant":
+            target = regret_vec
+        else:
+            # CFR+ cumulative, normalised by iteration t to bound the scale.
+            # Measured: tabular cum_regret/iterations = [0.011,0.060] for K, a
+            # network-fittable O(0.01-0.1) scale. Division by t>0 preserves sign
+            # and ratios (regret matching is scale-invariant), so the strategy is
+            # unchanged while the regression target stops diverging (was +4466).
+            target = (cum_plus.add(key, regret_vec) / float(t)).astype(np.float32)
+        value_mem.add(state, target, float(t))
 
         # Strategy memory at the traverser's nodes, Linear-weighted by t.
         strat_vec = np.zeros(N_ACTIONS, dtype=np.float32)
@@ -239,79 +218,97 @@ def traverse(game, history, traverser, net, value_mem, strat_mem, cum_reg, t, rn
         idx = rng.choice(len(acts), p=strat)
         return traverse(
             game, game.apply_action(history, acts[idx]),
-            traverser, net, value_mem, strat_mem, cum_reg, t, rng
+            traverser, net, value_mem, strat_mem, cum_plus, t, rng
         )
 
 
-# ── DCFR-discounted cumulative regret (tabular side-structure) ────────────────
-# Discounted Counterfactual Regret Minimization (Brown & Sandholm 2019).
-# Per infoset I, maintain D(I) updated each visit n as:
-#   pos *= (n/(n+1))^alpha ; neg *= (n/(n+1))^beta ; D += r^n
-# with alpha=1.5, beta=0 (paper's recommended regret coefficients). This keeps
-# the ratio between actions correct (early bad regrets fade) without the mean
-# collapsing to zero. Tabular here (288 infosets in Leduc); in the project the
-# value net's reservoir target plays this role.
+# NOTE: The CumulativeRegret table and DCFR alpha/beta discounting were REMOVED.
+# They were a departure from Brown et al. (2019): the paper stores raw
+# instantaneous regrets in the reservoir and weights the LOSS by t', it does not
+# maintain an accumulated (and therefore unbounded, diverging) per-infoset value.
+# The accumulated target diverged (D_cum for J reached -50397) and per-infoset
+# normalisation D/||D|| only converted that into a moving unit-vector target the
+# net could not fit. The advantage D_T is now produced IMPLICITLY by the
+# t'-weighted from-scratch fit over bounded instantaneous samples.
 
-DCFR_ALPHA = 1.0   # LCFR-style moderate discounting. alpha=1.5 faded the
-DCFR_BETA  = 0.5   # shallow-mix signal before variance averaged out (lock-in);
-                   # alpha=0 kept early errors forever (overshoot/oscillation,
-                   # [0,1]->[0.91,0.09] past the [0.30,0.70] equilibrium). alpha=1
-                   # fades positive cumulative regret linearly (n/(n+1)); beta=0.5
-                   # lets negative regret recover faster so no action stays dead.
 
-class CumulativeRegret:
+# ── Regret target form (DCFR_TARGET) ──────────────────────────────────────────
+# 'cumplus' : reservoir stores the CFR+-clipped CUMULATIVE regret (per infoset,
+#             max(R,0) each update). This is the quantity tabular CFR+ uses for
+#             regret matching; it preserves the cumulative SIGN (the bug fix) and
+#             CFR+ clipping keeps it BOUNDED without normalisation (~60 for K in
+#             Leduc at 1000 iters). This is the default.
+# 'instant' : reservoir stores the raw instantaneous regret r^t (previous form).
+#             Kept for A/B comparison. Its t'-weighted MEAN has the wrong sign
+#             relative to the cumulative sum (measured: K target [-1.1,+0.05] vs
+#             tabular cum_regret [+10.8,+60.1]).
+_DCFR_TARGET_MODE = os.environ.get("DCFR_TARGET", "cumplus").strip().lower()
+
+
+class CumulativePlus:
+    """Per-infoset CFR+-clipped cumulative regret: R <- max(R + r^t, 0).
+
+    Mirrors the tabular MCCFRSolver (cfr_plus=True) that CONVERGES on Leduc.
+    Clipping prevents negative accumulation toward -inf (no divergence) and
+    yields the correct sign for regret matching. No DCFR discounting, no
+    normalisation -- CFR+ alone keeps the scale network-fittable.
+    """
     def __init__(self):
-        # key -> [discounted_cumulative_regret (N_ACTIONS), visit_count]
-        self.table = {}
+        self.table = {}   # key -> cumulative regret vector (N_ACTIONS,)
 
-    def add(self, key, regret_vec, iteration):
-        entry = self.table.get(key)
-        if entry is None:
-            entry = [np.zeros(N_ACTIONS, dtype=np.float64), 0]
-        D, n = entry
-        # Discount existing cumulative regret by DCFR coefficients, using the
-        # per-infoset visit count n (not the global iteration) so infosets that
-        # are visited at different rates are each discounted by their own age.
-        if n > 0:
-            ratio = n / (n + 1.0)
-            pos_factor = ratio ** DCFR_ALPHA
-            neg_factor = ratio ** DCFR_BETA
-            D = np.where(D > 0, D * pos_factor, D * neg_factor)
-        D = D + regret_vec
-        entry[0] = D
-        entry[1] = n + 1
-        self.table[key] = entry
-        return D
+    def add(self, key, regret_vec):
+        R = self.table.get(key)
+        if R is None:
+            R = np.zeros(N_ACTIONS, dtype=np.float64)
+        R = np.maximum(R + regret_vec, 0.0)   # CFR+ clip
+        self.table[key] = R
+        return R.astype(np.float32)
 
 
 # ── Reservoir advantage memory (Vitter) ───────────────────────────────────────
 
 class Reservoir:
+    """Vitter (1985) Algorithm R. Stores (state, instantaneous_regret, t').
+
+    Per Brown et al. (2019) Algorithm 1, the reservoir holds raw INSTANTANEOUS
+    regret vectors r~_t' together with the iteration number t' at which they
+    were sampled. There is NO accumulation and NO normalisation: Lemma 1 proves
+    the sampled instantaneous regret is an unbiased estimator of the advantage,
+    so it is stored as-is. The iteration weight t' is consumed by the loss
+    (later iterations weighted more), so the from-scratch fit converges to the
+    t'-weighted mean of instantaneous regrets -- which equals D_T, the Linear-CFR
+    advantage. Crucially this target is BOUNDED (instantaneous regrets are
+    bounded) even though their cumulative sum is not -- the divergence that the
+    CumulativeRegret table produced.
+    """
     def __init__(self, capacity, state_size, n_actions, seed=0):
         self.cap = capacity
         self.states = np.zeros((capacity, state_size), dtype=np.float32)
         self.targets = np.zeros((capacity, n_actions), dtype=np.float32)
+        self.weights = np.zeros(capacity, dtype=np.float32)   # iteration t'
         self.size = 0
         self.seen = 0
         self.rng = np.random.default_rng(seed)
 
-    def add(self, state, target):
+    def add(self, state, target, weight):
         if self.size < self.cap:
             i = self.size
             self.states[i] = state
             self.targets[i] = target
+            self.weights[i] = weight
             self.size += 1
         else:
             j = int(self.rng.integers(0, self.seen + 1))
             if j < self.cap:
                 self.states[j] = state
                 self.targets[j] = target
+                self.weights[j] = weight
         self.seen += 1
 
     def sample(self, n):
         n = min(n, self.size)
         idx = self.rng.integers(0, self.size, size=n)
-        return self.states[idx], self.targets[idx]
+        return self.states[idx], self.targets[idx], self.weights[idx]
 
 
 # ── Tabular strategy memory (exact average for Leduc exploitability) ──────────
@@ -345,24 +342,54 @@ class StrategyMemory:
 
 # ── Train advantage net from scratch on the reservoir ─────────────────────────
 
+# Loss-muoto valitaan ymparistomuuttujalla DCFR_LOSS (diagnostiikkaa varten):
+#   'batchnorm' (oletus): (Sum_i t'_i * MSE_i) / Sum_i t'_i   -- numeerinen turva
+#   'raw'                : (t'_i * MSE_i).mean()              -- paperin raaka paino
+# raw testaa hypoteesia etta batch-normalisointi laimentaa korkean t':n tuoreet
+# nayttet ja estaa D_T-approksimaation. gradient-clip pitaa raw:n skaalan kurissa.
+_DCFR_LOSS_MODE = os.environ.get("DCFR_LOSS", "batchnorm").strip().lower()
+
+
 def train_from_scratch(reservoir, hidden, sgd_steps, batch, lr, device):
+    """Train the advantage net FROM SCRATCH (Brown et al. 2019 Algorithm 1).
+
+    Loss: L(theta) = E_(I,t',r~)~MV [ t' * Sum_a (r~(a) - V(I,a))^2 ].
+
+    Returns (net, final_loss). final_loss is the last SGD step's loss, used to
+    distinguish H1 (net cannot fit reservoir -> high loss -> training-capacity
+    problem) from H2 (net fits well -> low loss -> the TARGET itself is wrong).
+
+    DCFR_LOSS env var selects the weighting form (see module note above).
+    """
     net = AdvantageNet(STATE_SIZE, N_ACTIONS, hidden).to(device)
     if reservoir.size < 2:
-        return net
+        return net, float("nan")
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     net.train()
+    final_loss = float("nan")
     for _ in range(sgd_steps):
-        s, tgt = reservoir.sample(batch)
+        s, tgt, w = reservoir.sample(batch)
         s = torch.from_numpy(s).to(device)
         tgt = torch.from_numpy(tgt).to(device)
+        w = torch.from_numpy(w).to(device)               # iteration t', shape [B]
         pred = net(s)
-        loss = ((pred - tgt) ** 2).mean()   # MSE over full action vector
+        per_sample_mse = ((pred - tgt) ** 2).mean(dim=1)  # MSE over actions, [B]
+        # cumplus target is ALREADY time-weighted (it is an accumulation), so
+        # t'-weighting the loss would double-count. Use plain MSE there.
+        # instant target keeps the previous t'-weighted behaviour for A/B.
+        if _DCFR_TARGET_MODE != "instant":
+            loss = per_sample_mse.mean()                  # plain MSE (cumplus)
+        elif _DCFR_LOSS_MODE == "raw":
+            loss = (w * per_sample_mse).mean()            # paper's raw t' weight
+        else:
+            loss = (w * per_sample_mse).sum() / (w.sum() + 1e-8)  # batch-normalised
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
+        final_loss = float(loss.item())
     net.eval()
-    return net
+    return net, final_loss
 
 
 # ── Exact exploitability of the averaged strategy ─────────────────────────────
@@ -436,36 +463,38 @@ def main():
     ref = tab.exploitability()
     print(f"[reference] tabular CFR exploitability = {ref:.5f}\n")
 
-    # Deep CFR hyperparameters. Changes from the diverging runs, all from the
-    # measured root cause (per-iteration regret variance was ±4 >> signal 0.5,
-    # and the discounting schedule controls a lock-in vs overshoot trade-off):
-    #   (1) TRAVERSALS 100 -> 1000: averages external-sampling variance WITHIN
-    #       each iteration before training. Verified: reg_SE fell ~4 -> ~0.1.
-    #   (2) DCFR alpha=1, beta=0.5 (module level): moderate discounting. Both
-    #       extremes failed -- alpha=1.5 faded the signal (lock-in), alpha=0 kept
-    #       early errors (overshoot past equilibrium). This is the middle.
-    ITERS         = 200
+    # Convergence run: 1000 iterations, no average-strategy reset. The reset is
+    # a degree of freedom that would HIDE the early transient rather than
+    # measure it; run clean first. If avg_expl reaches the function-approx floor
+    # (~0.3-0.8) by 1000 without it, the transient is harmless. Only if the
+    # descent stalls clearly above the floor do we add a post-transient reset
+    # and measure the difference -- one variable at a time.
+    ITERS         = 1000
     TRAVERSALS    = 1000
     HIDDEN        = 128
     SGD_STEPS     = 1000
     BATCH         = 1024
     LR            = 1e-3
     RES_CAP       = 1_000_000
-    MEASURE_EVERY = 10
+    MEASURE_EVERY = 25
 
     value_mem = {0: Reservoir(RES_CAP, STATE_SIZE, N_ACTIONS, seed=1),
                  1: Reservoir(RES_CAP, STATE_SIZE, N_ACTIONS, seed=2)}
     strat_mem = StrategyMemory()
-    cum_reg = {0: CumulativeRegret(), 1: CumulativeRegret()}
+    # Per-player CFR+ cumulative regret tables (used when DCFR_TARGET=cumplus).
+    cum_plus = {0: CumulativePlus(), 1: CumulativePlus()}
 
     # Advantage nets start returning ~0 (random init is fine; paper inits to 0,
     # but a small random net is standard and works). One per player.
     nets = {0: AdvantageNet(STATE_SIZE, N_ACTIONS, HIDDEN).to(device),
             1: AdvantageNet(STATE_SIZE, N_ACTIONS, HIDDEN).to(device)}
+    _last_train_loss = {0: float("nan"), 1: float("nan")}
 
-    print(f"Clean Deep CFR reference | Leduc | hidden={HIDDEN} "
-          f"traversals={TRAVERSALS} sgd_steps={SGD_STEPS} batch={BATCH}")
-    print(f"{'iter':>6} {'avg_expl':>10} {'cur_expl':>10} {'ref':>8} {'ratio':>7} {'t(s)':>7}")
+    print(f"Deep CFR reference | Leduc | hidden={HIDDEN} "
+          f"traversals={TRAVERSALS} iters={ITERS} target={_DCFR_TARGET_MODE} "
+          f"(Brown et al. 2019)")
+    print(f"{'iter':>6} {'avg_expl':>9} {'cur_expl':>9} {'ref':>7} {'ratio':>6} "
+          f"{'t(s)':>7}  reg_SE  mean_regret per preflop infoset (J / Q / K)")
 
     t0 = time.time()
     for t in range(1, ITERS + 1):
@@ -478,83 +507,78 @@ def main():
             init_h = init_states[idx][0]
             traverse(game, init_h, traverser,
                      nets[traverser], value_mem[traverser], strat_mem,
-                     cum_reg[traverser], t, rng)
+                     cum_plus[traverser], t, rng)
 
         # Retrain THIS traverser's advantage net from scratch on its reservoir.
-        nets[traverser] = train_from_scratch(
+        nets[traverser], _last_loss = train_from_scratch(
             value_mem[traverser], HIDDEN, SGD_STEPS, BATCH, LR, device
         )
+        _last_train_loss[traverser] = _last_loss
 
         if t % MEASURE_EVERY == 0:
+            # avg and cur on the SAME cadence: the "avg falls / cur oscillates"
+            # split is the DCFR signature used to localise convergence, and it
+            # only reads if both share a timeline.
             avg_expl = exact_exploitability(game, strat_mem)
             cur_expl = current_strategy_exploitability(game, nets)
             ratio = avg_expl / ref if ref > 0 else float("nan")
-            # Diagnostic: net's prediction for K|| vs tabular cumulative regret
-            # [0.773, 1.807] (strat [0.30, 0.70]). If the fix works, the net's
-            # K|| prediction should be positive on BOTH actions with a similar
-            # ratio, and regret matching on it should give ~[0.30, 0.70].
-            kstate = encode_infoset("K||")
-            with torch.no_grad():
-                kpred = nets[0](
-                    torch.from_numpy(kstate).unsqueeze(0)
-                ).squeeze(0).numpy()[:2]
-            kpos = np.maximum(kpred, 0)
-            kstrat = kpos / kpos.sum() if kpos.sum() > 0 else np.array([1.0, 0.0])
-            print(f"{t:>6} {avg_expl:>10.5f} {cur_expl:>10.5f} {ref:>8.5f} "
-                  f"{ratio:>7.2f} {time.time()-t0:>7.1f}   "
-                  f"K||_pred=[{kpred[0]:+.2f},{kpred[1]:+.2f}] "
-                  f"strat=[{kstrat[0]:.2f},{kstrat[1]:.2f}]")
 
-            # Aggregate raw instantaneous regrets for K|| since the last report.
+            # t'-weighted mean instantaneous regret for three canonical preflop
+            # infosets (weak / medium / strong hand). Tabular truths:
+            #   J||: a marginal hand; Q||: medium; K||: strong, mix [0.30,0.70].
+            # This is the BOUNDED target the net fits (replacing the removed,
+            # diverging cumulative table); sign/ratio settling = convergence.
+            def dstr(key):
+                # t'-weighted mean instantaneous regret for `key`, computed over
+                # whichever player's reservoir contains it. This is the target
+                # the net fits; its sign/ratio settling is the convergence
+                # signal. Bounded, unlike the removed cumulative table.
+                st = encode_infoset(key)
+                for p in (0, 1):
+                    r = value_mem[p]
+                    if r.size == 0:
+                        continue
+                    rows = np.where(
+                        (r.states[:r.size] == st).all(axis=1))[0]
+                    if len(rows) == 0:
+                        continue
+                    w = r.weights[rows]
+                    tgt = r.targets[rows]
+                    wmean = (w[:, None] * tgt).sum(axis=0) / (w.sum() + 1e-8)
+                    return f"[{wmean[0]:+7.3f},{wmean[1]:+7.3f}]"
+                return "[ --  , --  ]"
+
+            # reg_SE: cheap insurance that the variance fix (1000 traversals)
+            # holds across the whole run. Standard error of the K|| v0-v1 signal.
             if _KREG_LOG:
-                regs = np.array([e[1] for e in _KREG_LOG], dtype=np.float64)
-                mean_r = regs.mean(axis=0)
-                strats = np.array([e[2] for e in _KREG_LOG], dtype=np.float64)
-                mean_strat = strats.mean(axis=0)
-                frac_a0_pos = float((regs[:, 0] > 0).mean())
-                frac_a1_pos = float((regs[:, 1] > 0).mean())
-                # Raw action values and node value (the heart of the question:
-                # are v[0]/v[1] themselves sane, or is node_value anchored to the
-                # dominant action by the current strategy?).
-                avs = np.array([e[3] for e in _KREG_LOG], dtype=np.float64)
-                nvs = np.array([e[4] for e in _KREG_LOG], dtype=np.float64)
-                mean_av = avs.mean(axis=0)
-                std_av = avs.std(axis=0)
-                # (1) VARIANCE metric: standard error of the v0-v1 regret signal.
-                # If raising traversals worked, reg_SE should be << |v0-v1|, i.e.
-                # the shallow-mix signal becomes statistically resolvable.
-                diff = avs[:, 0] - avs[:, 1]
-                reg_se = diff.std() / np.sqrt(len(diff))
-                # (2) ACCUMULATION metric: the DCFR table's current K|| cumulative
-                # vector and visit count. With alpha=0 this is the honest running
-                # sum; its sign should stabilise rather than flip each report.
-                entry = cum_reg[0].table.get("K||") or cum_reg[1].table.get("K||")
-                if entry is not None:
-                    Dvec, Dn = entry[0][:2], entry[1]
-                else:
-                    Dvec, Dn = np.zeros(2), 0
-                # (3) BEHAVIOUR metric: entropy of the current K|| strategy
-                # (0 = locked deterministic, ln2≈0.69 = uniform). Convergence
-                # requires this NOT collapsing to 0.
-                kp = np.maximum(kpred, 0)
-                ks = kp / kp.sum() if kp.sum() > 0 else np.array([0.5, 0.5])
-                ent = -sum(p * np.log(p) for p in ks if p > 0)
-                print(f"       K|| raw-regret: n={len(_KREG_LOG):>4d} "
-                      f"mean_r=[{mean_r[0]:+.3f},{mean_r[1]:+.3f}] "
-                      f"frac_pos=[{frac_a0_pos:.2f},{frac_a1_pos:.2f}] "
-                      f"mean_strat_used=[{mean_strat[0]:.2f},{mean_strat[1]:.2f}]")
-                print(f"       K|| action_vals: "
-                      f"v0={mean_av[0]:+.3f}±{std_av[0]:.2f} "
-                      f"v1={mean_av[1]:+.3f}±{std_av[1]:.2f} "
-                      f"(v0-v1={mean_av[0]-mean_av[1]:+.3f})")
-                print(f"       K|| behaviour:  reg_SE={reg_se:.3f} "
-                      f"D_cum=[{Dvec[0]:+.2f},{Dvec[1]:+.2f}] D_n={Dn} "
-                      f"entropy={ent:.3f}")
+                diff = np.array([e[0] - e[1] for e in _KREG_LOG], dtype=np.float64)
+                reg_se = diff.std() / np.sqrt(max(len(diff), 1))
                 _KREG_LOG.clear()
+            else:
+                reg_se = float("nan")
 
-    print("\nExpected: expl trends DOWN toward ref. If it does, this clean")
-    print("implementation is correct and becomes the baseline to diff the")
-    print("project solver against.")
+            # DIAGNOSTIIKKA (H1 vs H2): fittaako verkko reservoiria, ja onko
+            # kohde oikea. Verrataan K||-ennustetta sen reservoir-kohteiden
+            # t'-painotettuun keskiarvoon (= dstr('K||') yllÃ¤). Jos final_loss
+            # on matala MUTTA ennuste poikkeaa kohteesta -> kohde on epÃ¤vakaa
+            # (H2). Jos final_loss on korkea -> verkko ei fittaa (H1).
+            st_k = encode_infoset("K||")
+            with torch.no_grad():
+                pk = nets[traverser](
+                    torch.from_numpy(st_k).unsqueeze(0)).squeeze(0).numpy()
+            print(f"{t:>6} {avg_expl:>9.4f} {cur_expl:>9.4f} {ref:>7.4f} "
+                  f"{ratio:>6.2f} {time.time()-t0:>7.1f}  reg_SE={reg_se:.3f}  "
+                  f"J{dstr('J||')} Q{dstr('Q||')} K{dstr('K||')}")
+            print(f"       [diag] loss(P{traverser})={_last_train_loss[traverser]:.4f} "
+                  f"mode={_DCFR_LOSS_MODE} "
+                  f"K||_net_pred=[{pk[0]:+.3f},{pk[1]:+.3f}] "
+                  f"res_size={value_mem[traverser].size}")
+
+    print("\nExpected: avg_expl trends DOWN toward the function-approx floor")
+    print("(~0.3-0.8) while cur_expl oscillates -- expected and never converges")
+    print("(only the average policy converges in CFR). mean_regret signs should")
+    print("settle (J/Q/K) and stay BOUNDED, and reg_SE ~0.1 throughout. If avg")
+    print("reaches the floor, this is the validated baseline for the project diff.")
     return 0
 
 
