@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useTransition } from 'react'
-import { RANKS, SUITS, makeCard, cardRank, cardSuit, cardLabel } from '@/lib/onnx/encoder'
+import { RANKS, SUITS, makeCard, cardRank, cardSuit, cardLabel, STARTING_STACK } from '@/lib/onnx/encoder'
 import { queryStrategyBatch, type ActionProbs } from '@/lib/onnx/session'
 import { STREET_NAMES, type Street } from '@/types'
 
@@ -148,8 +148,8 @@ export default function RangeMatrix() {
           street,
           pot,
           toCall,
-          myStack:       200 - pot / 2,
-          oppStack:      200 - pot / 2,
+          myStack:       STARTING_STACK - pot / 2,
+          oppStack:      STARTING_STACK - pot / 2,
           actionHistory,
         }))
 

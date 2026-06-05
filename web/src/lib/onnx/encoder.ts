@@ -21,7 +21,9 @@
  */
 
 export const STATE_SIZE = 124
-export const STARTING_STACK = 200.0
+// STARTING_STACK on oltava sama kuin --stack arvo koulutuksessa.
+// Tuotantoajo käyttää 50BB — päivitä tämä kun malli vaihdetaan.
+export const STARTING_STACK = 50.0
 export const BOARD_CARDS_BY_STREET = [0, 3, 4, 5] // indexed by street 0-3
 
 // Verified against NLHE_ACTION_ENC[4] = {0.0f, 0.25f, 0.5f, 1.0f} in nlhe_game.hpp

@@ -1,13 +1,13 @@
 'use client'
 
 import { useState, useCallback, useTransition, useEffect } from 'react'
-import { RANKS, SUITS, makeCard, cardLabel, cardRank, cardSuit } from '@/lib/onnx/encoder'
+import { RANKS, SUITS, makeCard, cardLabel, cardRank, cardSuit, STARTING_STACK as STACK_SIZE } from '@/lib/onnx/encoder'
 import { queryStrategy, type ActionProbs } from '@/lib/onnx/session'
 import { STREET_NAMES, type Street } from '@/types'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const STARTING_STACK = 200
+const STARTING_STACK = STACK_SIZE
 
 const ACTION_META: Record<keyof ActionProbs, { label: string; color: string; desc: string }> = {
   fold:  { label: 'Fold / Check', color: '#7a8a80', desc: 'Surrender your hand or pass without betting' },
@@ -170,7 +170,7 @@ export default function StrategyExplorer() {
   const [street, setStreet] = useState<Street>(0)
   const [pot, setPot]       = useState(6)
   const [toCall, setToCall] = useState(2)
-  const [myStack, setMyStack] = useState(198)
+  const [myStack, setMyStack] = useState(STARTING_STACK - 2)
   const [probs, setProbs]   = useState<ActionProbs | null>(null)
   const [error, setError]   = useState<string | null>(null)
   const [pending, startTransition] = useTransition()
@@ -213,7 +213,7 @@ export default function StrategyExplorer() {
       {/* Header */}
       <div className="header">
         <h1 className="title">CFR // Strategy Explorer</h1>
-        <p className="subtitle">Deep CFR · HU NLHE · 200BB · 75% pot · Neural inference</p>
+        <p className="subtitle">Deep CFR · HU NLHE · {STARTING_STACK}BB · 75% pot · Neural inference</p>
       </div>
 
       {/* Street */}
@@ -292,7 +292,7 @@ export default function StrategyExplorer() {
             label="To call"
             value={toCall}
             min={0}
-            max={200}
+            max={STARTING_STACK}
             unit=" BB"
             desc="How much you need to pay to stay in the hand. 0 means no bet to face. Directly influences the fold vs. call decision."
             onChange={setToCall}
@@ -301,7 +301,7 @@ export default function StrategyExplorer() {
             label="My stack"
             value={myStack}
             min={1}
-            max={200}
+            max={STARTING_STACK}
             unit=" BB"
             desc="Your remaining chips. A deeper stack increases the significance of the all-in decision on later streets."
             onChange={setMyStack}
