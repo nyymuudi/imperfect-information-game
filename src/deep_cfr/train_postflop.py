@@ -115,6 +115,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-warm-start",        action="store_true",
                    help="Alusta regret-verkko nollista joka iteraatiolla "
                         "(Brown et al. 2019 cold-start). Oletus: warm-start.")
+    p.add_argument("--dcfr-gamma",           type=float, default=2.0,
+                   help="DCFR temporaalipainotuksen eksponentti γ. "
+                        "0 = uniform (vanilla Deep CFR), 2 = DCFR (oletus). "
+                        "Näytteet painotetaan t^γ näytteistysvaiheessa.")
 
     p.add_argument("--stack",                type=float, default=200.0)
     p.add_argument("--raise-fraction",       type=float, default=0.75,
@@ -210,6 +214,7 @@ def main() -> int:
         device=device,
         lr=1e-3,
         warm_start=not args.no_warm_start,
+        dcfr_gamma=args.dcfr_gamma,
     )
 
     print(f"Deep CFR — HU Postflop NLHE")

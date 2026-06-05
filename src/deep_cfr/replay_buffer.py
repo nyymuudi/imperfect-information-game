@@ -20,11 +20,21 @@ right choice for Deep CFR: keeping only the freshest samples makes the network
 fit only the latest iteration's instantaneous regrets, which does not converge
 (verified: flat exploitability on Leduc). The default is therefore 'reservoir'.
 
+DCFR temporal weighting (dcfr_gamma > 0):
+    Brown & Sandholm (2019) DCFR weights each sample by t^γ at training time,
+    giving recent iterations (which have more accurate regrets) higher influence.
+    Reservoir insertion remains uniform (Vitter Alg. R) — weighting applies only
+    in sample_batch via iteraatio-numero joka tallennetaan per näyte.
+    Suositeltu γ=2 regret-bufferille. Strategy-bufferille käytetään Linear-CFR
+    -painotusta loss-funktion kautta (dcfr_gamma=0).
+
 Reference: Vitter (1985). "Random Sampling with a Reservoir."
+           Brown & Sandholm (2019). "Solving Imperfect-Information Games via
+           Discounted Regret Minimization."
 """
 
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -34,11 +44,16 @@ class ReservoirBuffer:
 
     mode='reservoir' (default): uniform sample over all history (Vitter Alg. R)
     mode='window':              circular FIFO — K most recent samples only
+    dcfr_gamma:                 DCFR temporal weighting exponent. 0 = uniform
+                                (vanilla Deep CFR), 2 = DCFR (recommended for
+                                regret buffer). Sampling probability ∝ t^gamma
+                                where t on iteraationumero per näyte.
     """
     capacity: int
     state_size: int
     action_size: int
     mode: str = 'reservoir'   # 'reservoir' | 'window'
+    dcfr_gamma: float = 0.0   # 0 = uniform, 2.0 = DCFR
 
     def __post_init__(self):
         if self.mode not in ('reservoir', 'window'):
@@ -46,6 +61,9 @@ class ReservoirBuffer:
         self.states  = np.zeros((self.capacity, self.state_size),  dtype=np.float32)
         self.targets = np.zeros((self.capacity, self.action_size), dtype=np.float32)
         self.weights = np.zeros(self.capacity,                     dtype=np.float32)
+        # Iteraationumero per näyte — käytetään DCFR t^gamma -painotukseen.
+        # Arvona 1-indeksoitu iteraatio jolloin näyte lisättiin.
+        self.iters   = np.zeros(self.capacity,                     dtype=np.int32)
         self.size        = 0
         self.total_added = 0
         self._head       = 0   # next write position (window mode)
@@ -53,7 +71,8 @@ class ReservoirBuffer:
 
     # ── Single insert ─────────────────────────────────────────────────────────
 
-    def add(self, state: np.ndarray, target: np.ndarray, weight: float):
+    def add(self, state: np.ndarray, target: np.ndarray, weight: float,
+            iteration: int = 1):
         if self.mode == 'window':
             idx = self._head % self.capacity
             self._head += 1
@@ -72,6 +91,7 @@ class ReservoirBuffer:
         padded[:len(target)] = target
         self.targets[idx] = padded
         self.weights[idx] = weight
+        self.iters[idx]   = max(1, iteration)
         self.size = min(self.size + 1, self.capacity)
         self.total_added += 1
 
@@ -80,7 +100,8 @@ class ReservoirBuffer:
     def add_batch(self,
                   states:  np.ndarray,
                   targets: np.ndarray,
-                  weights: np.ndarray) -> None:
+                  weights: np.ndarray,
+                  iteration: int = 1) -> None:
         """
         Vectorised batch insert — O(1) numpy ops instead of O(N) Python loop.
 
@@ -93,6 +114,8 @@ class ReservoirBuffer:
         if n == 0:
             return
 
+        iter_val = max(1, iteration)
+
         if self.mode == 'window':
             start = self._head % self.capacity
             end   = start + n
@@ -100,15 +123,18 @@ class ReservoirBuffer:
                 self.states[start:end]  = states
                 self.targets[start:end] = targets
                 self.weights[start:end] = weights
+                self.iters[start:end]   = iter_val
             else:
                 first = self.capacity - start
                 self.states[start:]  = states[:first]
                 self.targets[start:] = targets[:first]
                 self.weights[start:] = weights[:first]
+                self.iters[start:]   = iter_val
                 rest = n - first
                 self.states[:rest]  = states[first:]
                 self.targets[:rest] = targets[first:]
                 self.weights[:rest] = weights[first:]
+                self.iters[:rest]   = iter_val
             self._head       += n
             self.size         = min(self.size + n, self.capacity)
             self.total_added += n
@@ -121,6 +147,7 @@ class ReservoirBuffer:
                 self.states[slots]  = states[:n_fill]
                 self.targets[slots] = targets[:n_fill]
                 self.weights[slots] = weights[:n_fill]
+                self.iters[slots]   = iter_val
                 self.size        += n_fill
                 self.total_added += n_fill
 
@@ -139,6 +166,7 @@ class ReservoirBuffer:
                 self.states[write_slots]  = states[sample_indices]
                 self.targets[write_slots] = targets[sample_indices]
                 self.weights[write_slots] = weights[sample_indices]
+                self.iters[write_slots]   = iter_val
 
             self.total_added += n_over
 
@@ -148,7 +176,15 @@ class ReservoirBuffer:
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.size == 0:
             raise ValueError("Cannot sample from empty buffer")
-        indices = self._rng.integers(0, self.size, size=min(batch_size, self.size))
+        n = min(batch_size, self.size)
+        if self.dcfr_gamma > 0.0:
+            # DCFR temporal weighting: näyte valitaan todennäköisyydellä ∝ t^γ.
+            # Myöhempien iteraatioiden tarkemmat regretit dominoivat näytteistystä.
+            raw = self.iters[:self.size].astype(np.float64) ** self.dcfr_gamma
+            probs = raw / raw.sum()
+            indices = self._rng.choice(self.size, size=n, replace=True, p=probs)
+        else:
+            indices = self._rng.integers(0, self.size, size=n)
         return (self.states[indices], self.targets[indices], self.weights[indices])
 
     def __len__(self):
@@ -158,3 +194,4 @@ class ReservoirBuffer:
         self.size        = 0
         self.total_added = 0
         self._head       = 0
+        self.iters[:] = 0

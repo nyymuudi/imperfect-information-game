@@ -73,6 +73,13 @@ class DeepCFRSolver:
     # kun train_epochs on rajallinen (< 100).
     warm_start: bool = True
     warm_start_lr_factor: float = 5.0
+    # DCFR temporal weighting exponent γ (Brown & Sandholm 2019).
+    # 0.0 = vanilla Deep CFR (uniform reservoir).
+    # 2.0 = DCFR (suositeltu regret-bufferille): näytteet painotetaan t^γ
+    #       näytteistysvaiheessa jolloin myöhemmät iteraatiot dominoivat.
+    # Strategy-bufferi käyttää Linear-CFR -painotusta (strat_w) loss-funktion
+    # kautta eikä tarvitse dcfr_gamma-painotusta.
+    dcfr_gamma: float = 2.0
 
     def __post_init__(self):
         state_sz  = self.encoder.state_size()
@@ -85,7 +92,12 @@ class DeepCFRSolver:
         # must be LARGE: it is the implicit cumulative-regret estimator, not a
         # fresh-data window. The strategy buffer is the time-average estimator.
         self._current_iter   = 0
-        self.regret_buffer   = ReservoirBuffer(self.buffer_capacity, state_sz, self.max_actions, mode='reservoir')
+        self.regret_buffer   = ReservoirBuffer(
+            self.buffer_capacity, state_sz, self.max_actions,
+            mode='reservoir', dcfr_gamma=self.dcfr_gamma,
+        )
+        # Strategy-bufferille ei DCFR-painotusta — Linear-CFR strat_w
+        # hoitaa iteraatiopainotuksen loss-funktion kautta.
         self.strategy_buffer = ReservoirBuffer(strat_cap, state_sz, self.max_actions, mode='reservoir')
 
         # CFR+-clipped cumulative regret target (default). Keyed by info_set_key
@@ -182,7 +194,7 @@ class DeepCFRSolver:
                 self._cfrplus_regret[key] = [R, n]
                 target = (R[:num_actions] / float(n)).astype(np.float32)
 
-            self.regret_buffer.add(state, target, 1.0)
+            self.regret_buffer.add(state, target, 1.0, iteration=self.iterations + 1)
             return node_value
         else:
             action_idx = self._rng.choice(num_actions, p=strategy)
@@ -240,8 +252,10 @@ class DeepCFRSolver:
                 states, reg_mat = self._collapse_by_state(X_np, a_np, v_np)
                 m = len(states)
                 # Regrets UNWEIGHTED — fit the regret targets directly.
+                # Iteraationumero tallennetaan DCFR t^γ -painotusta varten.
                 self.regret_buffer.add_batch(
-                    states, reg_mat, np.ones(m, dtype=np.float32)
+                    states, reg_mat, np.ones(m, dtype=np.float32),
+                    iteration=self.iterations + 1,
                 )
 
         if len(str_exp) > 0:
@@ -255,7 +269,8 @@ class DeepCFRSolver:
                 states, str_mat = self._collapse_by_state(X_np, a_np, v_np)
                 m = len(states)
                 self.strategy_buffer.add_batch(
-                    states, str_mat, np.full(m, strat_w, dtype=np.float32)
+                    states, str_mat, np.full(m, strat_w, dtype=np.float32),
+                    iteration=self.iterations + 1,
                 )
 
     def current_strategy_blueprint(self):
