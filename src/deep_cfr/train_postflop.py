@@ -111,7 +111,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "iterations. See module docstring.")
     p.add_argument("--strategy-buffer",      type=int,   default=0,
                    help="Strategy buffer capacity (0 = 1_000_000). Should be large.")
-    p.add_argument("--epochs",               type=int,   default=20)
+    p.add_argument("--epochs",               type=int,   default=50)
+    p.add_argument("--no-warm-start",        action="store_true",
+                   help="Alusta regret-verkko nollista joka iteraatiolla "
+                        "(Brown et al. 2019 cold-start). Oletus: warm-start.")
 
     p.add_argument("--stack",                type=float, default=200.0)
     p.add_argument("--raise-fraction",       type=float, default=0.75,
@@ -206,6 +209,7 @@ def main() -> int:
         use_cpp_engine=True,
         device=device,
         lr=1e-3,
+        warm_start=not args.no_warm_start,
     )
 
     print(f"Deep CFR — HU Postflop NLHE")

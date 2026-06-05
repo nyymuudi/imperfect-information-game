@@ -64,6 +64,15 @@ class DeepCFRSolver:
     traversals_per_iter: int = 100
     use_cpp_engine: bool = False
     device: str = "cpu"
+    # Warm-start: kun True, regret-verkko EI alusteta nollista joka iteraatiolla.
+    # Sen sijaan fitataan olemassaolevista painoista pienemmällä LR:llä
+    # (lr / warm_start_lr_factor). Tämä antaa verkon hyödyntää edellisen
+    # iteraation opittua regrettiä eikä aloita tyhjästä 500k-näytteen kanssa.
+    # Brown et al. 2019 suosittelee cold-startia isoilla peleillä, mutta
+    # postflop NLHE:n monimutkaisuudella warm-start konvergoi nopeammin
+    # kun train_epochs on rajallinen (< 100).
+    warm_start: bool = True
+    warm_start_lr_factor: float = 5.0
 
     def __post_init__(self):
         state_sz  = self.encoder.state_size()
@@ -307,22 +316,27 @@ class DeepCFRSolver:
             self.iterations += 1
 
             if len(self.regret_buffer) >= self.train_batch:
-                # Deep CFR (Brown et al. 2019): the value/regret network is
-                # trained FROM SCRATCH each iteration, starting from a random
-                # initialization. Fine-tuning from the previous iteration's
-                # weights raises final exploitability ~50% (their Fig. 4) and,
-                # combined with a changing target, causes the drift observed on
-                # Leduc. Re-initialise here.
-                state_sz = self.encoder.state_size()
+                state_sz   = self.encoder.state_size()
                 net_device = next(self.regret_net.parameters()).device
-                self.regret_net = RegretNetwork(
-                    state_sz, self.max_actions, self.hidden_size
-                ).to(net_device)
+                if self.warm_start and self.iterations > 1:
+                    # Warm-start: fitataan olemassaolevista painoista
+                    # pienemmällä LR:llä. Verkko hyödyntää edellisen
+                    # iteraation opittua regrettiä — ei aloita tyhjästä
+                    # 500k-näytteen kanssa per iteraatio.
+                    train_lr = self.lr / self.warm_start_lr_factor
+                else:
+                    # Cold-start ensimmäisellä iteraatiolla (tai kun
+                    # warm_start=False): alustetaan nollista Brown et al. 2019
+                    # -suosituksen mukaisesti.
+                    self.regret_net = RegretNetwork(
+                        state_sz, self.max_actions, self.hidden_size
+                    ).to(net_device)
+                    train_lr = self.lr
                 self._last_regret_loss = train_regret_network(
                     self.regret_net, self.regret_buffer,
                     epochs=self.train_epochs,
                     batch_size=self.train_batch,
-                    lr=self.lr,
+                    lr=train_lr,
                 )
 
             if callback and t % callback_freq == 0:
