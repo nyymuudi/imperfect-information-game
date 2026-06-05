@@ -131,9 +131,6 @@ void NLHEMCCFREngine::emit_or_accumulate(
 }
 
 void NLHEMCCFREngine::emit_cfrplus_targets() {
-    // Snapshot-semantiikka: tyhjennä reservoir, jotta tämä emit
-    // korvaa edellisen iteraation R^T-snapshotin eikä monista sitä.
-    regret_buf_.clear();
     for (const auto& kv : cfrplus_) {
         const NLHECfrPlusEntry& e = kv.second;
         if (e.visits <= 0) continue;
