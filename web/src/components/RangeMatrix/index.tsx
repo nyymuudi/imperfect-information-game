@@ -80,18 +80,32 @@ function BoardPicker({ value, excluded, onChange, onClear }: {
   )
 }
 
+// ── Action history presets ────────────────────────────────────────────────────
+// Antaa mallille realistisen betting-historian sen sijaan että kaikki kyselyt
+// tehdään tyhjällä historialla. Vastaa yleisimpiä pelattavia tilanteita.
+
+type HistoryPreset = { label: string; desc: string; actions: number[] }
+
+const HISTORY_PRESETS: HistoryPreset[] = [
+  { label: 'No action',    desc: 'First to act, no prior betting',         actions: [] },
+  { label: 'Facing bet',   desc: 'Opponent has bet / raised once',         actions: [2] },
+  { label: 'Facing 3-bet', desc: 'You raised, opponent 3-bet',             actions: [2, 2] },
+  { label: 'Check–check',  desc: 'Both players checked previous street',   actions: [0, 0] },
+]
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 const BOARD_COUNTS = [0, 3, 4, 5]
 
 export default function RangeMatrix() {
-  const [street, setStreet]   = useState<Street>(0)
-  const [board, setBoard]     = useState<(number | null)[]>([null, null, null, null, null])
-  const [pot, setPot]         = useState(6)
-  const [toCall, setToCall]   = useState(2)
-  const [results, setResults] = useState<Record<string, ActionProbs>>({})
-  const [error, setError]     = useState<string | null>(null)
-  const [pending, startTransition] = useTransition()
+  const [street, setStreet]         = useState<Street>(0)
+  const [board, setBoard]           = useState<(number | null)[]>([null, null, null, null, null])
+  const [pot, setPot]               = useState(6)
+  const [toCall, setToCall]         = useState(2)
+  const [historyIdx, setHistoryIdx] = useState(0)
+  const [results, setResults]       = useState<Record<string, ActionProbs>>({})
+  const [error, setError]           = useState<string | null>(null)
+  const [pending, startTransition]  = useTransition()
 
   const nBoard      = BOARD_COUNTS[street]
   const visibleBoard = board.slice(0, nBoard).filter((c): c is number => c !== null)
@@ -127,6 +141,7 @@ export default function RangeMatrix() {
 
         // Batch-encode all hands into a single [N, STATE_SIZE] tensor.
         // One session.run instead of N sequential calls — 10-50× faster.
+        const actionHistory = HISTORY_PRESETS[historyIdx].actions
         const encodeInputs = hands.map(({ card0, card1 }) => ({
           holeCards:     [card0, card1] as [number, number],
           boardCards:    visibleBoard,
@@ -135,7 +150,7 @@ export default function RangeMatrix() {
           toCall,
           myStack:       200 - pot / 2,
           oppStack:      200 - pot / 2,
-          actionHistory: [] as number[],
+          actionHistory,
         }))
 
         const probs = await queryStrategyBatch(encodeInputs)
@@ -169,6 +184,23 @@ export default function RangeMatrix() {
             </button>
           ))}
         </div>
+      </div>
+
+      <div className="section">
+        <p className="section-label">Situation</p>
+        <div className="seg-row">
+          {HISTORY_PRESETS.map((p, i) => (
+            <button
+              key={i}
+              onClick={() => setHistoryIdx(i)}
+              className={`seg-btn ${historyIdx === i ? 'active' : ''}`}
+              title={p.desc}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        <p className="slider-desc" style={{ marginTop: 4 }}>{HISTORY_PRESETS[historyIdx].desc}</p>
       </div>
 
       {nBoard > 0 && (

@@ -72,10 +72,73 @@ export function preflopEquity(card0: number, card1: number): number {
   return Math.min(base, 0.88)
 }
 
+// ── Hand evaluator ────────────────────────────────────────────────────────────
+// Proper 5-7 card evaluator — monotone with C++ HandEvaluator (not bit-
+// identical, but correct relative ranking). Parity test covers dims 0-111 and
+// 122-123; dim 121 is an accepted residual (documented in test_parity.py).
+//
+// Categories: 0=high card, 1=pair, 2=two pair, 3=trips,
+//             4=straight, 5=flush, 6=full house, 7=quads, 8=straight flush
+
+function _straightHigh(ranksSorted: number[]): number {
+  const u = [...new Set(ranksSorted)].sort((a, b) => b - a)
+  // Wheel: A-2-3-4-5
+  if (u.includes(12) && u.includes(3) && u.includes(2) && u.includes(1) && u.includes(0)) return 3
+  for (let i = 0; i <= u.length - 5; i++) {
+    if (u[i] - u[i + 4] === 4) return u[i]
+  }
+  return -1
+}
+
+function _evaluateCards(cards: number[]): number {
+  const ranks = cards.map(c => Math.floor(c / 4))
+  const suits = cards.map(c => c % 4)
+
+  // Flush detection
+  const suitCnt = [0, 0, 0, 0]
+  for (const s of suits) suitCnt[s]++
+  const flushSuit = suitCnt.findIndex(c => c >= 5)
+  const flushRanks = flushSuit >= 0
+    ? cards.filter(c => c % 4 === flushSuit).map(c => Math.floor(c / 4)).sort((a, b) => b - a)
+    : []
+
+  const ranksSorted = [...ranks].sort((a, b) => b - a)
+  const sfHigh  = flushRanks.length >= 5 ? _straightHigh(flushRanks) : -1
+  const strHigh = _straightHigh(ranksSorted)
+
+  const cnt = new Array<number>(13).fill(0)
+  for (const r of ranks) cnt[r]++
+
+  const quads = cnt.map((c, r) => c === 4 ? r : -1).filter(r => r >= 0).sort((a, b) => b - a)
+  const trips = cnt.map((c, r) => c === 3 ? r : -1).filter(r => r >= 0).sort((a, b) => b - a)
+  const pairs = cnt.map((c, r) => c === 2 ? r : -1).filter(r => r >= 0).sort((a, b) => b - a)
+  const kickers = ranksSorted.filter(r => cnt[r] === 1)
+
+  let cat: number
+  let tb: number[]
+
+  if (sfHigh >= 0)                         { cat = 8; tb = [sfHigh] }
+  else if (quads.length > 0)               { cat = 7; tb = [quads[0], kickers[0] ?? 0] }
+  else if (trips.length > 0 && (pairs.length > 0 || trips.length > 1))
+                                           { cat = 6; tb = [trips[0], pairs[0] ?? trips[1]] }
+  else if (flushRanks.length >= 5)         { cat = 5; tb = flushRanks.slice(0, 5) }
+  else if (strHigh >= 0)                   { cat = 4; tb = [strHigh] }
+  else if (trips.length > 0)              { cat = 3; tb = [trips[0], ...kickers.slice(0, 2)] }
+  else if (pairs.length >= 2)             { cat = 2; tb = [pairs[0], pairs[1], kickers[0] ?? 0] }
+  else if (pairs.length === 1)            { cat = 1; tb = [pairs[0], ...kickers.slice(0, 3)] }
+  else                                    { cat = 0; tb = kickers.slice(0, 5) }
+
+  // Positional encoding (base-13) then normalize
+  const BASE = 13
+  let score = cat
+  for (const t of tb.slice(0, 5)) score = score * BASE + t
+  // MAX = straight flush (cat=8) with 5 ace-high tiebreakers
+  const MAX = (8 * BASE + 12) * BASE * BASE * BASE * BASE + 12 * BASE * BASE * BASE + 12 * BASE * BASE + 12 * BASE + 12
+  return Math.min(score / MAX, 1.0)
+}
+
 /**
- * Simplified board strength approximation.
- * Full hand evaluation (HandEvaluator::evaluate) requires a poker hand
- * evaluator library — replace with e.g. `phe` or `pokersolver` for accuracy.
+ * Board strength: proper 5-7 card hand evaluation.
  * Returns 0 preflop (matches C++ behaviour).
  */
 export function boardStrength(
@@ -83,19 +146,7 @@ export function boardStrength(
   boardCards: number[],
 ): number {
   if (boardCards.length < 3) return 0.0
-
-  // Approximate: count high cards and pairs
-  const allCards = [...holeCards, ...boardCards]
-  const ranks = allCards.map(cardRank)
-  const rankCounts = new Map<number, number>()
-  for (const r of ranks) rankCounts.set(r, (rankCounts.get(r) ?? 0) + 1)
-
-  let score = 0
-  for (const [rank, count] of rankCounts) {
-    if (count >= 2) score += 0.15 * count   // pair/trips/quads
-    score += rank * 0.004                    // high card contribution
-  }
-  return Math.min(score, 1.0)
+  return _evaluateCards([...holeCards, ...boardCards])
 }
 
 /**
@@ -151,11 +202,12 @@ export function encode(input: EncodeInput): Float32Array {
     ? Math.min(toCall / (pot + toCall), 1.0)
     : 0.0
 
-  // [123] SPR — pot / effective_stack
+  // [123] SPR = min(stacks) / pot, normalised (cap at 10). Matches C++:
+  //   out[123] = pot > ε ? min(eff_stack / pot, 10) / 10 : 1.0
   const effectiveStack = Math.min(myStack, oppStack)
-  out[123] = effectiveStack > 0
-    ? Math.min(pot / (effectiveStack + 1e-7), 1.0)
-    : 0.0
+  out[123] = pot > 1e-6
+    ? Math.min(effectiveStack / pot, 10.0) / 10.0
+    : 1.0
 
   return out
 }
