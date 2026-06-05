@@ -3,19 +3,27 @@
 Train Deep CFR on Postflop Heads-Up NLHE.
 
 Usage:
-    # Quick test (~150s)
+    # Quick test (~60s, 50BB)
     python3 -m src.deep_cfr.train_postflop \\
-        --iterations 100 --traversals 500 --hidden 256
+        --iterations 100 --traversals 1000 --hidden 256
 
-    # Full training run with blueprint save
+    # Full training run with blueprint save (50BB, 1 raise/street)
     python3 -m src.deep_cfr.train_postflop \\
-        --iterations 1000 --traversals 500 --hidden 256 \\
-        --buffer 1000000 --epochs 20 \\
+        --iterations 500 --traversals 1000 --hidden 256 \\
+        --buffer 1000000 --epochs 50 \\
+        --save-blueprint blueprints/50bb_75pot_500iter
+
+    # 200BB (vaatii huomattavasti enemmän traversaaleja — ei suositella ilman
+    # card abstraktiota, puu on liian suuri Deep CFR:lle tällä budjetilla)
+    python3 -m src.deep_cfr.train_postflop \\
+        --stack 200 --max-raises 2 \\
+        --iterations 1000 --traversals 5000 --hidden 512 \\
+        --buffer 5000000 --epochs 50 \\
         --save-blueprint blueprints/200bb_75pot_1000iter
 
     # Resume evaluation from saved blueprint
     python3 -m src.deep_cfr.train_postflop \\
-        --load-blueprint blueprints/200bb_75pot_1000iter \\
+        --load-blueprint blueprints/50bb_75pot_500iter \\
         --eval-only
 
 Notes on buffer sizing:
@@ -120,7 +128,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "0 = uniform (vanilla Deep CFR), 2 = DCFR (oletus). "
                         "Näytteet painotetaan t^γ näytteistysvaiheessa.")
 
-    p.add_argument("--stack",                type=float, default=200.0)
+    p.add_argument("--stack",                type=float, default=50.0,
+                   help="Effective stack in BB (default: 50). 200BB puu on "
+                        "liian suuri Deep CFR:lle ilman vahvaa abstraktiota — "
+                        "käytä 50BB tai 100BB tuotantoajossa.")
+    p.add_argument("--max-raises",          type=int,   default=1,
+                   help="Max raises per street (default: 1). 2 kasvattaa "
+                        "puun koon ~4x per street.")
     p.add_argument("--raise-fraction",       type=float, default=0.75,
                    help="Raise size as fraction of pot (default: 0.75)")
 
@@ -196,7 +210,7 @@ def main() -> int:
     # ── Training path ─────────────────────────────────────────────────────────
     game = PostflopNLHE(
         starting_stack=args.stack,
-        max_raises_per_street=2,
+        max_raises_per_street=args.max_raises,
         raise_fractions=(args.raise_fraction,),
     )
 
