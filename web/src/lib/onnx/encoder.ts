@@ -1,28 +1,29 @@
 /**
  * TypeScript port of NLHEStateEncoder (src/cpp_engine/src/torch_model.cpp)
  *
- * Tensor layout (124 dims):
- *   [0:52]    hole cards one-hot
- *   [52:104]  visible board cards one-hot
- *   [104:108] street one-hot (0=preflop, 1=flop, 2=turn, 3=river)
- *   [108]     pot / (2 * starting_stack)
- *   [109]     to_call / (2 * starting_stack)
- *   [110]     my_stack / starting_stack
- *   [111]     opp_stack / starting_stack
- *   [112:120] action history — last 8 actions (ACTION_ENC values)
- *   [120]     preflop equity
- *   [121]     board_strength
- *   [122]     pot odds = to_call / (pot + to_call)
- *   [123]     SPR = min(stacks) / pot, normalised (cap at 10)
+ * Card-abstracted layout (36 dims):
+ *   [0:8]   preflop hand bucket one-hot (K=8, bins on equity ∈ [0,1])
+ *   [8:16]  board EHS bucket one-hot    (K=8; zeros preflop)
+ *   [16:20] street one-hot (0=preflop, 1=flop, 2=turn, 3=river)
+ *   [20]    pot / (2 * starting_stack)
+ *   [21]    to_call / (2 * starting_stack)
+ *   [22]    my_stack / starting_stack
+ *   [23]    opp_stack / starting_stack
+ *   [24:32] action history — last 8 actions (ACTION_ENC values)
+ *   [32]    preflop equity (continuous)
+ *   [33]    board_strength (continuous)
+ *   [34]    pot odds = to_call / (pot + to_call)
+ *   [35]    SPR = min(stacks) / pot, normalised (cap at 10)
  *
  * Card encoding: card = rank * 4 + suit
  *   rank: 0=2, 1=3, ..., 12=A
  *   suit: 0=♣, 1=♦, 2=♥, 3=♠
  */
 
-export const STATE_SIZE = 124
-// STARTING_STACK on oltava sama kuin --stack arvo koulutuksessa.
-// Tuotantoajo käyttää 50BB — päivitä tämä kun malli vaihdetaan.
+export const STATE_SIZE = 36
+export const K_PREFLOP  = 8
+export const K_BOARD    = 8
+// STARTING_STACK must match --stack used during training.
 export const STARTING_STACK = 50.0
 export const BOARD_CARDS_BY_STREET = [0, 3, 4, 5] // indexed by street 0-3
 
@@ -152,7 +153,7 @@ export function boardStrength(
 }
 
 /**
- * Encode game state into a 124-dim Float32Array.
+ * Encode game state into a 36-dim Float32Array.
  * Identical layout to NLHEStateEncoder::encode() in torch_model.cpp.
  */
 export function encode(input: EncodeInput): Float32Array {
@@ -161,53 +162,53 @@ export function encode(input: EncodeInput): Float32Array {
 
   const out = new Float32Array(STATE_SIZE)
   const NORM = 2.0 * STARTING_STACK
-
-  // [0:52] hole cards one-hot
-  for (const card of holeCards) {
-    if (card >= 0 && card < 52) out[card] = 1.0
-  }
-
-  // [52:104] visible board cards one-hot
   const nVisible = BOARD_CARDS_BY_STREET[street]
-  for (let i = 0; i < nVisible && i < boardCards.length; i++) {
-    const card = boardCards[i]
-    if (card >= 0 && card < 52) out[52 + card] = 1.0
+
+  // [0:8] preflop equity bucket one-hot
+  const equity = preflopEquity(holeCards[0], holeCards[1])
+  const pfBucket = Math.min(Math.floor(equity * K_PREFLOP), K_PREFLOP - 1)
+  out[pfBucket] = 1.0
+
+  // [8:16] board strength bucket one-hot (zeros preflop)
+  const visibleBoard = boardCards.slice(0, nVisible)
+  const brdStr = boardStrength(holeCards, visibleBoard)
+  if (nVisible >= 3) {
+    const brdBucket = Math.min(Math.floor(brdStr * K_BOARD), K_BOARD - 1)
+    out[8 + brdBucket] = 1.0
   }
 
-  // [104:108] street one-hot
-  out[104 + Math.min(street, 3)] = 1.0
+  // [16:20] street one-hot
+  out[16 + Math.min(street, 3)] = 1.0
 
-  // [108:112] betting scalars
-  out[108] = Math.min(pot       / NORM,             1.0)
-  out[109] = Math.min(toCall    / NORM,             1.0)
-  out[110] = Math.min(myStack   / STARTING_STACK,   1.0)
-  out[111] = Math.min(oppStack  / STARTING_STACK,   1.0)
+  // [20:24] betting scalars
+  out[20] = Math.min(pot       / NORM,           1.0)
+  out[21] = Math.min(toCall    / NORM,           1.0)
+  out[22] = Math.min(myStack   / STARTING_STACK, 1.0)
+  out[23] = Math.min(oppStack  / STARTING_STACK, 1.0)
 
-  // [112:120] action history (last 8)
+  // [24:32] action history (last 8)
   const HIST_SLOTS = 8
   const histStart  = Math.max(0, actionHistory.length - HIST_SLOTS)
   for (let i = histStart; i < actionHistory.length; i++) {
-    const slot = 112 + (i - histStart)
+    const slot = 24 + (i - histStart)
     const act  = actionHistory[i]
     if (act >= 0 && act <= 3) out[slot] = ACTION_ENC[act]
   }
 
-  // [120] preflop equity
-  out[120] = preflopEquity(holeCards[0], holeCards[1])
+  // [32] preflop equity (continuous)
+  out[32] = equity
 
-  // [121] board strength
-  const visibleBoard = boardCards.slice(0, nVisible)
-  out[121] = boardStrength(holeCards, visibleBoard)
+  // [33] board strength (continuous)
+  out[33] = brdStr
 
-  // [122] pot odds — to_call / (pot + to_call)
-  out[122] = pot + toCall > 0
+  // [34] pot odds
+  out[34] = pot + toCall > 0
     ? Math.min(toCall / (pot + toCall), 1.0)
     : 0.0
 
-  // [123] SPR = min(stacks) / pot, normalised (cap at 10). Matches C++:
-  //   out[123] = pot > ε ? min(eff_stack / pot, 10) / 10 : 1.0
+  // [35] SPR = min(stacks) / pot, normalised (cap at 10)
   const effectiveStack = Math.min(myStack, oppStack)
-  out[123] = pot > 1e-6
+  out[35] = pot > 1e-6
     ? Math.min(effectiveStack / pot, 10.0) / 10.0
     : 1.0
 

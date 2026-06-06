@@ -39,22 +39,34 @@ inline float preflop_equity_heuristic(int rank_high, int rank_low, bool suited) 
 }
 
 // ── NLHEStateEncoder ──────────────────────────────────────────────────────────
-// Produces the same 124-dim tensor as Python NLHEEncoder (dims 122-123 = pot
-// odds + SPR).
+// Card-abstracted encoder — produces the same 36-dim tensor as Python NLHEEncoder.
 //
-// PARITY NOTES (see torch_model.cpp for the implementations):
-//   * dim 120 (preflop equity): loaded from the Python equity-table JSON for
-//     exact parity; falls back to preflop_equity_heuristic only if absent.
-//   * dim 121 (board strength): normalised by THIS evaluator's true maximum,
-//     (8<<24)|(12<<20). Because the Python evaluator uses a different score
-//     packing (base-15 _pack), dim 121 is MONOTONE-but-not-bit-identical across
-//     implementations — an accepted residual. The parity test compares dims
-//     0-119 and 122-123, not 121.
-//   * dims 108-123 are quantised to a 1e-6 grid on output, matching the Python
-//     encoder and the NLHE state_key, so identical nodes group identically.
+// Layout (36 dims):
+//   [0:8]   Preflop hand bucket one-hot (K=8, bins on equity ∈ [0,1])
+//   [8:16]  Board EHS bucket one-hot    (K=8; zeros preflop)
+//   [16:20] Street one-hot
+//   [20:24] Betting scalars (pot, to_call, stacks)
+//   [24:32] Action history (8 slots, NLHE_ACTION_ENC values)
+//   [32]    Preflop equity (continuous)
+//   [33]    Board strength (continuous, hand-eval score / MAX_SCORE)
+//   [34]    Pot odds
+//   [35]    SPR
+//
+// PARITY NOTES:
+//   * dim 32 (preflop equity): loaded from equity-table JSON for parity with
+//     Python; falls back to preflop_equity_heuristic if absent.
+//   * dims [0:8] (preflop bucket): derived from dim 32 → min(int(eq*8), 7).
+//     Bit-identical to Python as long as equity values agree.
+//   * dims [8:16] (board bucket): derived from board_strength → min(int(s*8),7).
+//     C++ board_strength uses a different score packing than Python (accepted
+//     residual — both are monotone, wide bins minimise boundary disagreements).
+//   * dims 20-35 quantised to 1e-6 grid.
 class NLHEStateEncoder {
 public:
-    static constexpr int STATE_SIZE = 124;
+    static constexpr int STATE_SIZE = 36;
+    static constexpr int K_PREFLOP  = 8;
+    static constexpr int K_BOARD    = 8;
+
     static void encode(const NLHEState& state, int player, float* out);
     static std::vector<float> encode_vec(const NLHEState& state, int player);
 

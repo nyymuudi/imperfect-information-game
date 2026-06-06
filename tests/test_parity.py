@@ -1,26 +1,28 @@
 """
 Cross-implementation parity tests: Python NLHEEncoder vs C++ NLHEStateEncoder.
 
-Uses cfr_engine.make_nlhe_deal() + NLHEGame.initial_state() +
-NLHEStateEncoder.encode_vec() — all exported from bindings.cpp.
+Card-abstracted encoder layout (36 dims):
+  [0:8]   preflop bucket one-hot
+  [8:16]  board bucket one-hot (zeros preflop)
+  [16:20] street one-hot
+  [20:24] betting scalars
+  [24:32] action history
+  [32]    preflop equity (continuous)
+  [33]    board strength (continuous — ACCEPTED RESIDUAL: Python/C++ differ)
+  [34]    pot odds
+  [35]    SPR
 
 Coverage:
-  * TestEncoderParity        — preflop initial-state feature parity (dims 0-111)
-  * TestPostActionParity     — parity AFTER action sequences that exercise the
-                               corrected state machine: preflop CALL -> flop,
-                               flop first check (BB acts first OOP), raise
-                               sizing (pot-after-call). This is the region that
-                               was historically broken (159 vs 120 states); the
-                               original parity tests only covered the initial
-                               state and so could not have caught a regression
-                               here.
-  * TestEquityFeatureParity  — dim 120 parity (both sides read the same
-                               deterministic equity table). Skipped gracefully
-                               if the table file is not present.
-  * TestLegalActionsParity   — C++ legal-action set, plus Python<->C++ legal
-                               action-count agreement along a sequence.
+  * TestEncoderParity        — preflop initial-state feature parity
+  * TestPostActionParity     — parity AFTER action sequences
+  * TestEquityFeatureParity  — dim 32 parity (equity table)
+  * TestBucketParity         — preflop bucket parity (dims 0-7)
+  * TestLegalActionsParity   — C++ legal-action set
 
 Skipped automatically if cfr_engine.so is unavailable.
+Note: board bucket (dims 8-15) and board strength (dim 33) are NOT required to
+be bit-identical across implementations — both are monotone in hand strength but
+use different score normalisations. See torch_model.hpp parity notes.
 """
 
 import sys
@@ -121,141 +123,151 @@ def _both_vecs(hole0, hole1, board, char_actions, player):
 class TestEncoderParity:
 
     @cpp_required
-    def test_state_size_is_124(self):
+    def test_state_size_is_36(self):
         state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
         vec   = _eng.NLHEStateEncoder.encode_vec(state, 0)
-        assert len(vec) == 124
+        assert len(vec) == 36
 
     @cpp_required
-    def test_hole_card_bits_player0(self):
+    def test_preflop_bucket_is_one_hot(self):
+        """Preflop: exactly one bit set in dims [0:8], all zeros in [8:16]."""
         state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
         vec   = _eng.NLHEStateEncoder.encode_vec(state, 0)
-        ah, kh = str_to_card("Ah"), str_to_card("Kh")
-        qd, jd = str_to_card("Qd"), str_to_card("Jd")
-        assert vec[ah] == pytest.approx(1.0)
-        assert vec[kh] == pytest.approx(1.0)
-        assert vec[qd] == pytest.approx(0.0)
-        assert vec[jd] == pytest.approx(0.0)
+        assert sum(vec[0:8]) == pytest.approx(1.0)
+        assert all(v == pytest.approx(0.0) for v in vec[8:16])
 
     @cpp_required
     def test_street_one_hot_preflop(self):
         state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
         vec   = _eng.NLHEStateEncoder.encode_vec(state, 0)
-        assert vec[104] == pytest.approx(1.0)
-        assert vec[105] == pytest.approx(0.0)
-        assert vec[106] == pytest.approx(0.0)
-        assert vec[107] == pytest.approx(0.0)
+        assert vec[16] == pytest.approx(1.0)
+        assert vec[17] == pytest.approx(0.0)
+        assert vec[18] == pytest.approx(0.0)
+        assert vec[19] == pytest.approx(0.0)
 
     @cpp_required
     def test_pot_odds_preflop(self):
         state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
         vec   = _eng.NLHEStateEncoder.encode_vec(state, 0)
-        assert vec[122] == pytest.approx(0.25, abs=ATOL)
+        assert vec[34] == pytest.approx(0.25, abs=ATOL)
 
     @cpp_required
     def test_spr_full_stack(self):
         state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
         vec   = _eng.NLHEStateEncoder.encode_vec(state, 0)
-        assert vec[123] == pytest.approx(1.0, abs=ATOL)
+        assert vec[35] == pytest.approx(1.0, abs=ATOL)
 
     @cpp_required
-    def test_board_bits_zero_preflop(self):
+    def test_board_bucket_zero_preflop(self):
+        """Preflop: board bucket dims [8:16] must all be zero."""
         state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
         vec   = _eng.NLHEStateEncoder.encode_vec(state, 0)
-        assert all(v == pytest.approx(0.0) for v in vec[52:104])
+        assert all(v == pytest.approx(0.0) for v in vec[8:16])
 
     @cpp_required
-    def test_cpp_python_card_bits_match(self):
+    def test_cpp_python_preflop_bucket_match(self):
+        """Preflop bucket (dims 0-7) must be identical on both sides."""
         cpp_vec, py_vec = _both_vecs("AhKh", "QdJd", "7c8s9c", (), 0)
-        np.testing.assert_allclose(cpp_vec[:104], py_vec[:104], atol=ATOL,
-                                   err_msg="card-bit mismatch dim 0-103")
+        np.testing.assert_allclose(cpp_vec[0:8], py_vec[0:8], atol=ATOL,
+                                   err_msg="preflop bucket mismatch dim 0-7")
 
     @cpp_required
     def test_cpp_python_betting_scalars_match(self):
         cpp_vec, py_vec = _both_vecs("AhKh", "QdJd", "7c8s9c", (), 0)
-        np.testing.assert_allclose(cpp_vec[108:112], py_vec[108:112], atol=ATOL,
-                                   err_msg="betting scalar mismatch dim 108-111")
+        np.testing.assert_allclose(cpp_vec[20:24], py_vec[20:24], atol=ATOL,
+                                   err_msg="betting scalar mismatch dim 20-23")
 
     @cpp_required
     def test_cpp_python_street_one_hot_match(self):
         cpp_vec, py_vec = _both_vecs("AhKh", "QdJd", "7c8s9c", (), 0)
-        np.testing.assert_allclose(cpp_vec[104:108], py_vec[104:108], atol=ATOL,
-                                   err_msg="street one-hot mismatch dim 104-107")
+        np.testing.assert_allclose(cpp_vec[16:20], py_vec[16:20], atol=ATOL,
+                                   err_msg="street one-hot mismatch dim 16-19")
 
 
 # ── TestPostActionParity (the previously-uncovered region) ───────────────────
 
 class TestPostActionParity:
-    """
-    Parity AFTER action sequences that exercise the corrected state machine.
-    These are exactly the transitions that distinguished the broken 159-state
-    tree from the corrected 120-state tree, so they are the transitions a
-    parity test MUST cover.
-    """
+    """Parity AFTER action sequences on corrected state machine."""
 
-    # Each case: (label, char_actions, player_to_encode).
-    # player_to_encode is ALWAYS the player on turn after the sequence — that is
-    # the only state a traversal ever encodes, and to_call is defined from the
-    # acting player's perspective, so encoding the non-acting player would
-    # compare an inconsistent (never-traversed) state across implementations.
     CASES = [
-        ("preflop_sb_call_to_flop", ("k",), 1),      # CALL -> flop, BB to act
-        ("flop_first_check",        ("k", "c"), 0),  # BB checks; SB to act
-        ("preflop_raise",           ("r",), 1),      # raise -> BB to act
-        ("preflop_raise_call_flop", ("r", "k"), 1),  # raise+call -> flop, BB to act
-        ("flop_bet",                ("k", "c", "r"), 1),  # SB raises -> BB to act
+        ("preflop_sb_call_to_flop", ("k",), 1),
+        ("flop_first_check",        ("k", "c"), 0),
+        ("preflop_raise",           ("r",), 1),
+        ("preflop_raise_call_flop", ("r", "k"), 1),
+        ("flop_bet",                ("k", "c", "r"), 1),
     ]
 
     @cpp_required
     @pytest.mark.parametrize("label,actions,player",
                              CASES, ids=[c[0] for c in CASES])
     def test_structural_dims_match(self, label, actions, player):
-        """Dims 0-119 + 122-123 must match exactly (everything but equity/board
-        strength, which are dims 120-121 — see TestEquityFeatureParity)."""
+        """Dims checked: preflop bucket [0:8], street [16:20], betting [20:24],
+        action history [24:32], pot-odds+SPR [34:36].
+        Dims NOT checked: board bucket [8:16] and board strength [33]
+        — accepted residual, see torch_model.hpp parity notes."""
         cpp_vec, py_vec = _both_vecs("AhKh", "QdJd", "7c8s9c", actions, player)
-        # cards, board, street, betting scalars, action history
-        np.testing.assert_allclose(cpp_vec[:120], py_vec[:120], atol=ATOL,
-                                   err_msg=f"{label}: dim 0-119 mismatch")
-        # pot odds + SPR
-        np.testing.assert_allclose(cpp_vec[122:124], py_vec[122:124], atol=ATOL,
-                                   err_msg=f"{label}: dim 122-123 mismatch")
+        np.testing.assert_allclose(cpp_vec[0:8], py_vec[0:8], atol=ATOL,
+                                   err_msg=f"{label}: preflop bucket mismatch")
+        np.testing.assert_allclose(cpp_vec[16:32], py_vec[16:32], atol=ATOL,
+                                   err_msg=f"{label}: dim 16-31 mismatch")
+        np.testing.assert_allclose(cpp_vec[34:36], py_vec[34:36], atol=ATOL,
+                                   err_msg=f"{label}: pot-odds/SPR mismatch")
 
     @cpp_required
     def test_call_advances_street_both_sides(self):
-        """Preflop CALL advances to flop on BOTH sides (3 board bits visible)."""
+        """Preflop CALL → flop: board bucket should be non-zero AND street=flop."""
         cpp_vec, py_vec = _both_vecs("AhKh", "QdJd", "7c8s9c", ("k",), 1)
-        assert cpp_vec[52:104].sum() == pytest.approx(3.0)
-        assert py_vec[52:104].sum() == pytest.approx(3.0)
-        # flop one-hot
-        assert cpp_vec[105] == pytest.approx(1.0)
-        assert py_vec[105] == pytest.approx(1.0)
+        # board bucket: exactly one bit set in [8:16]
+        assert sum(cpp_vec[8:16]) == pytest.approx(1.0)
+        assert sum(py_vec[8:16]) == pytest.approx(1.0)
+        # street one-hot: flop bit (dim 17) set
+        assert cpp_vec[17] == pytest.approx(1.0)
+        assert py_vec[17] == pytest.approx(1.0)
 
 
-# ── TestEquityFeatureParity (dim 120) ────────────────────────────────────────
+# ── TestEquityFeatureParity (dim 32) ─────────────────────────────────────────
 
 class TestEquityFeatureParity:
-    """
-    dim 120 parity. Both sides read the same deterministic equity table; this
-    passes only when the table file has been generated (the Python encoder
-    writes it on first construction). If the C++ table is absent it falls back
-    to the heuristic and these values diverge — so we skip rather than fail when
-    the C++ side did not load the table.
-    """
+    """dim 32 (continuous preflop equity) parity — both sides read the same table."""
 
     @cpp_required
     def test_preflop_equity_matches_when_table_present(self):
-        # Build python first so the table file exists on disk.
         py_vec = make_python_vec("AhKh", "QdJd", "7c8s9c", (), 0)
         cpp_state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
         cpp_vec = np.array(_eng.NLHEStateEncoder.encode_vec(cpp_state, 0),
                            dtype=np.float32)
-        # Heuristic fallback for AKs is ~0.68 by coincidence; the table value is
-        # the MC equity. If they differ by more than the heuristic could, the
-        # table loaded; if they happen to be within tolerance, parity holds
-        # either way. We assert parity and xfail-skip if the C++ table is absent.
-        if abs(cpp_vec[120] - py_vec[120]) > 0.02:
+        if abs(cpp_vec[32] - py_vec[32]) > 0.02:
             pytest.skip("C++ equity table not loaded (heuristic fallback active)")
-        assert cpp_vec[120] == pytest.approx(py_vec[120], abs=2e-2)
+        assert cpp_vec[32] == pytest.approx(py_vec[32], abs=2e-2)
+
+
+# ── TestBucketParity (preflop bucket) ────────────────────────────────────────
+
+class TestBucketParity:
+    """Preflop bucket (dims 0-7) must agree when equity tables are loaded."""
+
+    @cpp_required
+    def test_aa_in_higher_bucket_than_72o(self):
+        """AA must land in a higher bucket than 72o on both sides."""
+        cpp_aa, py_aa = _both_vecs("AhAs", "QdJd", "7c8s9c", (), 0)
+        cpp_72, py_72 = _both_vecs("7h2d", "QdJd", "7c8s9c", (), 0)
+        aa_bucket_cpp = int(np.argmax(cpp_aa[0:8]))
+        aa_bucket_py  = int(np.argmax(py_aa[0:8]))
+        lo_bucket_cpp = int(np.argmax(cpp_72[0:8]))
+        lo_bucket_py  = int(np.argmax(py_72[0:8]))
+        assert aa_bucket_cpp > lo_bucket_cpp
+        assert aa_bucket_py  > lo_bucket_py
+
+    @cpp_required
+    def test_preflop_buckets_match_across_implementations(self):
+        """Same hand → same preflop bucket on both sides (when table loaded)."""
+        py_vec = make_python_vec("AhKh", "QdJd", "7c8s9c", (), 0)
+        cpp_state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
+        cpp_vec = np.array(_eng.NLHEStateEncoder.encode_vec(cpp_state, 0),
+                           dtype=np.float32)
+        if abs(cpp_vec[32] - py_vec[32]) > 0.02:
+            pytest.skip("C++ equity table not loaded")
+        assert int(np.argmax(cpp_vec[0:8])) == int(np.argmax(py_vec[0:8]))
 
 
 # ── TestLegalActionsParity ───────────────────────────────────────────────────

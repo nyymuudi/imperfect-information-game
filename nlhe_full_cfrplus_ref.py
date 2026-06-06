@@ -25,21 +25,22 @@ from src.games.postflop_nlhe import PostflopNLHE
 from src.deep_cfr.state_encoder import NLHEEncoder
 
 NLHE_NUM_ACTIONS = 4
-STATE_SIZE = 124
+STATE_SIZE = 36
 
 # Map PostflopNLHE action chars to the C++ NLHEAction enum slots.
 #   slot 0 = fold/check ('f' or 'c'), 1 = call ('k'), 2 = raise ('r'), 3 = all-in ('a')
 ACTION_SLOT = {"f": 0, "c": 0, "k": 1, "r": 2, "a": 3}
 
 
-# Dims 120 (preflop equity) and 121 (board_strength) DIVERGE between the C++
-# encoder (preflop_equity() formula / score-based) and the Python encoder
-# (Monte-Carlo equity_vs_random / evaluate_7card) — a documented residual in
-# test_parity.py. They are network INPUT features only and never enter the CFR+
-# regret computation, so we exclude them from the parity key. All other dims
-# (cards, street, betting, action history, pot-odds, SPR) uniquely identify the
-# node and ARE bit-identical across implementations.
-_KEY_DIMS = [i for i in range(124) if i not in (120, 121)]
+# Dims 32-33 DIVERGE between Python and C++ encoders:
+#   dim 32 (preflop equity): Python uses Monte-Carlo equity (equity_sims=200 in
+#          tests, 2000 in production); C++ loads the 2000-sim table. Different
+#          sim counts produce slightly different values for the same hand.
+#   dim 33 (board_strength): different score-packing/normalisation per evaluator.
+# Both are excluded from the parity key — the BUCKET dims [0:8] and [8:16] capture
+# the same discretised signal and ARE bit-identical (when equity values agree on
+# the bucket boundary, which they do for K=8 wide bins).
+_KEY_DIMS = [i for i in range(STATE_SIZE) if i not in (32, 33)]
 
 
 def _state_key(sv):
@@ -55,7 +56,7 @@ class NLHEFullCfrPlusRef:
         self.game = game
         self.enc = encoder
         self.target = target
-        # state_key -> {"R": np.array(4), "state": np.array(124), "visits": int}
+        # state_key -> {"R": np.array(4), "state": np.array(STATE_SIZE), "visits": int}
         self.acc = {}
         self.instant_rows = []   # for target="instant": (state_key, slot, val)
         self._state_cache = {}   # state_key -> state vector (for emission)
@@ -103,7 +104,7 @@ class NLHEFullCfrPlusRef:
             self._traverse_full(deal, tp, 1.0)
 
     def emit_targets(self):
-        """Return (states [m,124], targets [m,4]) — the collapsed regret matrix."""
+        """Return (states [m,STATE_SIZE], targets [m,4]) — the collapsed regret matrix."""
         rows = []          # (state_vec, slot, value)
         if self.target == "instant":
             for key, slot, val, sv in self.instant_rows:

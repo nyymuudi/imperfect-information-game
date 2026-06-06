@@ -2,7 +2,7 @@
 src/deep_cfr/cpp_backend.py
 
 C++ MCCFR backend for DeepCFRSolver.
-Buffer samples carry full 124-dim state vectors — training features
+Buffer samples carry full 36-dim state vectors — training features
 are identical to LibTorch inference features.
 """
 
@@ -186,7 +186,7 @@ class CppMCCFRBackend:
 class NLHECppBackend:
     """
     NLHE C++ backend using state-vector buffers.
-    Buffer samples store float[124] state vectors — no string parsing.
+    Buffer samples store float[STATE_SIZE] state vectors — no string parsing.
 
     Buffer insertion is handled by DeepCFRSolver._run_cpp_iteration, which
     routes the exported (state, action, value) triples through
@@ -196,7 +196,7 @@ class NLHECppBackend:
     conflicting-one-hot pathology that _collapse_by_state exists to remove.
     """
 
-    STATE_SIZE = 124
+    STATE_SIZE = 36  # matches NLHEStateEncoder::STATE_SIZE (card-abstracted)
 
     def __init__(self, n_traversals=500, regret_capacity=1 << 20,
                  strategy_capacity=1 << 20, device="cpu", seed=42,
@@ -275,7 +275,7 @@ class NLHECppBackend:
 
     def to_tensors(self, export) -> tuple:
         """
-        Convert NLHEBufferExport → (X [N,124], actions [N], values [N]).
+        Convert NLHEBufferExport → (X [N,STATE_SIZE], actions [N], values [N]).
         State vectors come directly from C++ — no string parsing.
         """
         n = export.n_samples

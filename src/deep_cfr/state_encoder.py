@@ -116,57 +116,46 @@ class LeducEncoder(StateEncoder):
 
 class NLHEEncoder(StateEncoder):
     """
-    No-Limit Hold'em state encoder for Deep CFR.
+    No-Limit Hold'em state encoder for Deep CFR — card-abstracted.
 
-    State vector (124 dimensions):
-        [0:52]    Private cards (one-hot, 2 bits set)
-        [52:104]  Board cards (one-hot, 0-5 bits set)
-        [104:108] Street (one-hot: preflop/flop/turn/river)
-        [108]     Pot size (normalized by 2× starting stack)
-        [109]     Amount to call (normalized)
-        [110]     Own stack remaining (normalized)
-        [111]     Opponent stack remaining (normalized)
-        [112:120] Action history (last 8 actions encoded)
-        [120]     Preflop equity of own hand (deterministic per hand class)
-        [121]     Board strength of own hand (evaluate_7card / MAX_HAND_SCORE)
-        [122]     Pot odds = to_call / (pot + to_call)
-        [123]     SPR = min(stacks) / pot (capped, normalised)
+    State vector (36 dimensions):
+        [0:8]   Preflop hand bucket (one-hot, K=8 equal-width bins on equity)
+        [8:16]  Board EHS bucket (one-hot, K=8; all zeros preflop)
+        [16:20] Street (one-hot: preflop/flop/turn/river)
+        [20]    Pot size (normalized by 2× starting stack)
+        [21]    Amount to call (normalized)
+        [22]    Own stack remaining (normalized)
+        [23]    Opponent stack remaining (normalized)
+        [24:32] Action history (last 8 actions encoded)
+        [32]    Preflop equity of own hand (continuous, in [0,1])
+        [33]    Board strength (evaluate_7card / MAX_HAND_SCORE, in [0,1])
+        [34]    Pot odds = to_call / (pot + to_call)
+        [35]    SPR = min(stacks) / pot (capped at 10, normalised)
 
-    Card encoding: card = rank * 4 + suit
-        rank: 0=2, 1=3, ..., 12=A
-        suit: 0=♣, 1=♦, 2=♥, 3=♠
+    Card abstraction:
+        Multiple concrete hands map to the same bucket → the same state
+        vector → the buffer accumulates dense samples per abstract state
+        rather than sparse samples spread across 1326 unique hand pairs.
+        Preflop bucket: min(int(equity * K), K-1), K=8.
+        Board bucket:   min(int(board_strength * K), K-1), K=8.
+        Dims 32-33 retain the continuous signal within the bucket so the
+        network can interpolate between adjacent buckets.
 
-    Betting/street parse: this encoder reads pot, to_call, stacks and street
-    from PostflopNLHE._parse_state — the SAME corrected state machine the C++
-    NLHEGame engine implements — instead of re-deriving them with a separate
-    parser. Keeping a single source of truth is what makes the Python training
-    features bit-match the C++ encoder inference features (the historical
-    "feature mismatch" that caused strategy collapse).
-
-    Determinism of dims 120-121: the preflop-equity feature comes from
-    `canonical_preflop_equity`, which is seeded per hand class and is therefore
-    reproducible across runs and across the C++ port. The board-strength
-    feature normalises evaluate_7card by `MAX_HAND_SCORE`, the exact maximum of
-    the packed evaluator score, so it lands in [0, 1] without a magic constant.
-    Both features are quantised to a 1e-6 grid on output so that the exact
-    grouping in DeepCFRSolver._collapse_by_state is robust to float noise.
+    Betting/street: read from PostflopNLHE._parse_state (mirrors C++ NLHEGame).
+    Quantisation: dims 20-35 rounded to 1e-6 grid for stable grouping.
     """
 
     ACTION_ENC = {"f": -1.0, "c": 0.0, "k": 0.25, "r": 0.5, "b": 0.75, "a": 1.0}
     HISTORY_LEN = 8
-
-    # Quantisation grid for the continuous feature dims. _collapse_by_state in
-    # the solver groups rows by exact state-vector equality (np.unique); even a
-    # 1-ULP difference would split a group. Rounding the continuous dims to this
-    # grid makes the grouping deterministic and matches the C++ state_key, which
-    # quantises to the same 1e-6 grid before hashing.
     FEATURE_QUANT = 1e-6
+    K_PREFLOP = 8
+    K_BOARD   = 8
 
     _shared_equity_cache = None
 
     def __init__(self, starting_stack: float = 200.0, equity_sims: int = 2000):
         self.starting_stack = starting_stack
-        self.norm = 2 * starting_stack  # Max pot ≈ 2× stacks
+        self.norm = 2 * starting_stack
         self._equity_sims = equity_sims
         self._game_cache = None
         if NLHEEncoder._shared_equity_cache is None:
@@ -177,8 +166,7 @@ class NLHEEncoder(StateEncoder):
     def _game(self):
         """Lazily build a PostflopNLHE matching this encoder's stack, so the
         encoder reads pot/to_call/street/stacks from the SAME (corrected) state
-        machine the C++ engine uses, rather than re-parsing the history with a
-        separate (and previously divergent) parser."""
+        machine the C++ engine uses."""
         if self._game_cache is None:
             from ..games.postflop_nlhe import PostflopNLHE
             self._game_cache = PostflopNLHE(
@@ -189,11 +177,6 @@ class NLHEEncoder(StateEncoder):
         return self._game_cache
 
     def _build_equity_cache(self):
-        """Pre-compute deterministic preflop equity for all 169 hand classes.
-
-        Uses the disk-cached table so the (slow) Monte Carlo runs once per sim
-        count and is reused across processes; this also lets the C++ engine read
-        the same values for dim-120 parity."""
         from ..abstraction.equity import preflop_equity_table
         table = preflop_equity_table(num_simulations=self._equity_sims)
         NLHEEncoder._shared_equity_cache.update(table)
@@ -217,77 +200,65 @@ class NLHEEncoder(StateEncoder):
         return 0.0
 
     def state_size(self) -> int:
-        return 124
+        return 36
 
     def encode(self, history: History, player: int) -> np.ndarray:
-        state = np.zeros(124, dtype=np.float32)
+        state = np.zeros(36, dtype=np.float32)
 
-        # Private cards (one-hot in 52-dim)
-        p0_cards = history[0]  # (card1, card2)
-        p1_cards = history[1]
-        my_cards = p0_cards if player == 0 else p1_cards
-        state[my_cards[0]] = 1.0
-        state[my_cards[1]] = 1.0
+        my_cards = history[0] if player == 0 else history[1]
 
-        actions = history[3:]
+        # Preflop equity + bucket [0:8]
+        equity = self._get_preflop_equity(my_cards[0], my_cards[1])
+        pf_bucket = min(int(equity * self.K_PREFLOP), self.K_PREFLOP - 1)
+        state[pf_bucket] = 1.0
 
-        # Authoritative betting/street state from the corrected state machine
-        # (mirrors C++ NLHEGame). Single source of truth for pot/to_call/street.
+        # Betting/street state from corrected state machine
         st = self._game()._parse_state(history)
         street_idx = st["street_idx"]
         n_visible = [0, 3, 4, 5][min(street_idx, 3)]
 
-        # Board cards (only visible ones based on street)
-        board = history[2]  # Full pre-dealt board
-        for card in board[:n_visible]:
-            state[52 + card] = 1.0
+        # Board strength + bucket [8:16] (zeros preflop)
+        visible_board = history[2][:n_visible] if n_visible > 0 else ()
+        board_str = self._get_board_strength(my_cards, visible_board)
+        if n_visible >= 3:
+            brd_bucket = min(int(board_str * self.K_BOARD), self.K_BOARD - 1)
+            state[8 + brd_bucket] = 1.0
 
-        # Street (one-hot)
+        # Street one-hot [16:20]
         street = {0: 0, 3: 1, 4: 2, 5: 3}.get(n_visible, 0)
-        state[104 + street] = 1.0
+        state[16 + street] = 1.0
 
-        # Betting info (read straight from the state machine)
-        pot      = st["pot"]
-        to_call  = st["to_call"]
-        my_stack = st["stacks"][player]
+        # Betting scalars [20:24]
+        pot       = st["pot"]
+        to_call   = st["to_call"]
+        my_stack  = st["stacks"][player]
         opp_stack = st["stacks"][1 - player]
-        state[108] = pot / self.norm
-        state[109] = to_call / self.norm
-        state[110] = my_stack / self.starting_stack
-        state[111] = opp_stack / self.starting_stack
+        state[20] = pot / self.norm
+        state[21] = to_call / self.norm
+        state[22] = my_stack / self.starting_stack
+        state[23] = opp_stack / self.starting_stack
 
-        # Action history. 'f' and 'c' are distinct in the Python alphabet, but
-        # the C++ engine stores both as FOLD_OR_CHECK (slot 0) and encodes that
-        # slot as 0.0. To keep dim 112-119 bit-identical across implementations,
-        # encode a terminal-only 'f' as 0.0 too: a fold ends the hand, so a
-        # folded node is never queried for a strategy during traversal, and
-        # using 0.0 here removes the only remaining action-history divergence.
+        # Action history [24:32]
+        # 'f' encodes as 0.0 to match C++ FOLD_OR_CHECK slot
+        actions = history[3:]
         for i, a in enumerate(actions[-self.HISTORY_LEN:]):
             if isinstance(a, str):
                 enc = self.ACTION_ENC.get(a, 0.0)
                 if a == 'f':
-                    enc = 0.0  # parity with C++ FOLD_OR_CHECK slot
-                state[112 + i] = enc
+                    enc = 0.0
+                state[24 + i] = enc
             else:
-                state[112 + i] = min(a / self.starting_stack, 1.0)
+                state[24 + i] = min(a / self.starting_stack, 1.0)
 
-        # Hand strength features (key for convergence) — deterministic.
-        state[120] = self._get_preflop_equity(my_cards[0], my_cards[1])
-        visible_board = history[2][:n_visible] if n_visible > 0 else ()
-        state[121] = self._get_board_strength(my_cards, visible_board)
-
-        # dim [122]: pot odds = to_call / (pot + to_call)
-        # Captures the immediate cost of calling relative to the reward.
+        # Continuous hand features [32:36]
+        state[32] = equity
+        state[33] = board_str
         pot_plus_call = pot + to_call
-        state[122] = to_call / pot_plus_call if pot_plus_call > 1e-6 else 0.0
+        state[34] = to_call / pot_plus_call if pot_plus_call > 1e-6 else 0.0
+        eff_stack = min(my_stack, opp_stack)
+        state[35] = min(eff_stack / pot, 10.0) / 10.0 if pot > 1e-6 else 1.0
 
-        # dim [123]: SPR = min(stacks) / pot, normalised (cap at 10)
-        # Stack-to-pot ratio: large SPR → post-flop implied odds matter more.
-        eff_stack  = min(my_stack, opp_stack)
-        state[123] = min(eff_stack / pot, 10.0) / 10.0 if pot > 1e-6 else 1.0
-
-        # Quantise the continuous dims to a fixed grid so _collapse_by_state's
-        # exact grouping (and the C++ state_key) treat identical nodes as equal.
-        cont = slice(108, 124)
+        # Quantise continuous dims to stable grouping grid
+        cont = slice(20, 36)
         state[cont] = np.round(state[cont] / self.FEATURE_QUANT) * self.FEATURE_QUANT
         return state.astype(np.float32)

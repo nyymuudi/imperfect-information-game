@@ -145,7 +145,7 @@ class TestPipelineConnectivity:
     def test_blueprint_created_from_solver(self, blueprint):
         assert isinstance(blueprint, Blueprint)
         assert blueprint.metadata.iterations == 5
-        assert blueprint.metadata.state_size == 124
+        assert blueprint.metadata.state_size == 36
 
     def test_blueprint_query_valid_distribution(self, blueprint, root_history, encoder):
         state_vec = encoder.encode(root_history, 0)

@@ -126,7 +126,8 @@ private:
 }  // namespace
 
 // ── NLHEStateEncoder ──────────────────────────────────────────────────────────
-// NLHE_ACTION_ENC is defined in nlhe_game.hpp — do NOT redefine here.
+// Card-abstracted encoder. Layout — see torch_model.hpp comment block.
+// NLHE_ACTION_ENC is defined in nlhe_game.hpp.
 
 void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     const float STACK = state.cfg.starting_stack;
@@ -136,37 +137,8 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
 
     int c0 = state.hole_cards[player][0];
     int c1 = state.hole_cards[player][1];
-    if(c0 >= 0 && c0 < 52) out[c0] = 1.0f;
-    if(c1 >= 0 && c1 < 52) out[c1] = 1.0f;
 
-    int n_visible = BOARD_CARDS_BY_STREET[state.street];
-    for(int i = 0; i < n_visible; ++i) {
-        int card = state.board[i];
-        if(card >= 0 && card < 52) out[52 + card] = 1.0f;
-    }
-
-    int street = std::min((int)state.street, 3);
-    out[104 + street] = 1.0f;
-
-    float to_call = state.street_invest[1-player] - state.street_invest[player];
-    to_call = std::max(0.0f, to_call);
-    out[108] = std::min(state.pot              / NORM,  1.0f);
-    out[109] = std::min(to_call               / NORM,  1.0f);
-    out[110] = std::min(state.stacks[player]   / STACK, 1.0f);
-    out[111] = std::min(state.stacks[1-player] / STACK, 1.0f);
-
-    static constexpr int HIST_START = 112;
-    static constexpr int HIST_SLOTS = 8;
-    int hist_begin = std::max(0, state.action_count - HIST_SLOTS);
-    for(int i = hist_begin; i < state.action_count; ++i) {
-        int slot   = HIST_START + (i - hist_begin);
-        int8_t act = state.action_history[i];
-        if(act >= 0 && act < 4)
-            out[slot] = NLHE_ACTION_ENC[act];   // defined in nlhe_game.hpp
-    }
-
-    // dim [120]: preflop equity. Parity path: look up the deterministic table
-    // Python wrote; only if it is unavailable do we fall back to the heuristic.
+    // dims [0:8]: preflop equity bucket one-hot
     int r0 = card_rank(c0), r1 = card_rank(c1);
     int s0 = card_suit(c0), s1 = card_suit(c1);
     int rh = std::max(r0,r1), rl = std::min(r0,r1);
@@ -175,27 +147,62 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     float eq = -1.0f;
     {
         const auto& tbl = PreflopEquityTable::instance();
-        if (tbl.loaded()) {
-            eq = tbl.lookup(canonical_class(rh, rl, suited, pair));
-        }
+        if (tbl.loaded()) eq = tbl.lookup(canonical_class(rh, rl, suited, pair));
     }
-    out[120] = (eq >= 0.0f) ? eq : preflop_equity_heuristic(rh, rl, suited);
-    out[121] = board_strength(state, player);
+    float equity = (eq >= 0.0f) ? eq : preflop_equity_heuristic(rh, rl, suited);
+    int pf_bucket = std::min((int)(equity * K_PREFLOP), K_PREFLOP - 1);
+    out[pf_bucket] = 1.0f;
 
-    // dim [122]: pot odds = to_call / (pot + to_call)
+    // dims [8:16]: board strength bucket one-hot (zeros preflop)
+    int n_visible = BOARD_CARDS_BY_STREET[state.street];
+    float brd_str = board_strength(state, player);
+    if (n_visible >= 3) {
+        int brd_bucket = std::min((int)(brd_str * K_BOARD), K_BOARD - 1);
+        out[8 + brd_bucket] = 1.0f;
+    }
+
+    // dims [16:20]: street one-hot
+    int street = std::min((int)state.street, 3);
+    out[16 + street] = 1.0f;
+
+    // dims [20:24]: betting scalars
+    float to_call = state.street_invest[1-player] - state.street_invest[player];
+    to_call = std::max(0.0f, to_call);
+    out[20] = std::min(state.pot              / NORM,  1.0f);
+    out[21] = std::min(to_call               / NORM,  1.0f);
+    out[22] = std::min(state.stacks[player]   / STACK, 1.0f);
+    out[23] = std::min(state.stacks[1-player] / STACK, 1.0f);
+
+    // dims [24:32]: action history (last 8 actions)
+    static constexpr int HIST_START = 24;
+    static constexpr int HIST_SLOTS = 8;
+    int hist_begin = std::max(0, state.action_count - HIST_SLOTS);
+    for(int i = hist_begin; i < state.action_count; ++i) {
+        int slot   = HIST_START + (i - hist_begin);
+        int8_t act = state.action_history[i];
+        if(act >= 0 && act < 4)
+            out[slot] = NLHE_ACTION_ENC[act];
+    }
+
+    // dim [32]: preflop equity (continuous)
+    out[32] = equity;
+
+    // dim [33]: board strength (continuous)
+    out[33] = brd_str;
+
+    // dim [34]: pot odds = to_call / (pot + to_call)
     float pot_plus_call = state.pot + to_call;
-    out[122] = (pot_plus_call > 1e-6f) ? (to_call / pot_plus_call) : 0.0f;
+    out[34] = (pot_plus_call > 1e-6f) ? (to_call / pot_plus_call) : 0.0f;
 
-    // dim [123]: SPR = min(stacks) / pot, normalised (cap at 10)
+    // dim [35]: SPR = min(stacks) / pot, normalised (cap at 10)
     float eff_stack = std::min(state.stacks[0], state.stacks[1]);
-    out[123] = (state.pot > 1e-6f)
-               ? std::min(eff_stack / state.pot, 10.0f) / 10.0f
-               : 1.0f;
+    out[35] = (state.pot > 1e-6f)
+              ? std::min(eff_stack / state.pot, 10.0f) / 10.0f
+              : 1.0f;
 
-    // Quantise the continuous dims to the SAME 1e-6 grid the Python encoder
-    // uses on output, so identical nodes hash/group identically across
-    // implementations (DeepCFRSolver._collapse_by_state + NLHE state_key).
-    for (int i = 108; i < STATE_SIZE; ++i)
+    // Quantise continuous dims [20:36] to 1e-6 grid — matches Python encoder
+    // and NLHE state_key so identical nodes group identically.
+    for (int i = 20; i < STATE_SIZE; ++i)
         out[i] = std::round(out[i] * 1e6f) / 1e6f;
 }
 

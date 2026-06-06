@@ -95,7 +95,7 @@ def _cpp_matrix():
 
     exp = engine.export_regret_buffer()
     n = exp.n_samples
-    states = np.array(exp.states, dtype=np.float32).reshape(n, 124)
+    states = np.array(exp.states, dtype=np.float32).reshape(n, exp.state_size)
     actions = np.array(list(exp.actions), dtype=np.int64)
     values = np.array(list(exp.values), dtype=np.float32)
     # collapse to {state_key: [4]}
