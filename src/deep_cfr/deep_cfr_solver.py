@@ -279,6 +279,14 @@ class DeepCFRSolver:
             if len(X_np) > 0:
                 states, reg_mat = self._collapse_by_state(X_np, a_np, v_np)
                 m = len(states)
+                # INSTANT-mode: normalisoi regretit 2*stack:lla jotta ne ovat
+                # samassa skaalassa kuin CFR+/visits (~[-1,1]).
+                # INSTANT-regretit ovat raakoja pot-skaalattuja arvoja (action_ev
+                # - node_ev), jotka voivat olla satoja BB:tä — ilman normalisointia
+                # loss räjähtää (3-4 vs 0.04) ja verkko ei konvergoi.
+                if self.regret_target == "instant":
+                    norm = 2.0 * getattr(self.game, 'starting_stack', 200.0)
+                    reg_mat = reg_mat / (norm + 1e-8)
                 # DCFR α-paino: t^α/(t^α+1) diskontaa varhaisten iteraatioiden
                 # kohinaisia regrettejä. γ-painotus hoitaa näytteistysvaiheen.
                 reg_w = self._dcfr_regret_weight(self.iterations)
@@ -363,15 +371,21 @@ class DeepCFRSolver:
             if len(self.regret_buffer) >= self.train_batch:
                 state_sz   = self.encoder.state_size()
                 net_device = next(self.regret_net.parameters()).device
-                if self.warm_start and self.iterations > 1:
+                # INSTANT-mode: aina cold-start (Brown et al. 2019 Algorithm 1).
+                # Warm-start on haitallinen INSTANT-moden kanssa koska kohdejakauma
+                # muuttuu merkittävästi iteraatioiden välillä — Adam-momentum
+                # ajautuu väärään suuntaan ja loss kasvaa. CFR+-mode hyötyy
+                # warm-startista koska kumulatiivinen kohde muuttuu hitaasti.
+                use_warm = self.warm_start and self.iterations > 1 \
+                           and self.regret_target != "instant"
+                if use_warm:
                     # Warm-start: fitataan olemassaolevista painoista
                     # pienemmällä LR:llä. Verkko hyödyntää edellisen
                     # iteraation opittua regrettiä — ei aloita tyhjästä
                     # 500k-näytteen kanssa per iteraatio.
                     train_lr = self.lr / self.warm_start_lr_factor
                 else:
-                    # Cold-start ensimmäisellä iteraatiolla (tai kun
-                    # warm_start=False): alustetaan nollista Brown et al. 2019
+                    # Cold-start: alustetaan nollista Brown et al. 2019
                     # -suosituksen mukaisesti.
                     self.regret_net = RegretNetwork(
                         state_sz, self.max_actions, self.hidden_size
