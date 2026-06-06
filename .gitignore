@@ -11,6 +11,9 @@ dist/
 *.onnx
 blueprints/
 
+# Web-deploy: public/models/*.onnx commitoidaan (selain tarvitsee ne)
+!web/public/models/*.onnx
+
 # C++ build
 *.so
 src/cpp_engine/build/
