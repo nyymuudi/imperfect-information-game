@@ -80,6 +80,18 @@ class DeepCFRSolver:
     # Strategy-bufferi käyttää Linear-CFR -painotusta (strat_w) loss-funktion
     # kautta eikä tarvitse dcfr_gamma-painotusta.
     dcfr_gamma: float = 2.0
+    # Regret-kohde: 'instant' = per-traversaali hetkellinen regret (Brown et al.
+    # 2019 Algorithm 1, oikea valinta jatkuvalle tilavektorille).
+    # 'cfrplus' = CFR+/visits kumulatiivisena kohteena (toimii vain kun
+    # visits(I)>>1, eli diskreetti infoset-avain kuten Leducissa).
+    regret_target: str = "instant"
+    # DCFR α/β-diskontaus (Brown & Sandholm 2019).
+    # Iteraatiossa t: regret-näytteen paino = t^α / (t^α + 1) (α=1.5, β=0).
+    # Tämä diskontaa varhaisten iteraatioiden kohinaisia regrettejä
+    # ilman että ne poistetaan kokonaan reservoirista.
+    # 0.0 = ei diskontausta (vanilla Deep CFR).
+    dcfr_alpha: float = 1.5
+    dcfr_beta:  float = 0.0
 
     def __post_init__(self):
         state_sz  = self.encoder.state_size()
@@ -122,6 +134,7 @@ class DeepCFRSolver:
                         starting_stack=self.game.starting_stack,
                         raise_fraction=self.game.raise_fractions[0],
                         max_raises=self.game.max_raises_per_street,
+                        regret_target=self.regret_target,
                     )
                 else:
                     self._cpp = CppMCCFRBackend(
@@ -233,6 +246,21 @@ class DeepCFRSolver:
         np.add.at(targets, (inverse, a_np), v_np)
         return uniq_states.astype(np.float32), targets
 
+    def _dcfr_regret_weight(self, t: int) -> float:
+        """DCFR α/β-paino iteraatiolle t (Brown & Sandholm 2019).
+
+        regret_weight = t^α / (t^α + 1)   kun α > 0
+        Lähestyy 1.0:aa kun t → ∞, joten myöhemmät (tarkemmat) iteraatiot
+        dominoivat näytteistystä. Varhaiset iteraatiot diskontautuvat mutta
+        eivät poistu kokonaan reservoirista.
+        dcfr_beta ei vaikuta regret-painoon (vaikuttaa strategy-painoon
+        paperissa, mutta Linear-CFR strat_w hoitaa sen jo).
+        """
+        if self.dcfr_alpha <= 0.0:
+            return 1.0
+        ta = float(t + 1) ** self.dcfr_alpha
+        return ta / (ta + 1.0)
+
     def _run_cpp_iteration(self) -> None:
         reg_exp, str_exp = self._cpp.run_iteration(
             self.iterations,
@@ -251,10 +279,12 @@ class DeepCFRSolver:
             if len(X_np) > 0:
                 states, reg_mat = self._collapse_by_state(X_np, a_np, v_np)
                 m = len(states)
-                # Regrets UNWEIGHTED — fit the regret targets directly.
-                # Iteraationumero tallennetaan DCFR t^γ -painotusta varten.
+                # DCFR α-paino: t^α/(t^α+1) diskontaa varhaisten iteraatioiden
+                # kohinaisia regrettejä. γ-painotus hoitaa näytteistysvaiheen.
+                reg_w = self._dcfr_regret_weight(self.iterations)
                 self.regret_buffer.add_batch(
-                    states, reg_mat, np.ones(m, dtype=np.float32),
+                    states, reg_mat,
+                    np.full(m, reg_w, dtype=np.float32),
                     iteration=self.iterations + 1,
                 )
 

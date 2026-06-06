@@ -200,10 +200,12 @@ class NLHECppBackend:
 
     def __init__(self, n_traversals=500, regret_capacity=1 << 20,
                  strategy_capacity=1 << 20, device="cpu", seed=42,
-                 starting_stack=200.0, raise_fraction=0.75, max_raises=2):
+                 starting_stack=200.0, raise_fraction=0.75, max_raises=2,
+                 regret_target: str = "instant"):
         if not _ENGINE_AVAILABLE:
             raise ImportError("cfr_engine.so not found.")
         self.device = device
+        self._regret_target = regret_target.strip().lower()
 
         cfg             = _eng.NLHETraversalConfig()
         cfg.n_traversals      = n_traversals
@@ -212,6 +214,15 @@ class NLHECppBackend:
         cfg.collect_strategy  = True
         cfg.seed              = seed
         cfg.max_actions       = 4
+
+        # Regret target: INSTANT = per-traversal instantaneous regret (Brown et al.
+        # 2019 Algorithm 1). CFRPLUS = CFR+/visits kumulatiivisena kohteena.
+        # INSTANT on oikea valinta jatkuvalle tilavektorille koska visits(I)≈1
+        # aina — CFR+/visits redusoituu kohinaiseksi yhden näytteen estimaatiksi.
+        if self._regret_target == "instant":
+            cfg.target = _eng.RegretTarget.INSTANT
+        else:
+            cfg.target = _eng.RegretTarget.CFRPLUS
 
         game_cfg               = _eng.NLHEGameConfig()
         game_cfg.starting_stack = starting_stack
@@ -251,13 +262,11 @@ class NLHECppBackend:
             self._engine.run_traversals_uniform(0)
             self._engine.run_traversals_uniform(1)
 
-        # Emit the accumulated CFR+ targets (R/visits, one sample per
-        # (state, action slot)) into the regret buffer for export. Without this
-        # call the regret buffer stays EMPTY in the default CFRPLUS target mode,
-        # because traversal only folds regret into the accumulator — it does not
-        # write to the buffer until emission. (INSTANT mode writes directly and
-        # would not need this, but CFRPLUS is the default.)
-        self._engine.emit_cfrplus_targets()
+        # CFRPLUS-modessa: emit akkumuloidut R/visits regret-bufferiin.
+        # INSTANT-modessa: traversaali kirjoittaa suoraan regret-bufferiin,
+        # emit on turha ja hidastava — ohitetaan.
+        if self._regret_target == "cfrplus":
+            self._engine.emit_cfrplus_targets()
 
         return (
             self._engine.export_regret_buffer(),

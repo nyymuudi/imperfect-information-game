@@ -127,6 +127,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="DCFR temporaalipainotuksen eksponentti γ. "
                         "0 = uniform (vanilla Deep CFR), 2 = DCFR (oletus). "
                         "Näytteet painotetaan t^γ näytteistysvaiheessa.")
+    p.add_argument("--dcfr-alpha",           type=float, default=1.5,
+                   help="DCFR regret-diskontaus α (oletus 1.5). "
+                        "Näytepaino = t^α/(t^α+1). 0 = ei diskontausta.")
+    p.add_argument("--regret-target",        type=str,   default="instant",
+                   choices=["instant", "cfrplus"],
+                   help="Regret-kohde C++-traversaalille. "
+                        "'instant' = hetkellinen regret per solmu (Brown et al. "
+                        "2019 Algorithm 1, oikea valinta jatkuvalle tilavektorille). "
+                        "'cfrplus' = CFR+/visits (toimii vain diskreetin infoset-avaimen kanssa).")
 
     p.add_argument("--stack",                type=float, default=50.0,
                    help="Effective stack in BB (default: 50). 200BB puu on "
@@ -229,6 +238,8 @@ def main() -> int:
         lr=1e-3,
         warm_start=not args.no_warm_start,
         dcfr_gamma=args.dcfr_gamma,
+        dcfr_alpha=args.dcfr_alpha,
+        regret_target=args.regret_target,
     )
 
     print(f"Deep CFR — HU Postflop NLHE")
