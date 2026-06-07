@@ -151,7 +151,19 @@ class NLHEEncoder(StateEncoder):
     K_PREFLOP = 8
     K_BOARD   = 8
 
+    # Equity range for normalised bucket computation.
+    # Derived from the 169-hand preflop equity table (2000 sims): weakest hand
+    # (72o ≈ 0.316) to strongest (AA ≈ 0.842). Equal-width bins on [0, 1] leave
+    # buckets 0-1 and 7 empty; normalising to the actual range fills all K bins
+    # and separates AA/72o by K-1 = 7 buckets instead of 4.
+    # These constants are recomputed from the loaded table at init; the fallback
+    # values here match the 2000-sim table and are used if the table is absent.
+    EQ_MIN_DEFAULT: float = 0.316
+    EQ_MAX_DEFAULT: float = 0.842
+
     _shared_equity_cache = None
+    _shared_eq_min: float | None = None
+    _shared_eq_max: float | None = None
 
     def __init__(self, starting_stack: float = 200.0, equity_sims: int = 2000):
         self.starting_stack = starting_stack
@@ -162,6 +174,8 @@ class NLHEEncoder(StateEncoder):
             NLHEEncoder._shared_equity_cache = {}
             self._build_equity_cache()
         self._equity_cache = NLHEEncoder._shared_equity_cache
+        self._eq_min = NLHEEncoder._shared_eq_min or self.EQ_MIN_DEFAULT
+        self._eq_max = NLHEEncoder._shared_eq_max or self.EQ_MAX_DEFAULT
 
     def _game(self):
         """Lazily build a PostflopNLHE matching this encoder's stack, so the
@@ -180,6 +194,10 @@ class NLHEEncoder(StateEncoder):
         from ..abstraction.equity import preflop_equity_table
         table = preflop_equity_table(num_simulations=self._equity_sims)
         NLHEEncoder._shared_equity_cache.update(table)
+        vals = list(table.values())
+        if vals:
+            NLHEEncoder._shared_eq_min = float(min(vals))
+            NLHEEncoder._shared_eq_max = float(max(vals))
 
     def _get_preflop_equity(self, card1: int, card2: int) -> float:
         from ..abstraction.equity import canonical_hand_class
@@ -207,9 +225,15 @@ class NLHEEncoder(StateEncoder):
 
         my_cards = history[0] if player == 0 else history[1]
 
-        # Preflop equity + bucket [0:8]
+        # Preflop equity + bucket [0:8] — normalised to actual equity range
         equity = self._get_preflop_equity(my_cards[0], my_cards[1])
-        pf_bucket = min(int(equity * self.K_PREFLOP), self.K_PREFLOP - 1)
+        eq_range = self._eq_max - self._eq_min
+        if eq_range > 0:
+            eq_norm = (equity - self._eq_min) / eq_range
+        else:
+            eq_norm = equity
+        pf_bucket = min(int(eq_norm * self.K_PREFLOP), self.K_PREFLOP - 1)
+        pf_bucket = max(0, pf_bucket)  # guard against equity < eq_min
         state[pf_bucket] = 1.0
 
         # Betting/street state from corrected state machine

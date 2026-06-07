@@ -23,6 +23,10 @@
 export const STATE_SIZE = 36
 export const K_PREFLOP  = 8
 export const K_BOARD    = 8
+// Equity range for normalised preflop bucket (from 2000-sim table):
+//   weakest hand 72o ≈ 0.316, strongest AA ≈ 0.842.
+export const EQ_MIN = 0.316
+export const EQ_MAX = 0.842
 // STARTING_STACK must match --stack used during training.
 export const STARTING_STACK = 50.0
 export const BOARD_CARDS_BY_STREET = [0, 3, 4, 5] // indexed by street 0-3
@@ -164,9 +168,10 @@ export function encode(input: EncodeInput): Float32Array {
   const NORM = 2.0 * STARTING_STACK
   const nVisible = BOARD_CARDS_BY_STREET[street]
 
-  // [0:8] preflop equity bucket one-hot
+  // [0:8] preflop equity bucket one-hot — normalised to [EQ_MIN, EQ_MAX]
   const equity = preflopEquity(holeCards[0], holeCards[1])
-  const pfBucket = Math.min(Math.floor(equity * K_PREFLOP), K_PREFLOP - 1)
+  const eqNorm = Math.max(0, Math.min(1, (equity - EQ_MIN) / (EQ_MAX - EQ_MIN)))
+  const pfBucket = Math.min(Math.floor(eqNorm * K_PREFLOP), K_PREFLOP - 1)
   out[pfBucket] = 1.0
 
   // [8:16] board strength bucket one-hot (zeros preflop)

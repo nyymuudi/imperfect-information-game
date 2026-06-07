@@ -5,6 +5,7 @@
 #include <numeric>
 #include <array>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <string>
@@ -60,7 +61,9 @@ public:
         return (it == table_.end()) ? -1.0f : it->second;
     }
 
-    bool loaded() const { return loaded_; }
+    bool  loaded()  const { return loaded_; }
+    float eq_min()  const { return eq_min_; }
+    float eq_max()  const { return eq_max_; }
 
 private:
     PreflopEquityTable() { load(); }
@@ -116,10 +119,20 @@ private:
             skip_ws();
             if (i < n && content[i] == ',') ++i;
         }
+        if (!table_.empty()) {
+            eq_min_ = std::numeric_limits<float>::infinity();
+            eq_max_ = -std::numeric_limits<float>::infinity();
+            for (const auto& kv : table_) {
+                eq_min_ = std::min(eq_min_, kv.second);
+                eq_max_ = std::max(eq_max_, kv.second);
+            }
+        }
         return !table_.empty();
     }
 
     bool loaded_ = false;
+    float eq_min_ = 0.316f;   // fallback: weakest hand (72o) approx
+    float eq_max_ = 0.842f;   // fallback: strongest hand (AA) approx
     std::unordered_map<std::string, float> table_;
 };
 
@@ -138,19 +151,28 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     int c0 = state.hole_cards[player][0];
     int c1 = state.hole_cards[player][1];
 
-    // dims [0:8]: preflop equity bucket one-hot
+    // dims [0:8]: preflop equity bucket one-hot — normalised to [eq_min, eq_max]
+    // so all K bins are populated and AA/72o are K-1 bins apart.
     int r0 = card_rank(c0), r1 = card_rank(c1);
     int s0 = card_suit(c0), s1 = card_suit(c1);
     int rh = std::max(r0,r1), rl = std::min(r0,r1);
     bool suited = (s0 == s1) && (c0 != c1);
     bool pair   = (r0 == r1);
     float eq = -1.0f;
+    float eq_min = 0.316f, eq_max = 0.842f;  // fallback constants
     {
         const auto& tbl = PreflopEquityTable::instance();
-        if (tbl.loaded()) eq = tbl.lookup(canonical_class(rh, rl, suited, pair));
+        if (tbl.loaded()) {
+            eq = tbl.lookup(canonical_class(rh, rl, suited, pair));
+            eq_min = tbl.eq_min();
+            eq_max = tbl.eq_max();
+        }
     }
     float equity = (eq >= 0.0f) ? eq : preflop_equity_heuristic(rh, rl, suited);
-    int pf_bucket = std::min((int)(equity * K_PREFLOP), K_PREFLOP - 1);
+    float eq_range = eq_max - eq_min;
+    float eq_norm  = (eq_range > 0.0f) ? ((equity - eq_min) / eq_range) : equity;
+    int pf_bucket = std::min((int)(eq_norm * K_PREFLOP), K_PREFLOP - 1);
+    if (pf_bucket < 0) pf_bucket = 0;
     out[pf_bucket] = 1.0f;
 
     // dims [8:16]: board strength bucket one-hot (zeros preflop)
