@@ -1,7 +1,7 @@
 {
-  "model_path": "/models/strategy_net.953c38cc58c2.onnx",
-  "hash": "953c38cc58c2",
-  "iterations": 500,
+  "model_path": "/models/strategy_net.5b92e587f36d.onnx",
+  "hash": "5b92e587f36d",
+  "iterations": 1500,
   "state_size": 36,
-  "timestamp": "2026-06-07T04:05:35"
+  "timestamp": "2026-06-13T16:15:23"
 }
