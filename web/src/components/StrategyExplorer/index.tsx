@@ -1,11 +1,9 @@
 'use client'
 
-import { useState, useCallback, useTransition, useEffect, useMemo } from 'react'
+import { useState, useCallback, useTransition, useEffect } from 'react'
 import { RANKS, SUITS, makeCard, cardLabel, cardRank, cardSuit, STARTING_STACK as STACK_SIZE } from '@/lib/onnx/encoder'
 import { queryStrategy, type ActionProbs } from '@/lib/onnx/session'
 import { STREET_NAMES, type Street } from '@/types'
-import { createSafeSubgameSolver, handKey, type SubgameStrategy } from '@/lib/cfr'
-import type { NLHEHistory } from '@/lib/cfr'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -177,129 +175,11 @@ export default function StrategyExplorer() {
   const [error, setError]   = useState<string | null>(null)
   const [pending, startTransition] = useTransition()
 
-  // ── Subgame solver state ────────────────────────────────────────────────────
-  const [refinedProbs, setRefinedProbs] = useState<ActionProbs | null>(null)
-  const [refineStatus, setRefineStatus] = useState<string | null>(null)
-  const [refining, setRefining] = useState(false)
-
-  // Cached solver instance — built once per session.
-  const solver = useMemo(() => createSafeSubgameSolver({
-    startingStack: STARTING_STACK,
-    maxRaisesPerStreet: 1,
-    raiseFraction: 0.75,
-  }), [])
-
   const visibleBoardCount = STREET_INFO[street].cards
 
   const setBoard0 = useCallback((i: number) => (c: number) => {
     setBoard(prev => { const next = [...prev]; next[i] = c; return next })
   }, [])
-
-  /**
-   * Build a uniform opponent range (all 1326 hole-card combos minus blockers).
-   * MVP — future versions could let the user customise the range.
-   */
-  const buildUniformOppRange = useCallback((blockers: number[]): Map<string, number> => {
-    const range = new Map<string, number>()
-    const blockSet = new Set(blockers)
-    let combos = 0
-    for (let i = 0; i < 52; i++) {
-      if (blockSet.has(i)) continue
-      for (let j = i + 1; j < 52; j++) {
-        if (blockSet.has(j)) continue
-        range.set(handKey([i, j]), 1.0)
-        combos++
-      }
-    }
-    // Normalise to 1/combos so probabilities sum to 1.
-    for (const k of range.keys()) range.set(k, 1.0 / combos)
-    return range
-  }, [])
-
-  const handleRefine = async () => {
-    if (hole0 === null || hole1 === null) {
-      setError('Select both hole cards before refining')
-      return
-    }
-    if (visibleBoardCount > 0 &&
-        board.slice(0, visibleBoardCount).some(c => c === null)) {
-      setError('Fill all visible board cards before refining')
-      return
-    }
-    setError(null)
-    setRefining(true)
-    setRefineStatus('Setting up subgame…')
-
-    try {
-      // Build a full 5-card board: pad with deterministic unseen cards so the
-      // subgame solver has something to enumerate. We don't actually use these
-      // for showdown unless the spot reaches river.
-      const visible = board
-        .slice(0, visibleBoardCount)
-        .filter((c): c is number => c !== null)
-      const used = new Set<number>([hole0, hole1, ...visible])
-      const fullBoard: number[] = [...visible]
-      for (let c = 0; c < 52 && fullBoard.length < 5; c++) {
-        if (!used.has(c)) {
-          fullBoard.push(c)
-          used.add(c)
-        }
-      }
-
-      // Hero placeholder opp cards — substituted by SubgameGame per deal.
-      const oppPlaceholder: [number, number] = [
-        fullBoard[fullBoard.length - 2], fullBoard[fullBoard.length - 1],
-      ]
-
-      const rootHistory: NLHEHistory = [
-        [hole0, hole1],
-        oppPlaceholder,
-        fullBoard,
-      ] as const
-
-      const heroRange = new Map([[handKey([hole0, hole1]), 1.0]])
-      const oppRange  = buildUniformOppRange([hole0, hole1, ...visible])
-
-      setRefineStatus(`Solving (${oppRange.size} opp combos)…`)
-      const refined = await solver.solve({
-        rootHistory,
-        heroPlayer: 0,
-        heroRange,
-        opponentRange: oppRange,
-        iterations: 50,    // browser-friendly default; raise for more precision
-        maxDeals: 100,
-        onProgress: (it) => setRefineStatus(`CFR iter ${it}/50…`),
-      })
-
-      if (refined === null) {
-        setError('Subgame had no valid deals (card conflicts)')
-        setRefinedProbs(null)
-      } else {
-        // Read hero's strategy at the root.
-        const probs = refined.query(rootHistory, 0)
-        // Map back to ActionProbs. Legal actions on first decision:
-        // [check, raise?, all-in?] (no fold facing zero bet).
-        const result: ActionProbs = {
-          fold:  0, call:  0, raise: 0, allIn: 0,
-        }
-        // First legal action position depends on toCall>0 (face bet) or 0 (open).
-        // For MVP assume open spot (toCall=0): probs ordering = [check, raise, allIn]
-        const keys: Array<keyof ActionProbs> = ['fold', 'raise', 'allIn']
-        for (let i = 0; i < probs.length && i < keys.length; i++) {
-          result[keys[i]] = probs[i]
-        }
-        setRefinedProbs(result)
-        setRefineStatus(`Solved — ${refined.size()} info sets`)
-      }
-    } catch (e) {
-      setError(`Subgame solver failed: ${(e as Error).message}`)
-      console.error(e)
-      setRefinedProbs(null)
-      setRefineStatus(null)
-    } finally {
-      setRefining(false)
-    }
-  }
 
   const handleQuery = () => {
     if (hole0 === null || hole1 === null) {
@@ -445,41 +325,6 @@ export default function StrategyExplorer() {
             {(Object.entries(probs) as [keyof ActionProbs, number][]).map(([action, value]) => (
               <ProbBar key={action} action={action} value={value} />
             ))}
-          </div>
-
-          {/* Subgame solver refinement panel */}
-          <div style={{ marginTop: 24 }}>
-            <button
-              onClick={handleRefine}
-              disabled={refining}
-              className="query-btn"
-              style={{ background: '#5b21b6' }}
-            >
-              {refining ? `[ ${refineStatus ?? 'Refining…'} ]` : '[ Refine with subgame solver → ]'}
-            </button>
-            <p style={{ fontSize: 12, color: '#9ca3af', marginTop: 8 }}>
-              Runs in-browser CFR (50 iters) over a gadget game with safety
-              guarantee. Computes a strategy at least as non-exploitable as the
-              blueprint vs. a uniform opponent range. ~10-30 seconds.
-            </p>
-
-            {refinedProbs && (
-              <div style={{ marginTop: 16 }}>
-                <p className="section-label">Subgame-refined strategy</p>
-                <div className="info-box" style={{ marginBottom: 8 }}>
-                  <strong>Safe re-solve</strong> via Moravčík et al. (2016) gadget
-                  game. The opponent gets an opt-out option whose payoff equals
-                  their blueprint EV — guaranteeing the refined hero strategy is
-                  at least as good as the blueprint (Burch et al. 2014, Thm. 1).
-                </div>
-                <div className="results">
-                  {(Object.entries(refinedProbs) as [keyof ActionProbs, number][])
-                    .map(([action, value]) => (
-                      <ProbBar key={action} action={action} value={value} />
-                    ))}
-                </div>
-              </div>
-            )}
           </div>
         </div>
       )}
