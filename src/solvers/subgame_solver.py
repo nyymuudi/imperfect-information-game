@@ -63,9 +63,6 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
-
 import numpy as np
 
 from ..games.base import ExtensiveFormGame, History, Action, InfoSetKey
@@ -339,6 +336,7 @@ def _rollout_expected_value(
     encoder,
     game: PostflopNLHE,
     history: History,
+    payoff_fn=None,
 ) -> tuple[float, float]:
     """
     Compute expected payoffs (p0_ev, p1_ev) for a specific deal by
@@ -346,9 +344,18 @@ def _rollout_expected_value(
 
     Recursive tree traversal — tractable for subgame subtrees
     (typically ≤ 5 betting rounds deep with ≤ 4 actions each).
+
+    payoff_fn: optional callable(history, game) -> (p0, p1) used to compute
+        terminal values instead of game.terminal_payoffs. Pass
+        head_to_head.ev_adjusted_payoffs to integrate over all-in runouts
+        instead of using the deal's predetermined cards — variance-reducing
+        for noisy mid-training exploitability estimates.
     """
     if game.is_terminal(history):
-        payoffs = game.terminal_payoffs(history)
+        if payoff_fn is not None:
+            payoffs = payoff_fn(history, game)
+        else:
+            payoffs = game.terminal_payoffs(history)
         return float(payoffs[0]), float(payoffs[1])
 
     player  = game.current_player(history)
@@ -362,7 +369,8 @@ def _rollout_expected_value(
         if prob < 1e-9:
             continue
         next_h      = game.apply_action(history, action)
-        next0, next1 = _rollout_expected_value(blueprint, encoder, game, next_h)
+        next0, next1 = _rollout_expected_value(blueprint, encoder, game, next_h,
+                                                payoff_fn=payoff_fn)
         ev0 += prob * next0
         ev1 += prob * next1
 
@@ -490,8 +498,8 @@ class UnsafeSubgameSolver:
             # No valid deals — return uniform strategy stub
             return SubgameStrategy({}, subgame)
 
-        solver   = CFRSolver(game=subgame, linear_averaging=True)
-        raw_dict = solver.solve(iterations=iterations)
+        solver = CFRSolver(game=subgame, linear_averaging=True)
+        solver.solve(iterations=iterations)
 
         # Convert InfoSetData → average_strategy arrays
         strategy_dict = {

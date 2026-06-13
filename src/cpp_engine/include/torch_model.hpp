@@ -63,9 +63,18 @@ inline float preflop_equity_heuristic(int rank_high, int rank_low, bool suited) 
 //   * dims 20-35 quantised to 1e-6 grid.
 class NLHEStateEncoder {
 public:
-    static constexpr int STATE_SIZE = 36;
     static constexpr int K_PREFLOP  = 8;
     static constexpr int K_BOARD    = 8;
+    // STATE_SIZE = 8 (preflop) + K_BOARD + 4 (street) + 4 (betting)
+    //            + 8 (history) + 4 (continuous tail) = 28 + K_BOARD.
+    static constexpr int STATE_SIZE = 28 + K_BOARD;
+
+    // Bucket scheme — runtime-switchable so training and h2h can use the same
+    // .so. 0 = flat (K=8 one-hot, v3 production), 1 = tree (4-hot super +
+    // 4-hot fine within super, two-hot in 8 dims). State size unchanged.
+    enum class Scheme : int { Flat = 0, Tree = 1 };
+    static void set_scheme(int s);
+    static int  get_scheme();
 
     static void encode(const NLHEState& state, int player, float* out);
     static std::vector<float> encode_vec(const NLHEState& state, int player);

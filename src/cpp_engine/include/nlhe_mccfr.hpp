@@ -101,6 +101,14 @@ public:
         float pot, float to_call, float my_stack) const;
     std::vector<float> query_preflop_strategy(int hole0, int hole1) const;
 
+    // ── EV-adjusted terminals (variance-reducing regret targets) ──────────────
+    // When enabled, terminal nodes that reached showdown via all-in (both
+    // players' stacks hit 0 before the river) use equity over remaining board
+    // cards instead of the deal-specific realised outcome. Same regret target
+    // for the same strategic spot regardless of which runout was sampled.
+    static void set_ev_adjusted_terminals(bool on);
+    static bool get_ev_adjusted_terminals();
+
     // ── Buffers ───────────────────────────────────────────────────────────────
     void   clear_buffers()       { regret_buf_.clear(); strategy_buf_.clear(); }
     void   set_iteration(int it) { config_.iteration = it; }

@@ -1,7 +1,7 @@
 """
 Cross-implementation parity tests: Python NLHEEncoder vs C++ NLHEStateEncoder.
 
-Card-abstracted encoder layout (36 dims):
+Card-abstracted encoder layout (36 dims, K_BOARD=8):
   [0:8]   preflop bucket one-hot
   [8:16]  board bucket one-hot (zeros preflop)
   [16:20] street one-hot
@@ -268,6 +268,117 @@ class TestBucketParity:
         if abs(cpp_vec[32] - py_vec[32]) > 0.02:
             pytest.skip("C++ equity table not loaded")
         assert int(np.argmax(cpp_vec[0:8])) == int(np.argmax(py_vec[0:8]))
+
+
+# ── TestBoardBucketParity (dims 8-15) ────────────────────────────────────────
+
+class TestBoardBucketParity:
+    """Board bucket (dims 8-15) — bit-identical across implementations.
+
+    Bucket derives from hand CATEGORY (0..8) which is recovered identically
+    from the Python base-15 _pack scheme and the C++ encode_score >>24 scheme.
+    Continuous board_strength (dim 33) remains an accepted residual.
+    """
+
+    BOARDS = [
+        # cat 0: high card sub-bins (low vs high top rank)
+        ("2c3d", "5s6h", "7c8s9d"),     # weak high card (top rank 9 = J? no, T)
+        ("AhKh", "QdJd", "7c8s9c"),     # high card with A→ sub-bin 1
+        # cat 1: pair sub-bins (small vs big pair)
+        ("2c2d", "AsKs", "5h7c9d"),     # 22 pair → small
+        ("Ts2d", "AsKs", "Tc7c4d"),     # TT pair → small (pair rank 8)
+        ("Js2d", "AsKs", "Jc7c4d"),     # JJ pair → big (pair rank 9)
+        # cat 2: two pair
+        ("AhAs", "QdJd", "AcQc7d"),     # AA-QQ two pair (might be trips? AAA + Q)
+        # cat 3: trips
+        ("KsKh", "Qd2c", "Kc7d2h"),     # top set (trips)
+        # cat 4/5: straight/flush
+        ("2c3d", "QdJd", "4s5h6c"),     # made straight
+        ("2h5h", "QdJd", "7h8hKh"),     # made flush
+        # cat 6/7/8: full house, quads, SF
+        ("AhAs", "QdJd", "AcAd7c"),     # quads
+        ("KsKh", "Qd2c", "KcKd7h"),     # quads (different hand)
+    ]
+
+    @cpp_required
+    @pytest.mark.parametrize("h0,h1,board", BOARDS,
+                             ids=[f"{b[0]}_on_{b[2]}" for b in BOARDS])
+    def test_board_bucket_matches_after_call(self, h0, h1, board):
+        """Preflop CALL → flop: same hole+board → same bucket on both sides."""
+        cpp_vec, py_vec = _both_vecs(h0, h1, board, ("k",), 1)
+        cpp_bucket = int(np.argmax(cpp_vec[8:16]))
+        py_bucket  = int(np.argmax(py_vec[8:16]))
+        assert cpp_bucket == py_bucket, (
+            f"board bucket mismatch on {board}: cpp={cpp_bucket} py={py_bucket}"
+        )
+
+
+# ── TestTreeSchemeParity (dims 8-15, two-hot) ────────────────────────────────
+
+class TestTreeSchemeParity:
+    """Tree-scheme board encoding parity. Super [8:12] + fine [12:16] two-hot.
+
+    Bit-identical between Python and C++ because both sides compute the
+    same category from packed score and the same sub-bin from rank
+    multiplicities — no score-packing dependence.
+    """
+
+    TREE_BOARDS = [
+        # Cat 0 (HC) sub-bins
+        ("2c3d", "5s6h", "7c8s9d"),     # top rank 9 → super 0 fine 0
+        ("AhKh", "QdJd", "7c8s9c"),     # top A → super 0 fine 3
+        ("2c3d", "5s6h", "7c8sJd"),     # top J → super 0 fine 1
+        ("2c3d", "5s6h", "7c8sKd"),     # top K → super 0 fine 2
+        # Cat 1 (Pair) sub-bins
+        ("2c2d", "AsKs", "5h7c9d"),     # pair 2 → super 1 fine 0
+        ("9s9h", "AsKs", "5h7c4d"),     # pair 9 → super 1 fine 1
+        ("KsKh", "AsQs", "5h7c4d"),     # pair K → super 1 fine 2
+        ("AhAs", "QdJd", "5h7c4d"),     # pair A → super 1 fine 3
+        # Cat 2-5 (Made non-paired) -> super 2
+        ("AhAs", "QdJd", "AcQc7d"),     # two pair? actually trips+pair=FH
+        ("2c3d", "QdJd", "4s5h6c"),     # made straight
+        ("2h5h", "QdJd", "7h8hKh"),     # made flush
+        # Cat 6-8 (Premium) -> super 3
+        ("AhAs", "QdJd", "AcAd7c"),     # quads
+    ]
+
+    @cpp_required
+    @pytest.mark.parametrize("h0,h1,board", TREE_BOARDS,
+                             ids=[f"{b[0]}_on_{b[2]}" for b in TREE_BOARDS])
+    def test_tree_super_and_fine_match(self, h0, h1, board):
+        """C++ tree scheme matches Python tree scheme for same hand+board."""
+        try:
+            _eng.NLHEStateEncoder.set_scheme(1)  # tree
+            # C++ encode
+            actions = [_CHAR_TO_ENUM[a] for a in ("k",)]
+            cpp_state = make_cpp_state(h0, h1, board, actions)
+            cpp_vec = np.array(_eng.NLHEStateEncoder.encode_vec(cpp_state, 1),
+                               dtype=np.float32)
+            # Python encode with tree scheme
+            from src.deep_cfr.state_encoder import NLHEEncoder
+            NLHEEncoder._shared_equity_cache = None
+            py_enc = NLHEEncoder(starting_stack=200.0, equity_sims=2000,
+                                 bucket_scheme="tree")
+            hh0 = tuple(_cards(h0))
+            hh1 = tuple(_cards(h1))
+            bd  = tuple(_cards(board))
+            full = tuple(_full_board(list(hh0), list(hh1), list(bd)))
+            history = (hh0, hh1, full) + ("k",)
+            py_vec = py_enc.encode(history, 1)
+            # Compare super and fine slots
+            cpp_super = int(np.argmax(cpp_vec[8:12]))
+            cpp_fine  = int(np.argmax(cpp_vec[12:16]))
+            py_super  = int(np.argmax(py_vec[8:12]))
+            py_fine   = int(np.argmax(py_vec[12:16]))
+            assert cpp_super == py_super and cpp_fine == py_fine, (
+                f"{board}: super=({cpp_super},{py_super}) "
+                f"fine=({cpp_fine},{py_fine})"
+            )
+            # Both halves should sum to exactly 1.0 each.
+            assert sum(cpp_vec[8:12])  == pytest.approx(1.0)
+            assert sum(cpp_vec[12:16]) == pytest.approx(1.0)
+        finally:
+            _eng.NLHEStateEncoder.set_scheme(0)  # restore flat default
 
 
 # ── TestLegalActionsParity ───────────────────────────────────────────────────

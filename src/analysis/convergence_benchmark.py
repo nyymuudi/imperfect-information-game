@@ -15,13 +15,11 @@ Output: convergence_comparison.png
 """
 
 import time
-import numpy as np
 import matplotlib.pyplot as plt
 from src.games.kuhn import KuhnPoker
 from src.games.leduc import LeducHoldem
 from src.solvers.cfr import CFRSolver
 from src.solvers.mccfr import MCCFRSolver
-from src.analysis.convergence import ConvergenceTracker
 
 
 class TimedTracker:

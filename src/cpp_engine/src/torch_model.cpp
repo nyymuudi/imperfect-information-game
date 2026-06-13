@@ -142,6 +142,12 @@ private:
 // Card-abstracted encoder. Layout — see torch_model.hpp comment block.
 // NLHE_ACTION_ENC is defined in nlhe_game.hpp.
 
+// Process-global scheme. Set from Python (bindings) before training so the
+// MCCFR loop's encoder calls produce the right layout. Default: flat (v3).
+static int g_scheme = 0;
+void NLHEStateEncoder::set_scheme(int s) { g_scheme = s; }
+int  NLHEStateEncoder::get_scheme()      { return g_scheme; }
+
 void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     const float STACK = state.cfg.starting_stack;
     const float NORM  = 2.0f * STACK;
@@ -175,83 +181,157 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     if (pf_bucket < 0) pf_bucket = 0;
     out[pf_bucket] = 1.0f;
 
-    // dims [8:16]: board strength bucket one-hot (zeros preflop)
+    // Dim offsets parameterised on K_BOARD (must match Python encoder).
+    constexpr int BRD_OFF    = K_PREFLOP;               // 8
+    constexpr int STREET_OFF = BRD_OFF + K_BOARD;       // 24 when K_BOARD=16
+    constexpr int BET_OFF    = STREET_OFF + 4;          // 28
+    constexpr int HIST_OFF   = BET_OFF + 4;             // 32
+    constexpr int CONT_OFF   = HIST_OFF + 8;            // 40
+
+    // Board bucket — scheme-dependent.
+    //   Flat (g_scheme=0, v3 production): K_BOARD-way one-hot in [BRD_OFF:BRD_OFF+8].
+    //   Tree (g_scheme=1, experimental v5): two-hot — super in [BRD_OFF:BRD_OFF+4],
+    //                                       fine within super in [BRD_OFF+4:BRD_OFF+8].
     int n_visible = BOARD_CARDS_BY_STREET[state.street];
     float brd_str = board_strength(state, player);
     if (n_visible >= 3) {
-        int brd_bucket = std::min((int)(brd_str * K_BOARD), K_BOARD - 1);
-        out[8 + brd_bucket] = 1.0f;
+        int8_t cards[7];
+        cards[0] = state.hole_cards[player][0];
+        cards[1] = state.hole_cards[player][1];
+        for (int i = 0; i < n_visible && i < 5; ++i) cards[2+i] = state.board[i];
+        int n_eval = 2 + std::min(n_visible, 5);
+        int32_t score = HandEvaluator::evaluate(cards, n_eval);
+        int category = (score >> 24) & 0xFF;
+
+        // Rank multiplicities for sub-bin extraction (shared by both schemes).
+        int counts[13] = {0};
+        int top_rank  = 0;
+        for (int i = 0; i < n_eval; ++i) {
+            int r = cards[i] / 4;
+            if (r >= 0 && r < 13) counts[r]++;
+            if (r > top_rank) top_rank = r;
+        }
+        int pair_rank = -1;
+        for (int r = 12; r >= 0; --r) {
+            if (counts[r] >= 2) { pair_rank = r; break; }
+        }
+
+        if (g_scheme == 1 || g_scheme == 2 || g_scheme == 3) {
+            // ── Tree / super / tree42 scheme ──────────────────────────────────
+            // All three share super_idx computation; differ in fine layout:
+            //   scheme 1 (tree):   4-hot fine at [BRD+4:BRD+8]
+            //   scheme 2 (super):  no fine (zero)
+            //   scheme 3 (tree42): 2-hot fine at [BRD+4:BRD+6] (collapsed half)
+            int super_idx, fine_idx;
+            if (category == 0) {
+                super_idx = 0;
+                if (top_rank == 12)      fine_idx = 3;   // A
+                else if (top_rank == 11) fine_idx = 2;   // K
+                else if (top_rank >= 8)  fine_idx = 1;   // T-Q
+                else                     fine_idx = 0;   // 2-9
+            } else if (category == 1) {
+                super_idx = 1;
+                if (pair_rank == 12)      fine_idx = 3;
+                else if (pair_rank >= 10) fine_idx = 2;
+                else if (pair_rank >= 7)  fine_idx = 1;
+                else                      fine_idx = 0;
+            } else if (category >= 2 && category <= 5) {
+                super_idx = 2;
+                fine_idx  = category - 2;   // {twopair, trips, straight, flush}
+            } else {
+                super_idx = 3;
+                if (category == 6)      fine_idx = 0;    // FH
+                else if (category == 7) fine_idx = 1;    // quads
+                else                    fine_idx = (top_rank == 12) ? 3 : 2;  // royal vs SF
+            }
+            out[BRD_OFF + super_idx] = 1.0f;
+            if (g_scheme == 1) {
+                // Tree: 4-hot fine.
+                out[BRD_OFF + 4 + fine_idx] = 1.0f;
+            } else if (g_scheme == 3) {
+                // Tree42: collapse fine to 2-bin (0,1 → 0; 2,3 → 1).
+                int fine_2 = (fine_idx <= 1) ? 0 : 1;
+                out[BRD_OFF + 4 + fine_2] = 1.0f;
+            }
+            // Super (g_scheme == 2): only super_idx set.
+        } else {
+            // ── Flat scheme (v3 production) ───────────────────────────────────
+            int brd_bucket;
+            if (category >= 6) {
+                brd_bucket = 7;
+            } else if (category == 4 || category == 5) {
+                brd_bucket = 6;
+            } else if (category == 3) {
+                brd_bucket = 5;
+            } else if (category == 2) {
+                brd_bucket = 4;
+            } else if (category == 1) {
+                brd_bucket = (pair_rank >= 7) ? 3 : 2;
+            } else {
+                brd_bucket = (top_rank >= 9) ? 1 : 0;
+            }
+            out[BRD_OFF + brd_bucket] = 1.0f;
+        }
     }
 
-    // dims [16:20]: street one-hot
+    // Street one-hot
     int street = std::min((int)state.street, 3);
-    out[16 + street] = 1.0f;
+    out[STREET_OFF + street] = 1.0f;
 
-    // dims [20:24]: betting scalars
+    // Betting scalars
     float to_call = state.street_invest[1-player] - state.street_invest[player];
     to_call = std::max(0.0f, to_call);
-    out[20] = std::min(state.pot              / NORM,  1.0f);
-    out[21] = std::min(to_call               / NORM,  1.0f);
-    out[22] = std::min(state.stacks[player]   / STACK, 1.0f);
-    out[23] = std::min(state.stacks[1-player] / STACK, 1.0f);
+    out[BET_OFF + 0] = std::min(state.pot              / NORM,  1.0f);
+    out[BET_OFF + 1] = std::min(to_call                / NORM,  1.0f);
+    out[BET_OFF + 2] = std::min(state.stacks[player]   / STACK, 1.0f);
+    out[BET_OFF + 3] = std::min(state.stacks[1-player] / STACK, 1.0f);
 
-    // dims [24:32]: action history (last 8 actions)
-    static constexpr int HIST_START = 24;
+    // Action history (last 8 actions)
     static constexpr int HIST_SLOTS = 8;
     int hist_begin = std::max(0, state.action_count - HIST_SLOTS);
     for(int i = hist_begin; i < state.action_count; ++i) {
-        int slot   = HIST_START + (i - hist_begin);
+        int slot   = HIST_OFF + (i - hist_begin);
         int8_t act = state.action_history[i];
         if(act >= 0 && act < 4)
             out[slot] = NLHE_ACTION_ENC[act];
     }
 
-    // dim [32]: preflop equity (continuous)
-    out[32] = equity;
-
-    // dim [33]: board strength (continuous)
-    out[33] = brd_str;
-
-    // dim [34]: pot odds = to_call / (pot + to_call)
+    // Continuous tail
+    out[CONT_OFF + 0] = equity;
+    out[CONT_OFF + 1] = brd_str;
     float pot_plus_call = state.pot + to_call;
-    out[34] = (pot_plus_call > 1e-6f) ? (to_call / pot_plus_call) : 0.0f;
-
-    // dim [35]: SPR = min(stacks) / pot, normalised (cap at 10)
+    out[CONT_OFF + 2] = (pot_plus_call > 1e-6f) ? (to_call / pot_plus_call) : 0.0f;
     float eff_stack = std::min(state.stacks[0], state.stacks[1]);
-    out[35] = (state.pot > 1e-6f)
-              ? std::min(eff_stack / state.pot, 10.0f) / 10.0f
-              : 1.0f;
+    out[CONT_OFF + 3] = (state.pot > 1e-6f)
+                       ? std::min(eff_stack / state.pot, 10.0f) / 10.0f
+                       : 1.0f;
 
-    // Quantise continuous dims [20:36] to 1e-6 grid — matches Python encoder
-    // and NLHE state_key so identical nodes group identically.
-    for (int i = 20; i < STATE_SIZE; ++i)
-        out[i] = std::round(out[i] * 1e6f) / 1e6f;
+    // Quantise BET_OFF..STATE_SIZE to FEATURE_QUANT grid. floor(x/q + 0.5)
+    // matches numpy semantics on the 0.5 boundary (vs std::round).
+    constexpr float FEATURE_QUANT = 0.05f;
+    for (int i = BET_OFF; i < STATE_SIZE; ++i)
+        out[i] = std::floor(out[i] / FEATURE_QUANT + 0.5f) * FEATURE_QUANT;
 }
 
+// NOTE: this file previously hosted a Monte Carlo EHS cache + canonical-key
+// suit-isomorphism packing for board_strength. That path implemented v8's
+// continuous board feature (MC EHS vs random opponent), which regressed v3 by
+// +629 mbb/h in CRN+EV h2h (z=4.17). Reverted to the monotone hand-rank proxy
+// below. The MC EHS scaffolding lived in git history before this cleanup pass.
+
 float NLHEStateEncoder::board_strength(const NLHEState& state, int player) {
+    // v3 production: monotone hand-rank proxy normalised by this evaluator's
+    // max-possible packed score. Yksinkertainen, deterministinen, halpa.
+    // MC EHS -versio (v8) regressoi v3:a +629 mbb/h h2h:ssa, joten palautettu.
     int n_visible = BOARD_CARDS_BY_STREET[state.street];
-    if(n_visible < 3) return 0.0f;
+    if (n_visible < 3) return 0.0f;
     int8_t cards[7];
     cards[0] = state.hole_cards[player][0];
     cards[1] = state.hole_cards[player][1];
-    for(int i = 0; i < n_visible && i < 5; ++i) cards[2+i] = state.board[i];
+    for (int i = 0; i < n_visible && i < 5; ++i) cards[2 + i] = state.board[i];
     int n = 2 + std::min(n_visible, 5);
     int32_t score = HandEvaluator::evaluate(cards, n);
-
-    // NORMALISATION PARITY NOTE
-    // -------------------------
-    // Python normalises evaluate_7card by MAX_HAND_SCORE = _pack(8, 12), where
-    // _pack uses a base-15 positional scheme. This C++ HandEvaluator uses a
-    // different packing (encode_score: category<<24 | ranks<<...), so the raw
-    // integer scores are NOT comparable to Python's even though both rank hands
-    // identically. dim 121 is therefore a MONOTONE-but-not-bit-identical
-    // feature across implementations; this is an accepted residual documented
-    // in tests/test_parity.py (the parity test compares dims 0-111, not 120-121).
-    //
-    // We normalise by THIS evaluator's true maximum — straight flush, ace high:
-    // encode_score(8, {12}) = (8<<24) | (12<<20) — so the value lands in [0,1]
-    // without saturating the top category (the old 8<<24 constant let a royal
-    // flush exceed 1.0 before clamping, collapsing the strongest hands).
+    // MAX_SCORE = straight flush, ace high = encode_score(8, {12}).
     constexpr float MAX_SCORE = static_cast<float>((8 << 24) | (12 << 20));
     return std::min((float)score / MAX_SCORE, 1.0f);
 }

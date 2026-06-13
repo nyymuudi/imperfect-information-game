@@ -25,7 +25,7 @@ from src.games.postflop_nlhe import PostflopNLHE
 from src.deep_cfr.state_encoder import NLHEEncoder
 
 NLHE_NUM_ACTIONS = 4
-STATE_SIZE = 36
+STATE_SIZE = 36  # K_BOARD=8 → 28 + K_BOARD
 
 # Map PostflopNLHE action chars to the C++ NLHEAction enum slots.
 #   slot 0 = fold/check ('f' or 'c'), 1 = call ('k'), 2 = raise ('r'), 3 = all-in ('a')
@@ -38,14 +38,13 @@ ACTION_SLOT = {"f": 0, "c": 0, "k": 1, "r": 2, "a": 3}
 #          sim counts produce slightly different values for the same hand.
 #   dim 33 (board_strength): different score-packing/normalisation per evaluator.
 # Both are excluded from the parity key — the BUCKET dims [0:8] and [8:16] capture
-# the same discretised signal and ARE bit-identical (when equity values agree on
-# the bucket boundary, which they do for K=8 wide bins).
+# the same discretised signal and ARE bit-identical.
 _KEY_DIMS = [i for i in range(STATE_SIZE) if i not in (32, 33)]
 
 
 def _state_key(sv):
     """Quantise the parity-relevant dims to a 1e-6 grid; pack as int32 bytes.
-    Excludes dims 120-121 (equity/board_strength) — see note above."""
+    Excludes dims 32-33 (equity/board_strength) — see note above."""
     arr = np.asarray(sv, dtype=np.float64)[_KEY_DIMS]
     q = np.rint(arr * 1e6).astype(np.int32)
     return q.tobytes()

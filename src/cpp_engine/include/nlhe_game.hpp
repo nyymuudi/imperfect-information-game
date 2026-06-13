@@ -79,6 +79,12 @@ struct NLHEState {
     bool    folded[2];
     bool    terminal;
     float   payoff_p0;         // P0's net gain (signed)
+    // EV-adjusted MCCFR support: track the street at which both players
+    // first became all-in (both stacks == 0). -1 means "not all-in" or
+    // "one-sided fold". On terminal-with-showdown, if 0 ≤ all_in_street < 3,
+    // the post-betting board cards are runout variance that the equity-
+    // adjusted terminal value should integrate over rather than use directly.
+    int8_t  all_in_street;
     NLHEGameConfig cfg;
 };
 

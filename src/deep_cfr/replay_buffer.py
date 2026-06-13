@@ -34,7 +34,7 @@ Reference: Vitter (1985). "Random Sampling with a Reservoir."
 """
 
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

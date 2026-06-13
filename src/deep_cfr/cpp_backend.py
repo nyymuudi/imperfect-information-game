@@ -7,7 +7,7 @@ are identical to LibTorch inference features.
 """
 
 from __future__ import annotations
-import os, sys, warnings
+import sys, warnings
 from pathlib import Path
 from typing import Optional
 import torch
@@ -196,7 +196,7 @@ class NLHECppBackend:
     conflicting-one-hot pathology that _collapse_by_state exists to remove.
     """
 
-    STATE_SIZE = 36  # matches NLHEStateEncoder::STATE_SIZE (card-abstracted)
+    STATE_SIZE = 36  # matches NLHEStateEncoder::STATE_SIZE (K_BOARD=8)
 
     def __init__(self, n_traversals=500, regret_capacity=1 << 20,
                  strategy_capacity=1 << 20, device="cpu", seed=42,

@@ -104,7 +104,6 @@ class CardAbstraction:
         for i in range(self.num_buckets):
             lo, hi = self.bucket_ranges[i]
             count = len(bucket_counts[i])
-            exemplar = self.bucket_exemplars[i]
             hands_sample = ", ".join(sorted(bucket_counts[i])[:5])
             if count > 5:
                 hands_sample += f", ... (+{count - 5})"

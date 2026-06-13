@@ -11,8 +11,9 @@ dist/
 *.onnx
 blueprints/
 
-# Web-deploy: public/models/*.onnx commitoidaan (selain tarvitsee ne)
+# Web-deploy: public/models/*.onnx + manifest commitoidaan (selain tarvitsee ne)
 !web/public/models/*.onnx
+!web/public/models/model_manifest.json
 
 # C++ build
 *.so
@@ -45,9 +46,28 @@ web/.env.local
 .vscode/settings.json
 .idea/
 
-# Istuntokohtaiset korjaus-/diagnoosiskriptit
-*.bak[0-9]
-fix_*.py
-diagnose_*.py
-retune_*.py
-add_regression_test.py
+# Istuntokohtaiset juurihakemiston korjaus-/diagnoosiskriptit
+# (käyttöskenaarioissa "fix_foo.py" -tyyppisiä; rajataan juureen,
+# scripts/-alikansion sisältö (esim. scripts/diagnose_expl_vs_h2h.py) pidetään git:ssä)
+/*.bak[0-9]
+/fix_*.py
+/diagnose_*.py
+/retune_*.py
+/add_regression_test.py
+
+# Experiment tracking — paikalliset DB:t ja artefaktit, älä committoi
+optuna.db
+mlflow.db
+mlruns/
+mlartifacts/
+
+# Graphify knowledge-graph -työkalu — generoituu paikallisesti
+graphify-out/
+
+# Validation-koulutuslokit — voivat paisua nopeasti, säilyy paikallisesti
+validation_runs/
+
+# Python virtual envit
+.venv/
+venv/
+.env

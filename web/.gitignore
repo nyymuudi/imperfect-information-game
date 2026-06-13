@@ -24,3 +24,20 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Coverage
+/coverage/
+
+# Test artefakti
+/test-results/
+/playwright-report/
+
+# Editor
+.vscode/settings.json
+.idea/
+
+# Vercel deployment artefakti
+.vercel/
+
+# Onnxruntime-web ladatut wasm-artefaktit (jos ovat ./public/-juuressa)
+# (web/public/models/*.onnx ovat tarkoituksellisesti git:ssä)

@@ -98,6 +98,41 @@ async function _inferSingle(input: EncodeInput): Promise<ActionProbs> {
   return _toActionProbs(output[session.outputNames[0]].data as Float32Array, 0)
 }
 
+/**
+ * Raw probability query — accepts an already-encoded state vector and the
+ * number of legal actions, returns the action-mask-respecting probability
+ * vector as a Float32Array of length `numLegalActions`.
+ *
+ * Used by SafeSubgameSolver (web/src/lib/cfr/subgame-solver.ts) which encodes
+ * its own state vectors via the SubgameGame wrapper. Keeps the solver
+ * decoupled from queryStrategy's EncodeInput shape.
+ */
+export async function queryStrategyRaw(
+  state: Float32Array,
+  numLegalActions: number,
+): Promise<Float32Array> {
+  const session = await getSession()
+  const stateTensor = new ort.Tensor('float32', state, [1, STATE_SIZE])
+  const mask = new Float32Array(4)
+  for (let i = 0; i < Math.min(numLegalActions, 4); i++) mask[i] = 1.0
+  const maskTensor  = new ort.Tensor('float32', mask, [1, 4])
+  const output      = await session.run({ state: stateTensor, action_mask: maskTensor })
+  const logits      = output[session.outputNames[0]].data as Float32Array
+  const out = new Float32Array(numLegalActions)
+  let total = 0
+  for (let i = 0; i < numLegalActions; i++) {
+    const v = Math.max(logits[i] ?? 0, 0)
+    out[i] = v
+    total += v
+  }
+  if (total > 1e-7) {
+    for (let i = 0; i < numLegalActions; i++) out[i] /= total
+  } else {
+    out.fill(1 / numLegalActions)
+  }
+  return out
+}
+
 // ── Batch inference ───────────────────────────────────────────────────────────
 
 /**

@@ -40,7 +40,7 @@ from dataclasses import dataclass
 
 from typing import Optional
 
-from ..games.base import ExtensiveFormGame, History, Action, InfoSetKey
+from ..games.base import ExtensiveFormGame, History
 from .state_encoder import StateEncoder
 from .replay_buffer import ReservoirBuffer
 from .networks import (
@@ -92,6 +92,18 @@ class DeepCFRSolver:
     # 0.0 = ei diskontausta (vanilla Deep CFR).
     dcfr_alpha: float = 1.5
     dcfr_beta:  float = 0.0
+    # Iteraation jälkeen lr_decay_start regret-LR kerrotaan lr_decay_factor:lla
+    # joka iteraatio. 1.0 = ei decay:tä. Auttaa kun buffer saturoi ja kohde
+    # muuttuu hitaammin — pienempi LR vähentää kohinaa myöhäisissä iteraatioissa.
+    lr_decay_start:  int   = 100
+    lr_decay_factor: float = 1.0
+    # Seed C++ MCCFR -enginelle (samplaus-RNG). Multi-run baseline:lla eri
+    # seed tuottaa eri näytteet samoilla hyperparametreilla → eri blueprint.
+    seed: int = 42
+    # Strategy-verkon fine-tune: pääajon jälkeen ekstra-epochit pienemmällä
+    # LR:llä. 0 epochs = pois päältä (vanha käytös). Käyttää strategy_bufferia.
+    finetune_epochs: int   = 0
+    finetune_lr:     float = 1e-4
 
     def __post_init__(self):
         state_sz  = self.encoder.state_size()
@@ -119,7 +131,7 @@ class DeepCFRSolver:
         self._cfrplus_regret = {}
 
         self.iterations = 0
-        self._rng = np.random.default_rng(42)
+        self._rng = np.random.default_rng(self.seed)
 
         self._cpp = None
         if self.use_cpp_engine:
@@ -135,6 +147,7 @@ class DeepCFRSolver:
                         raise_fraction=self.game.raise_fractions[0],
                         max_raises=self.game.max_raises_per_street,
                         regret_target=self.regret_target,
+                        seed=self.seed,
                     )
                 else:
                     self._cpp = CppMCCFRBackend(
@@ -391,6 +404,11 @@ class DeepCFRSolver:
                         state_sz, self.max_actions, self.hidden_size
                     ).to(net_device)
                     train_lr = self.lr
+                # LR decay buffer-saturaation jälkeen: vähentää myöhäisten
+                # iteraatioiden kohinaa kun kohde muuttuu hitaammin.
+                if self.lr_decay_factor < 1.0 and self.iterations > self.lr_decay_start:
+                    decay_steps = self.iterations - self.lr_decay_start
+                    train_lr *= self.lr_decay_factor ** decay_steps
                 self._last_regret_loss = train_regret_network(
                     self.regret_net, self.regret_buffer,
                     epochs=self.train_epochs,
@@ -409,6 +427,18 @@ class DeepCFRSolver:
                 batch_size=self.train_batch,
                 lr=self.lr,
             )
+            # Fine-tune phase: ekstra-epochit pienemmällä LR:llä.
+            # Painottuu strategy-bufferin Linear-CFR-painojen kautta
+            # automaattisesti myöhäisiin iteraatioihin.
+            if self.finetune_epochs > 0:
+                print(f"Fine-tuning strategy net "
+                      f"({self.finetune_epochs} epochs @ lr={self.finetune_lr})")
+                train_strategy_network(
+                    self.strategy_net, self.strategy_buffer,
+                    epochs=self.finetune_epochs,
+                    batch_size=self.train_batch,
+                    lr=self.finetune_lr,
+                )
 
         return self.strategy_net
 

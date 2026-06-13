@@ -95,6 +95,7 @@ NLHEState NLHEGame::initial_state(const NLHEDeal& deal, const NLHEGameConfig& cf
     s.folded[0]=s.folded[1]=false;
     s.terminal        = false;
     s.payoff_p0       = 0.0f;
+    s.all_in_street   = -1;
     std::fill(s.action_history, s.action_history+NLHE_MAX_HISTORY, int8_t(-1));
     return s;
 }
@@ -178,6 +179,11 @@ static void advance_street(NLHEState& s) {
 // ── Apply action ──────────────────────────────────────────────────────────────
 NLHEState NLHEGame::apply_action(const NLHEState& state, NLHEAction action) {
     NLHEState s = state;
+    // Snapshot the street BEFORE applying the action — used for all_in_street
+    // tracking, since a calling action may auto-advance street to the next one
+    // (e.g. preflop call closes preflop and advances to flop). We want the
+    // street at which the decision was made, not the next street.
+    int8_t pre_action_street = s.street;
     if(s.action_count < NLHE_MAX_HISTORY)
         s.action_history[s.action_count++] = static_cast<int8_t>(action);
 
@@ -239,6 +245,16 @@ NLHEState NLHEGame::apply_action(const NLHEState& state, NLHEAction action) {
     }
 
     default: break;
+    }
+
+    // EV-adjusted MCCFR tracking: the first moment both stacks hit 0 — that's
+    // the street at which betting effectively ended. Any board cards revealed
+    // beyond this street are "runout variance" rather than reactable info.
+    // We use pre_action_street so a call that closes preflop is recorded as
+    // street 0, not the post-advance street 1.
+    if (s.all_in_street == -1
+        && s.stacks[0] <= 1e-6f && s.stacks[1] <= 1e-6f) {
+        s.all_in_street = pre_action_street;
     }
     return s;
 }

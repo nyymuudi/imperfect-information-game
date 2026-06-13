@@ -189,6 +189,13 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def("strategy_model_loaded",  &NLHEMCCFREngine::strategy_model_loaded)
         .def("query_preflop_strategy", &NLHEMCCFREngine::query_preflop_strategy,
              py::arg("hole0"), py::arg("hole1"))
+        .def_static("set_ev_adjusted_terminals",
+                    &NLHEMCCFREngine::set_ev_adjusted_terminals,
+                    py::arg("on"),
+                    "Enable equity-over-runout terminal values for all-in showdowns. "
+                    "Variance-reducing — same all-in spot always gets same target.")
+        .def_static("get_ev_adjusted_terminals",
+                    &NLHEMCCFREngine::get_ev_adjusted_terminals)
         .def("query_strategy",         &NLHEMCCFREngine::query_strategy,
              py::arg("hole0"), py::arg("hole1"), py::arg("street"),
              py::arg("board"), py::arg("pot"), py::arg("to_call"),
@@ -243,7 +250,11 @@ PYBIND11_MODULE(cfr_engine, m) {
             [](const NLHEState& s, int player){
                 return NLHEStateEncoder::encode_vec(s, player);
             },
-            py::arg("state"), py::arg("player"));
+            py::arg("state"), py::arg("player"))
+        .def_static("set_scheme", &NLHEStateEncoder::set_scheme,
+            py::arg("scheme"),
+            "0 = flat (v3 production), 1 = tree (hierarchical two-hot).")
+        .def_static("get_scheme", &NLHEStateEncoder::get_scheme);
 
     m.attr("NLHE_STACK")      = NLHE_STACK;
     m.attr("NLHE_BB")         = NLHE_BB;

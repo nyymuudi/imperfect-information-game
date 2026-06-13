@@ -321,7 +321,6 @@ def preflop_equity_table(
     """
     if use_disk_cache:
         import json
-        from pathlib import Path
         path = _equity_table_cache_path(num_simulations)
         if path.exists():
             try:
@@ -336,7 +335,6 @@ def preflop_equity_table(
 
     if use_disk_cache:
         import json
-        from pathlib import Path
         path = _equity_table_cache_path(num_simulations)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

@@ -4,8 +4,179 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <unordered_map>
 
 namespace cfr {
+
+// ── EV-adjusted terminal values ──────────────────────────────────────────────
+// At all-in showdown terminals, replacing the deterministic deal-specific
+// runout with the equity over remaining board cards is a variance-reduction
+// technique known in poker as "all-in adjusted" or "Sklansky bucks". For
+// Deep CFR it has the same effect on regret targets: the same all-in spot
+// played multiple times always gets the same expected value rather than a
+// noisy realisation. Tighter regret targets → faster, cleaner convergence.
+//
+// Runtime cost: equity enumeration scales with remaining cards. Flop-all-in
+// = C(45,2) = 990 evaluations. Turn-all-in = 44. Preflop-all-in = MC over
+// 2000 samples. Cached by (hole_a, hole_b, board, n_visible) — all-in spots
+// repeat aggressively during training so cache hit rate is very high.
+static bool g_ev_adjusted_terminals = false;
+
+// Cache key packs hole_a (2 cards) + hole_b (2 cards) + board (up to 5).
+// Hole pairs are sorted independently so order within a pair doesn't matter.
+namespace {
+    inline uint64_t pack_equity_key(const int8_t* ha, const int8_t* hb,
+                                     const int8_t* board, int n_visible) {
+        int a0 = std::min((int)ha[0], (int)ha[1]);
+        int a1 = std::max((int)ha[0], (int)ha[1]);
+        int b0 = std::min((int)hb[0], (int)hb[1]);
+        int b1 = std::max((int)hb[0], (int)hb[1]);
+        // Canonical orientation: order players so a < b lexicographically.
+        // This makes equity_for(a,b) == 1 - equity_for(b,a) consistent and
+        // doubles cache hit rate.
+        if (a0 > b0 || (a0 == b0 && a1 > b1)) {
+            std::swap(a0, b0); std::swap(a1, b1);
+        }
+        uint64_t k = (uint64_t)(a0 & 0xFF)        // 8 bits
+                   | ((uint64_t)(a1 & 0xFF) << 8)
+                   | ((uint64_t)(b0 & 0xFF) << 16)
+                   | ((uint64_t)(b1 & 0xFF) << 24);
+        for (int i = 0; i < n_visible && i < 5; ++i) {
+            k |= ((uint64_t)(uint8_t)board[i]) << (32 + i * 6);
+        }
+        // Sign bit indicates whether we swapped — caller uses this to flip.
+        return k;
+    }
+
+    static std::unordered_map<uint64_t, float> g_equity_cache;
+    constexpr size_t EQUITY_CACHE_MAX = 50'000'000ULL;
+
+    inline uint64_t splitmix64(uint64_t x) {
+        x += 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    }
+
+    // Compute p0's equity vs p1's specific hand over remaining board cards.
+    // Cached. Returns float in [0, 1].
+    float equity_p0_vs_p1(const int8_t* ha, const int8_t* hb,
+                           const int8_t* board, int n_visible) {
+        // Cache lookup with player swap.
+        int a0 = std::min((int)ha[0], (int)ha[1]);
+        int a1 = std::max((int)ha[0], (int)ha[1]);
+        int b0 = std::min((int)hb[0], (int)hb[1]);
+        int b1 = std::max((int)hb[0], (int)hb[1]);
+        bool swapped = (a0 > b0 || (a0 == b0 && a1 > b1));
+
+        uint64_t key = pack_equity_key(ha, hb, board, n_visible);
+        auto it = g_equity_cache.find(key);
+        if (it != g_equity_cache.end()) {
+            return swapped ? (1.0f - it->second) : it->second;
+        }
+
+        // Compute.
+        bool dead[52] = {false};
+        dead[ha[0]] = dead[ha[1]] = dead[hb[0]] = dead[hb[1]] = true;
+        for (int i = 0; i < n_visible; ++i) dead[board[i]] = true;
+        int live[52], live_n = 0;
+        for (int c = 0; c < 52; ++c) if (!dead[c]) live[live_n++] = c;
+
+        int needed = 5 - n_visible;
+        int8_t hand_a[7], hand_b[7];
+        hand_a[0] = ha[0]; hand_a[1] = ha[1];
+        hand_b[0] = hb[0]; hand_b[1] = hb[1];
+        for (int i = 0; i < n_visible; ++i) {
+            hand_a[2 + i] = board[i];
+            hand_b[2 + i] = board[i];
+        }
+
+        float wins = 0.0f;
+        int   total = 0;
+
+        if (needed == 0) {
+            int32_t sa = HandEvaluator::evaluate(hand_a, 7);
+            int32_t sb = HandEvaluator::evaluate(hand_b, 7);
+            wins = (sa > sb) ? 1.0f : (sa < sb ? 0.0f : 0.5f);
+            total = 1;
+        } else if (needed == 1) {
+            for (int i = 0; i < live_n; ++i) {
+                hand_a[2 + n_visible] = (int8_t)live[i];
+                hand_b[2 + n_visible] = (int8_t)live[i];
+                int32_t sa = HandEvaluator::evaluate(hand_a, 7);
+                int32_t sb = HandEvaluator::evaluate(hand_b, 7);
+                if (sa > sb) wins += 1.0f;
+                else if (sa == sb) wins += 0.5f;
+                ++total;
+            }
+        } else if (needed == 2) {
+            for (int i = 0; i < live_n; ++i) {
+                for (int j = i + 1; j < live_n; ++j) {
+                    hand_a[2 + n_visible]     = (int8_t)live[i];
+                    hand_a[2 + n_visible + 1] = (int8_t)live[j];
+                    hand_b[2 + n_visible]     = (int8_t)live[i];
+                    hand_b[2 + n_visible + 1] = (int8_t)live[j];
+                    int32_t sa = HandEvaluator::evaluate(hand_a, 7);
+                    int32_t sb = HandEvaluator::evaluate(hand_b, 7);
+                    if (sa > sb) wins += 1.0f;
+                    else if (sa == sb) wins += 0.5f;
+                    ++total;
+                }
+            }
+        } else {
+            // Preflop / flop all-in needing 3-5 more cards: MC.
+            constexpr int N_SIMS = 2000;
+            uint64_t seed = splitmix64(key);
+            for (int s = 0; s < N_SIMS; ++s) {
+                // Partial Fisher-Yates.
+                int pool[52];
+                for (int i = 0; i < live_n; ++i) pool[i] = live[i];
+                for (int i = 0; i < needed; ++i) {
+                    seed = splitmix64(seed);
+                    int r = i + int(seed % uint64_t(live_n - i));
+                    std::swap(pool[i], pool[r]);
+                    hand_a[2 + n_visible + i] = (int8_t)pool[i];
+                    hand_b[2 + n_visible + i] = (int8_t)pool[i];
+                }
+                int32_t sa = HandEvaluator::evaluate(hand_a, 7);
+                int32_t sb = HandEvaluator::evaluate(hand_b, 7);
+                if (sa > sb) wins += 1.0f;
+                else if (sa == sb) wins += 0.5f;
+                ++total;
+            }
+        }
+
+        float eq = (total > 0) ? (wins / float(total)) : 0.5f;
+        if (g_equity_cache.size() < EQUITY_CACHE_MAX) {
+            g_equity_cache[key] = eq;
+        }
+        return swapped ? (1.0f - eq) : eq;
+    }
+}  // namespace
+
+// Public API surfaced via bindings.
+void NLHEMCCFREngine::set_ev_adjusted_terminals(bool on) {
+    g_ev_adjusted_terminals = on;
+}
+bool NLHEMCCFREngine::get_ev_adjusted_terminals() {
+    return g_ev_adjusted_terminals;
+}
+
+// Compute the terminal value for player 0. Falls back to state.payoff_p0
+// unless EV-adjusted mode is on AND this terminal was an all-in showdown
+// (both hands present, betting ended before the river).
+inline float terminal_payoff_p0(const NLHEState& s) {
+    if (!g_ev_adjusted_terminals) return s.payoff_p0;
+    if (s.folded[0] || s.folded[1])  return s.payoff_p0;
+    if (s.all_in_street < 0 || s.all_in_street >= 3) return s.payoff_p0;
+    int n_visible = BOARD_CARDS_BY_STREET[s.all_in_street];
+    float eq_p0 = equity_p0_vs_p1(
+        s.hole_cards[0], s.hole_cards[1], s.board, n_visible);
+    float inv0 = s.cfg.starting_stack - s.stacks[0];
+    float inv1 = s.cfg.starting_stack - s.stacks[1];
+    float pot = inv0 + inv1;
+    return eq_p0 * pot - inv0;
+}
 
 NLHEMCCFREngine::NLHEMCCFREngine(const NLHETraversalConfig& config)
     : config_(config),
@@ -163,7 +334,7 @@ float NLHEMCCFREngine::traverse_cb(
     const NLHEState& state,int tp,float r_tp,float r_opp,
     const NLHEStrategyFn& fn)
 {
-    if(state.terminal) return (tp==0)?state.payoff_p0:-state.payoff_p0;
+    if(state.terminal) { float v = terminal_payoff_p0(state); return (tp==0)?v:-v; }
     const int p=state.current_player;
     const auto legal=NLHEGame::legal_actions(state);
     const int  n=(int)legal.size();
@@ -213,7 +384,7 @@ void NLHEMCCFREngine::run_traversals_model(int tp) {
 float NLHEMCCFREngine::traverse_model(
     const NLHEState& state,int tp,float r_tp,float r_opp)
 {
-    if(state.terminal) return (tp==0)?state.payoff_p0:-state.payoff_p0;
+    if(state.terminal) { float v = terminal_payoff_p0(state); return (tp==0)?v:-v; }
     const int p=state.current_player;
     const auto legal=NLHEGame::legal_actions(state);
     const int  n=(int)legal.size();
@@ -262,7 +433,7 @@ void NLHEMCCFREngine::run_full_traversal_deal_uniform(int tp, const NLHEDeal& de
 float NLHEMCCFREngine::traverse_full(
     const NLHEState& state, int tp, float r_opp, const NLHEStrategyFn& fn)
 {
-    if(state.terminal) return (tp==0)?state.payoff_p0:-state.payoff_p0;
+    if(state.terminal) { float v = terminal_payoff_p0(state); return (tp==0)?v:-v; }
     const int p=state.current_player;
     const auto legal=NLHEGame::legal_actions(state);
     const int  n=(int)legal.size();

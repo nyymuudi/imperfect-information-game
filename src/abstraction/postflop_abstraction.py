@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .equity import evaluate_7card, evaluate_5card
+from .equity import evaluate_7card
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────

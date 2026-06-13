@@ -1,19 +1,26 @@
 /**
- * TypeScript port of NLHEStateEncoder (src/cpp_engine/src/torch_model.cpp)
+ * TypeScript port of NLHEStateEncoder (src/cpp_engine/src/torch_model.cpp).
  *
- * Card-abstracted layout (36 dims):
- *   [0:8]   preflop hand bucket one-hot (K=8, bins on equity ∈ [0,1])
- *   [8:16]  board EHS bucket one-hot    (K=8; zeros preflop)
- *   [16:20] street one-hot (0=preflop, 1=flop, 2=turn, 3=river)
- *   [20]    pot / (2 * starting_stack)
- *   [21]    to_call / (2 * starting_stack)
- *   [22]    my_stack / starting_stack
- *   [23]    opp_stack / starting_stack
- *   [24:32] action history — last 8 actions (ACTION_ENC values)
- *   [32]    preflop equity (continuous)
- *   [33]    board_strength (continuous)
- *   [34]    pot odds = to_call / (pot + to_call)
- *   [35]    SPR = min(stacks) / pot, normalised (cap at 10)
+ * 2026-06-12: aktiivinen blueprint v7_long_production (1500-iter, tree42).
+ * Encoder palautettu tree42-skeemaan tämän blueprintin tueksi. v3_coarse
+ * (flat) ei toimi tällä encoderilla; jos haluat fallback v3:een, vaihda
+ * BUCKET_SCHEME='flat' ja revertaa _boardSuperFine kutsuva kohta encode():ssa.
+ *
+ * Card-abstracted layout (36 dims, tree42 board):
+ *   [0:8]    preflop hand bucket one-hot (K=8, bins on equity ∈ [0,1])
+ *   [8:12]   board super one-hot         (4-way: HC/Pair/Made/Premium; zero preflop)
+ *   [12:14]  board fine one-hot          (2-way low/high half of fine_4; zero preflop)
+ *   [14:16]  RESERVED zero                (säilytetään 36-dim state-size:lle)
+ *   [16:20]  street one-hot (0=preflop, 1=flop, 2=turn, 3=river)
+ *   [20]     pot / (2 * starting_stack)
+ *   [21]     to_call / (2 * starting_stack)
+ *   [22]     my_stack / starting_stack
+ *   [23]     opp_stack / starting_stack
+ *   [24:32]  action history — last 8 actions (ACTION_ENC values)
+ *   [32]     preflop equity (continuous)
+ *   [33]     board_strength (continuous, hand-rank/MAX proxy)
+ *   [34]     pot odds = to_call / (pot + to_call)
+ *   [35]     SPR = min(stacks) / pot, normalised (cap at 10)
  *
  * Card encoding: card = rank * 4 + suit
  *   rank: 0=2, 1=3, ..., 12=A
@@ -23,6 +30,7 @@
 export const STATE_SIZE = 36
 export const K_PREFLOP  = 8
 export const K_BOARD    = 8
+export const BUCKET_SCHEME = 'tree42' as const
 // Equity range for normalised preflop bucket (from 2000-sim table):
 //   weakest hand 72o ≈ 0.316, strongest AA ≈ 0.842.
 export const EQ_MIN = 0.316
@@ -97,7 +105,7 @@ function _straightHigh(ranksSorted: number[]): number {
   return -1
 }
 
-function _evaluateCards(cards: number[]): number {
+export function _evaluateCards(cards: readonly number[]): number {
   const ranks = cards.map(c => Math.floor(c / 4))
   const suits = cards.map(c => c % 4)
 
@@ -157,6 +165,96 @@ export function boardStrength(
 }
 
 /**
+ * Detect 5-7 card hand category 0-8 (HC..SF). Used by tree42 bucket logic.
+ * Matches NLHEStateEncoder hand-evaluator categorisation in C++.
+ */
+function _handCategory(cards: number[]): number {
+  const ranks = cards.map(c => Math.floor(c / 4))
+  const suits = cards.map(c => c % 4)
+  const suitCnt = [0, 0, 0, 0]
+  for (const s of suits) suitCnt[s]++
+  const flushSuit = suitCnt.findIndex(c => c >= 5)
+  const flushRanks = flushSuit >= 0
+    ? cards.filter(c => c % 4 === flushSuit).map(c => Math.floor(c / 4)).sort((a, b) => b - a)
+    : []
+  const ranksSorted = [...ranks].sort((a, b) => b - a)
+  const sfHigh  = flushRanks.length >= 5 ? _straightHigh(flushRanks) : -1
+  const strHigh = _straightHigh(ranksSorted)
+  const cnt = new Array<number>(13).fill(0)
+  for (const r of ranks) cnt[r]++
+  const hasQuads = cnt.some(c => c === 4)
+  const tripsCnt = cnt.filter(c => c === 3).length
+  const pairsCnt = cnt.filter(c => c === 2).length
+  if (sfHigh >= 0)                                return 8 // SF
+  if (hasQuads)                                   return 7 // quads
+  if (tripsCnt > 0 && (pairsCnt > 0 || tripsCnt > 1))
+                                                  return 6 // full house
+  if (flushRanks.length >= 5)                     return 5 // flush
+  if (strHigh >= 0)                               return 4 // straight
+  if (tripsCnt > 0)                               return 3 // trips
+  if (pairsCnt >= 2)                              return 2 // two pair
+  if (pairsCnt === 1)                             return 1 // pair
+  return 0 // high card
+}
+
+/**
+ * Tree42 super+fine board encoding:
+ *   super_idx ∈ 0..3 (HC, Pair, MadeNonPaired, Premium)
+ *   fine_4    ∈ 0..3 sub-bin within super (kategoriaspesifinen)
+ *   fine_2    = fine_4 ≤ 1 ? 0 : 1 (kollapsoitu low/high half)
+ *
+ * Matches C++ scheme=3 branch in NLHEStateEncoder::encode().
+ */
+function _boardSuperFine(
+  holeCards: [number, number],
+  boardCards: number[],
+): { superIdx: number; fine2: number } | null {
+  if (boardCards.length < 3) return null
+  const allCards = [...holeCards, ...boardCards]
+  const cat = _handCategory(allCards)
+  const ranks = allCards.map(c => Math.floor(c / 4))
+  const cnt = new Array<number>(13).fill(0)
+  for (const r of ranks) cnt[r]++
+
+  let superIdx = 0
+  let fine4 = 0
+
+  if (cat === 0) {
+    superIdx = 0
+    const topRank = Math.max(...ranks)
+    if (topRank === 12)      fine4 = 3   // A
+    else if (topRank === 11) fine4 = 2   // K
+    else if (topRank >= 8)   fine4 = 1   // T-Q
+    else                     fine4 = 0   // 2-9
+  } else if (cat === 1) {
+    superIdx = 1
+    let pairRank = -1
+    for (let r = 12; r >= 0; r--) {
+      if (cnt[r] >= 2) { pairRank = r; break }
+    }
+    if (pairRank === 12)      fine4 = 3
+    else if (pairRank >= 10)  fine4 = 2
+    else if (pairRank >= 7)   fine4 = 1
+    else                      fine4 = 0
+  } else if (cat >= 2 && cat <= 5) {
+    superIdx = 2
+    fine4 = cat - 2  // {twopair, trips, straight, flush}
+  } else {
+    superIdx = 3
+    if (cat === 6)      fine4 = 0  // FH
+    else if (cat === 7) fine4 = 1  // quads
+    else {
+      // SF: royal (top rank = A) vs non-royal
+      const topRank = Math.max(...ranks)
+      fine4 = (topRank === 12) ? 3 : 2
+    }
+  }
+
+  const fine2 = fine4 <= 1 ? 0 : 1
+  return { superIdx, fine2 }
+}
+
+/**
  * Encode game state into a 36-dim Float32Array.
  * Identical layout to NLHEStateEncoder::encode() in torch_model.cpp.
  */
@@ -174,12 +272,16 @@ export function encode(input: EncodeInput): Float32Array {
   const pfBucket = Math.min(Math.floor(eqNorm * K_PREFLOP), K_PREFLOP - 1)
   out[pfBucket] = 1.0
 
-  // [8:16] board strength bucket one-hot (zeros preflop)
+  // [8:16] tree42 board encoding:
+  //   [8:12]  super one-hot
+  //   [12:14] fine_2 one-hot
+  //   [14:16] reserved zero
   const visibleBoard = boardCards.slice(0, nVisible)
   const brdStr = boardStrength(holeCards, visibleBoard)
-  if (nVisible >= 3) {
-    const brdBucket = Math.min(Math.floor(brdStr * K_BOARD), K_BOARD - 1)
-    out[8 + brdBucket] = 1.0
+  const tree42 = _boardSuperFine(holeCards, visibleBoard)
+  if (tree42 !== null) {
+    out[8 + tree42.superIdx] = 1.0
+    out[12 + tree42.fine2]   = 1.0
   }
 
   // [16:20] street one-hot
