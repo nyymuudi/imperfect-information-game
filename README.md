@@ -141,6 +141,10 @@ Tabular CFR is memory-bounded at ~10⁶ info sets. Deep CFR removes the memory c
 
 The raw traversal speedup (51.6× on Leduc) does not translate directly to end-to-end speedup. Two additional bottlenecks must be addressed simultaneously: (1) Python GIL overhead on per-node network inference eliminates the traversal gain entirely — LibTorch inline inference is mandatory; (2) O(N) Python buffer insertion dominates at 50–100k samples/iteration and requires vectorised numpy batch operations.
 
+### 8. Pre-computed advisor cache + auxiliary loss can lift Deep CFR past its plateau
+
+Deep CFR's regret network converges to a noisy approximation of the true regret at each info set, capped by network capacity and sample efficiency. Pre-solving a small set of representative public states with deeper local CFR (a "CFR advisor cache") and feeding the resulting action probabilities + EVs into the encoder as extra input dims gives the network ground-truth value information it would otherwise have to learn from scratch. The catch: a naive aux input gets *ignored* — the network finds it can solve regret-matching without the advisor, so the gradient through those dims collapses. Adding an auxiliary EV-prediction head that forces the shared trunk to *reproduce* the cache's EV signal recovers the benefit. The current production blueprint (50BB, 500 iter, cache-augmented) reaches **761 ± 88 mbb/decision** LBR exploitability — a ~210 mbb/dec improvement over the same-budget cache-less baseline (v14d_fixed @ 975 ± 136). The same recipe extends to multi-raise blueprints: a 3-sizing 50BB blueprint with the cache improves from ~1267 to **884 ± 97** mbb/dec (z = +2.09 vs the no-cache baseline).
+
 ## C++ MCCFR Engine with LibTorch
 
 ### Performance
@@ -203,10 +207,12 @@ src/
 │
 ├── deep_cfr/
 │   ├── deep_cfr_solver.py   # Deep CFR training loop
-│   ├── networks.py          # RegretNetwork (Huber) + StrategyNetwork (softmax)
+│   ├── networks.py          # RegretNetwork (Huber, optional aux-EV head) + StrategyNetwork (softmax)
 │   ├── replay_buffer.py     # Reservoir + sliding-window buffers, add_batch
-│   ├── state_encoder.py     # LeducEncoder (20-dim) + NLHEEncoder (124-dim)
-│   ├── cpp_backend.py       # C++ engine interface + export_for_libtorch
+│   ├── state_encoder.py     # LeducEncoder (20-dim) + NLHEEncoder (37/49-dim, cache-augmented)
+│   ├── cfr_cache.py         # CFR advisor cache: 64-bit abstraction keys, npz + binary I/O, lookup
+│   ├── action_slots.py      # Legal-actions → fixed-slot remapping (handles ALL_IN gap in 4-action mode)
+│   ├── cpp_backend.py       # C++ engine interface + export_for_libtorch + cache backfill
 │   └── train_postflop.py    # Postflop NLHE training runner
 │
 ├── abstraction/
@@ -224,12 +230,14 @@ src/
 │   │   ├── leduc_game.hpp
 │   │   ├── mccfr.hpp        # ReservoirBuffer<T> (Vitter 1985)
 │   │   ├── nlhe_game.hpp    # NLHEGameConfig + 4-action enum + NLHEState
-│   │   ├── nlhe_mccfr.hpp   # NLHERegretSample { float state[124] }
-│   │   └── torch_model.hpp  # TorchModel + NLHEStateEncoder (124-dim)
+│   │   ├── nlhe_mccfr.hpp   # NLHERegretSample { float state[49] }
+│   │   ├── torch_model.hpp  # TorchModel + NLHEStateEncoder (49-dim, cache-aware)
+│   │   └── cfr_cache_loader.hpp  # Binary cache loader (matches cfr_cache.py)
 │   ├── src/
 │   │   ├── nlhe_game.cpp    # 4-action tree, configurable sizing
 │   │   ├── nlhe_mccfr.cpp   # State-vector samples, direct 4-slot inference
-│   │   ├── torch_model.cpp  # Encoder matching Python NLHEEncoder exactly
+│   │   ├── torch_model.cpp  # Encoder matching Python NLHEEncoder + inline cache lookup
+│   │   ├── cfr_cache_loader.cpp  # Binary search over sorted uint64 keys
 │   │   └── bindings.cpp
 │   └── cuda/
 │       └── reservoir_buffer.cu  # Vitter sampling + regret accumulation kernels
