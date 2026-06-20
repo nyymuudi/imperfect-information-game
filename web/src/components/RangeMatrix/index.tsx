@@ -90,7 +90,9 @@ const HISTORY_PRESETS: HistoryPreset[] = [
   { label: 'No action',    desc: 'First to act, no prior betting',         actions: [] },
   { label: 'Facing bet',   desc: 'Opponent has bet / raised once',         actions: [2] },
   { label: 'Facing 3-bet', desc: 'You raised, opponent 3-bet',             actions: [2, 2] },
-  { label: 'Check–check',  desc: 'Both players checked previous street',   actions: [0, 0] },
+  // "Check–check" preset removed: a check-check sequence is postflop-only,
+  // and the UI is currently locked to preflop. Restore alongside the
+  // street selector when action-history input lands.
 ]
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -98,10 +100,13 @@ const HISTORY_PRESETS: HistoryPreset[] = [
 const BOARD_COUNTS = [0, 3, 4, 5]
 
 export default function RangeMatrix() {
-  const [street, setStreet]         = useState<Street>(0)
+  // Street locked to preflop — see StrategyExplorer for the postflop /
+  // action-history caveat. Selector removed; restore useState<Street>(0)
+  // when the action-history input lands.
+  const street: Street = 0
   const [board, setBoard]           = useState<(number | null)[]>([null, null, null, null, null])
-  const [pot, setPot]               = useState(6)
-  const [toCall, setToCall]         = useState(2)
+  const [pot, setPot]               = useState(3)
+  const [toCall, setToCall]         = useState(1)
   const [historyIdx, setHistoryIdx] = useState(0)
   const [results, setResults]       = useState<Record<string, ActionProbs>>({})
   const [error, setError]           = useState<string | null>(null)
@@ -175,16 +180,8 @@ export default function RangeMatrix() {
         <p className="subtitle">GTO action frequencies across all 169 hand combinations</p>
       </div>
 
-      <div className="section">
-        <p className="section-label">Street</p>
-        <div className="seg-row">
-          {([0,1,2,3] as Street[]).map(s => (
-            <button key={s} onClick={() => setStreet(s)} className={`seg-btn ${street === s ? 'active' : ''}`}>
-              {STREET_NAMES[s]}
-            </button>
-          ))}
-        </div>
-      </div>
+      {/* Street selector removed: UI locked to preflop until an action-
+          history input exists. See StrategyExplorer for the rationale. */}
 
       <div className="section">
         <p className="section-label">Situation</p>

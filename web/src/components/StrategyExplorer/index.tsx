@@ -167,7 +167,10 @@ export default function StrategyExplorer() {
   const [hole0, setHole0]   = useState<number | null>(null)
   const [hole1, setHole1]   = useState<number | null>(null)
   const [board, setBoard]   = useState<(number | null)[]>([null, null, null, null, null])
-  const [street, setStreet] = useState<Street>(0)
+  // Street is currently locked to preflop — see the comment around the
+  // (removed) selector below. When an action-history input lands this
+  // can become useState<Street>(0) again.
+  const street: Street = 0
   // Default: pre-action SB. Pot = SB(1) + BB(2) = 3, to call = 1
   // (call BB minus what SB already posted), hero stack = full stack - SB.
   const [pot, setPot]       = useState(3)
@@ -218,37 +221,10 @@ export default function StrategyExplorer() {
         <p className="subtitle">Deep CFR · HU NLHE · {STARTING_STACK}BB · 50% pot · Neural inference</p>
       </div>
 
-      {/* Street — postflop disabled: requires an action-history UI that
-          doesn't yet exist. With empty action history the network sees an
-          impossible state vector and returns meaningless probabilities for
-          flop/turn/river. Locked to preflop until that UI lands. */}
-      <div className="section">
-        <p className="section-label">Street</p>
-        <div className="seg-row">
-          {([0, 1, 2, 3] as Street[]).map(s => (
-            <button
-              key={s}
-              onClick={() => s === 0 && setStreet(s)}
-              disabled={s !== 0}
-              className={`seg-btn ${street === s ? 'active' : ''} ${s !== 0 ? 'disabled' : ''}`}
-              title={s === 0
-                ? 'Preflop — supported'
-                : 'Postflop requires an action-history input that the UI doesn\'t yet expose. Coming later.'}
-            >
-              {STREET_NAMES[s]}
-            </button>
-          ))}
-        </div>
-        <div className="info-box">
-          <strong>{STREET_NAMES[street]}:</strong> {STREET_INFO[street].desc}
-          {street === 0 && (
-            <span style={{ display: 'block', marginTop: 4, opacity: 0.7 }}>
-              Postflop streets are currently disabled — they need an action-history
-              picker so the network can be told what happened on previous streets.
-            </span>
-          )}
-        </div>
-      </div>
+      {/* Street: locked to preflop. Postflop spots need an action-history
+          picker that the UI doesn't yet expose; without one the network
+          would see an impossible state vector. Selector hidden entirely
+          until that input lands. */}
 
       {/* Hole cards */}
       <div className="section">
