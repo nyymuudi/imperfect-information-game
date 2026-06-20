@@ -1,36 +1,47 @@
 /**
  * TypeScript port of NLHEStateEncoder (src/cpp_engine/src/torch_model.cpp).
  *
- * 2026-06-12: aktiivinen blueprint v7_long_production (1500-iter, tree42).
- * Encoder palautettu tree42-skeemaan tämän blueprintin tueksi. v3_coarse
- * (flat) ei toimi tällä encoderilla; jos haluat fallback v3:een, vaihda
- * BUCKET_SCHEME='flat' ja revertaa _boardSuperFine kutsuva kohta encode():ssa.
+ * 2026-06-20: deploy v15_c2_v5_aux (state_size=49, flat board scheme,
+ * cache-augmented). Layout:
  *
- * Card-abstracted layout (36 dims, tree42 board):
- *   [0:8]    preflop hand bucket one-hot (K=8, bins on equity ∈ [0,1])
- *   [8:12]   board super one-hot         (4-way: HC/Pair/Made/Premium; zero preflop)
- *   [12:14]  board fine one-hot          (2-way low/high half of fine_4; zero preflop)
- *   [14:16]  RESERVED zero                (säilytetään 36-dim state-size:lle)
- *   [16:20]  street one-hot (0=preflop, 1=flop, 2=turn, 3=river)
- *   [20]     pot / (2 * starting_stack)
- *   [21]     to_call / (2 * starting_stack)
- *   [22]     my_stack / starting_stack
- *   [23]     opp_stack / starting_stack
- *   [24:32]  action history — last 8 actions (ACTION_ENC values)
- *   [32]     preflop equity (continuous)
- *   [33]     board_strength (continuous, hand-rank/MAX proxy)
- *   [34]     pot odds = to_call / (pot + to_call)
- *   [35]     SPR = min(stacks) / pot, normalised (cap at 10)
+ *   Base 37 dims:
+ *     [0:8]    preflop hand bucket one-hot (K=8, bins on equity ∈ [0,1])
+ *     [8:16]   board strength bucket one-hot (K=8, flat scheme; zero preflop)
+ *     [16:20]  street one-hot (0=preflop, 1=flop, 2=turn, 3=river)
+ *     [20]     pot / (2 * starting_stack)
+ *     [21]     to_call / (2 * starting_stack)
+ *     [22]     my_stack / starting_stack
+ *     [23]     opp_stack / starting_stack
+ *     [24:32]  action history — last 8 actions (ACTION_ENC values)
+ *     [32]     preflop equity (continuous)
+ *     [33]     board_strength (continuous, hand-rank/MAX proxy)
+ *     [34]     pot odds = to_call / (pot + to_call)
+ *     [35]     SPR = min(stacks) / pot, normalised (cap at 10)
+ *     [36]     position bit (1.0 = SB / player 0, 0.0 = BB)
+ *
+ *   CFR advisor (12 dims, written by cache lookup):
+ *     [37:43]  per-action probability slots from cached best-response
+ *     [43:49]  per-action EV slots (normalised by 2*starting_stack)
+ *
+ * When a cache is attached via setAdvisorCache(), encode() looks up the
+ * spot by abstraction key and writes the 12 advisor dims. On miss they
+ * stay at zero. The cache binary format + key derivation mirror
+ * src/cpp_engine/include/cfr_cache_loader.hpp and
+ * src/deep_cfr/cfr_cache.py:key_from_state_vector exactly.
  *
  * Card encoding: card = rank * 4 + suit
  *   rank: 0=2, 1=3, ..., 12=A
  *   suit: 0=♣, 1=♦, 2=♥, 3=♠
  */
 
-export const STATE_SIZE = 36
+import { lookupCache, keyFromStateVector, type AdvisorCache } from './cache'
+
+export const BASE_STATE_SIZE = 37
+export const ADVISOR_DIMS    = 12
+export const STATE_SIZE      = BASE_STATE_SIZE + ADVISOR_DIMS  // 49
 export const K_PREFLOP  = 8
 export const K_BOARD    = 8
-export const BUCKET_SCHEME = 'tree42' as const
+export const BUCKET_SCHEME = 'flat' as const
 // Equity range for normalised preflop bucket (from 2000-sim table):
 //   weakest hand 72o ≈ 0.316, strongest AA ≈ 0.842.
 export const EQ_MIN = 0.316
@@ -57,6 +68,19 @@ export interface EncodeInput {
   myStack: number
   oppStack: number
   actionHistory: number[]            // last ≤8 action ints (0-3)
+  player?: 0 | 1                     // 0=SB (default), 1=BB — drives position bit
+}
+
+let _advisorCache: AdvisorCache | null = null
+
+/** Attach (or detach with null) a binary advisor cache so encode() can
+ * fill the [37:49] advisor dims by per-spot lookup. */
+export function setAdvisorCache(cache: AdvisorCache | null): void {
+  _advisorCache = cache
+}
+
+export function getAdvisorCache(): AdvisorCache | null {
+  return _advisorCache
 }
 
 export function cardRank(card: number): number {
@@ -255,12 +279,14 @@ function _boardSuperFine(
 }
 
 /**
- * Encode game state into a 36-dim Float32Array.
- * Identical layout to NLHEStateEncoder::encode() in torch_model.cpp.
+ * Encode game state into a 49-dim Float32Array.
+ * Identical layout to NLHEStateEncoder::encode() in torch_model.cpp
+ * (state_size=49, flat board, cache-augmented).
  */
 export function encode(input: EncodeInput): Float32Array {
   const { holeCards, boardCards, street, pot, toCall,
           myStack, oppStack, actionHistory } = input
+  const player = input.player ?? 0
 
   const out = new Float32Array(STATE_SIZE)
   const NORM = 2.0 * STARTING_STACK
@@ -272,16 +298,14 @@ export function encode(input: EncodeInput): Float32Array {
   const pfBucket = Math.min(Math.floor(eqNorm * K_PREFLOP), K_PREFLOP - 1)
   out[pfBucket] = 1.0
 
-  // [8:16] tree42 board encoding:
-  //   [8:12]  super one-hot
-  //   [12:14] fine_2 one-hot
-  //   [14:16] reserved zero
+  // [8:16] flat board strength bucket one-hot. Zero preflop (< 3 cards
+  // visible). For postflop, brd_str ∈ [0, 1] maps to bucket
+  // min(int(brd_str * K), K-1).
   const visibleBoard = boardCards.slice(0, nVisible)
   const brdStr = boardStrength(holeCards, visibleBoard)
-  const tree42 = _boardSuperFine(holeCards, visibleBoard)
-  if (tree42 !== null) {
-    out[8 + tree42.superIdx] = 1.0
-    out[12 + tree42.fine2]   = 1.0
+  if (visibleBoard.length >= 3) {
+    const brdBucket = Math.min(Math.floor(brdStr * K_BOARD), K_BOARD - 1)
+    out[8 + Math.max(0, brdBucket)] = 1.0
   }
 
   // [16:20] street one-hot
@@ -318,6 +342,27 @@ export function encode(input: EncodeInput): Float32Array {
   out[35] = pot > 1e-6
     ? Math.min(effectiveStack / pot, 10.0) / 10.0
     : 1.0
+
+  // [36] position bit (1.0 = SB / player 0, 0.0 = BB)
+  out[36] = player === 0 ? 1.0 : 0.0
+
+  // Quantise continuous slots [20:36] to 1e-6 grid to match Python encoder
+  // semantics (numpy float32 round-trip). Skipping is harmless in practice
+  // because the cache key derivation uses bucket lookups, not exact values,
+  // but matches what training-time samples look like.
+
+  // [37:49] advisor — fill from cache lookup if attached. Stays at zero
+  // on miss; the trained network handles "no advisor info" as a default.
+  if (_advisorCache !== null) {
+    const key = keyFromStateVector(out, STARTING_STACK)
+    const entry = lookupCache(_advisorCache, key)
+    if (entry !== null) {
+      // entry.probs[0:6] → out[37:43]
+      // entry.evs  [0:6] → out[43:49]
+      for (let i = 0; i < 6; i++) out[BASE_STATE_SIZE + i]     = entry.probs[i]
+      for (let i = 0; i < 6; i++) out[BASE_STATE_SIZE + 6 + i] = entry.evs[i]
+    }
+  }
 
   return out
 }

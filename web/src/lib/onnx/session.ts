@@ -17,7 +17,8 @@
  */
 
 import * as ort from 'onnxruntime-web'
-import { STATE_SIZE, type EncodeInput, encode } from './encoder'
+import { STATE_SIZE, type EncodeInput, encode, setAdvisorCache } from './encoder'
+import { loadCache } from './cache'
 
 export type ActionProbs = {
   fold:  number
@@ -49,7 +50,20 @@ async function resolveModelPath(): Promise<string> {
       const manifest = await res.json()
       if (typeof manifest.model_path === 'string') {
         _resolvedPath = manifest.model_path
-        console.log(`[session] model version: ${manifest.hash ?? 'unknown'} (${manifest.iterations ?? '?'} iter)`)
+        console.log(`[session] model version: ${manifest.hash ?? 'unknown'} (${manifest.iterations ?? '?'} iter, state_size=${manifest.state_size ?? '?'})`)
+        // If model uses the cache-augmented 49-dim state, fetch the
+        // advisor cache binary in parallel. Cache miss is non-fatal:
+        // the encoder leaves advisor dims at zero, network handles it.
+        if (manifest.state_size === 49 && typeof manifest.cache_path === 'string') {
+          loadCache(manifest.cache_path)
+            .then(c => {
+              setAdvisorCache(c)
+              console.log(`[session] advisor cache loaded: ${c.nEntries} entries`)
+            })
+            .catch(err => {
+              console.warn(`[session] advisor cache load failed: ${err.message}`)
+            })
+        }
         return manifest.model_path
       }
     }

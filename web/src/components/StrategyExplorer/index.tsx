@@ -12,7 +12,7 @@ const STARTING_STACK = STACK_SIZE
 const ACTION_META: Record<keyof ActionProbs, { label: string; color: string; desc: string }> = {
   fold:  { label: 'Fold / Check', color: '#7a8a80', desc: 'Surrender your hand or pass without betting' },
   call:  { label: 'Call',         color: '#22c55e', desc: "Match the opponent's bet to stay in the hand" },
-  raise: { label: 'Raise',        color: '#f59e0b', desc: 'Increase the bet (75% of the pot)' },
+  raise: { label: 'Raise',        color: '#f59e0b', desc: 'Increase the bet (50% of the pot)' },
   allIn: { label: 'All-in',       color: '#a78bfa', desc: 'Commit all remaining chips to the pot' },
 }
 
@@ -168,9 +168,11 @@ export default function StrategyExplorer() {
   const [hole1, setHole1]   = useState<number | null>(null)
   const [board, setBoard]   = useState<(number | null)[]>([null, null, null, null, null])
   const [street, setStreet] = useState<Street>(0)
-  const [pot, setPot]       = useState(6)
-  const [toCall, setToCall] = useState(2)
-  const [myStack, setMyStack] = useState(STARTING_STACK - 2)
+  // Default: pre-action SB. Pot = SB(1) + BB(2) = 3, to call = 1
+  // (call BB minus what SB already posted), hero stack = full stack - SB.
+  const [pot, setPot]       = useState(3)
+  const [toCall, setToCall] = useState(1)
+  const [myStack, setMyStack] = useState(STARTING_STACK - 1)
   const [probs, setProbs]   = useState<ActionProbs | null>(null)
   const [error, setError]   = useState<string | null>(null)
   const [pending, startTransition] = useTransition()
@@ -213,21 +215,38 @@ export default function StrategyExplorer() {
       {/* Header */}
       <div className="header">
         <h1 className="title">CFR // Strategy Explorer</h1>
-        <p className="subtitle">Deep CFR · HU NLHE · {STARTING_STACK}BB · 75% pot · Neural inference</p>
+        <p className="subtitle">Deep CFR · HU NLHE · {STARTING_STACK}BB · 50% pot · Neural inference</p>
       </div>
 
-      {/* Street */}
+      {/* Street — postflop disabled: requires an action-history UI that
+          doesn't yet exist. With empty action history the network sees an
+          impossible state vector and returns meaningless probabilities for
+          flop/turn/river. Locked to preflop until that UI lands. */}
       <div className="section">
         <p className="section-label">Street</p>
         <div className="seg-row">
           {([0, 1, 2, 3] as Street[]).map(s => (
-            <button key={s} onClick={() => setStreet(s)} className={`seg-btn ${street === s ? 'active' : ''}`}>
+            <button
+              key={s}
+              onClick={() => s === 0 && setStreet(s)}
+              disabled={s !== 0}
+              className={`seg-btn ${street === s ? 'active' : ''} ${s !== 0 ? 'disabled' : ''}`}
+              title={s === 0
+                ? 'Preflop — supported'
+                : 'Postflop requires an action-history input that the UI doesn\'t yet expose. Coming later.'}
+            >
               {STREET_NAMES[s]}
             </button>
           ))}
         </div>
         <div className="info-box">
           <strong>{STREET_NAMES[street]}:</strong> {STREET_INFO[street].desc}
+          {street === 0 && (
+            <span style={{ display: 'block', marginTop: 4, opacity: 0.7 }}>
+              Postflop streets are currently disabled — they need an action-history
+              picker so the network can be told what happened on previous streets.
+            </span>
+          )}
         </div>
       </div>
 
@@ -317,15 +336,22 @@ export default function StrategyExplorer() {
 
       {probs && (
         <div className="section">
-          <p className="section-label">GTO strategy</p>
+          <p className="section-label">Trained strategy</p>
           <div className="info-box" style={{ marginBottom: 8 }}>
-            Probabilities represent an approximation of the <strong>Nash equilibrium</strong> — a strategy your opponent cannot exploit regardless of how they play.
+            Probabilities are an <strong>approximation</strong> of the Nash equilibrium —
+            close to a strategy that resists exploitation, but not yet perfect. The
+            current model has measured exploitability of ~760 mbb per decision
+            (~38 big blinds per 100 hands) against a best-response opponent. Lower
+            is better; perfect Nash would be 0.
           </div>
           <div className="results">
             {(Object.entries(probs) as [keyof ActionProbs, number][]).map(([action, value]) => (
               <ProbBar key={action} action={action} value={value} />
             ))}
           </div>
+          <p className="model-quality">
+            Model: 50BB · 500 iter · cache-augmented · LBR ≈ 760 mbb/dec
+          </p>
         </div>
       )}
 

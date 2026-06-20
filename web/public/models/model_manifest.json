@@ -1,7 +1,11 @@
 {
-  "model_path": "/models/strategy_net.5b92e587f36d.onnx",
-  "hash": "5b92e587f36d",
-  "iterations": 1500,
-  "state_size": 36,
-  "timestamp": "2026-06-13T16:15:23"
+  "model_path": "/models/strategy_net.e6c5adf4d007.onnx",
+  "hash": "e6c5adf4d007",
+  "iterations": 500,
+  "state_size": 49,
+  "cache_path": "/models/v14d_advisor_v4.cache.bin",
+  "cache_entries": 2000,
+  "lbr_mbb_per_decision": 761,
+  "blueprint": "50bb_v15_c2_v5_aux",
+  "timestamp": "2026-06-18T20:05:19"
 }
