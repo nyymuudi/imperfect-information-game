@@ -69,8 +69,13 @@ class PostflopNLHE(ExtensiveFormGame):
     max_raises_per_street: int = 2  # matches C++ NLHEGameConfig.max_raises
     sb: float = 1.0
     bb: float = 2.0
-    # Raise sizes as fraction of pot (pot AFTER the call)
-    raise_fractions: tuple[float, ...] = (0.75,)
+    # Raise sizes as fraction of pot (pot AFTER the call).
+    # Changed 2026-06-14: 0.75 → 0.50. LBR diagnostics on v11 showed many
+    # spots where 75%-pot was too large for thin value / clear bluff, and
+    # 50% is a more standard GTO size for HU NLHE in a 4-action tree.
+    # Pre-2026-06-14 blueprints were trained at 0.75 and are not directly
+    # comparable — pass raise_fractions=(0.75,) explicitly when loading them.
+    raise_fractions: tuple[float, ...] = (0.50,)
 
     def num_players(self) -> int:
         return 2
@@ -130,11 +135,12 @@ class PostflopNLHE(ExtensiveFormGame):
             else:
                 current_player = 1        # BB acts first postflop
 
-        def bet_amount():
+        def bet_amount(raise_idx: int = 0):
+            """Raise amount for the raise_fractions[raise_idx] sizing."""
             p = current_player
             owe = street_invest[1 - p] - street_invest[p]
             effective_pot = pot + owe     # pot after calling
-            raise_add = effective_pot * self.raise_fractions[0]
+            raise_add = effective_pot * self.raise_fractions[raise_idx]
             return min(raise_add, stacks[p] - owe)
 
         for a in actions:
@@ -163,8 +169,11 @@ class PostflopNLHE(ExtensiveFormGame):
                 street_invest[p] += call_amt
                 pot += call_amt
                 advance_street()
-            elif a == 'r':
-                raise_add = bet_amount()
+            elif a == 'r' or (isinstance(a, str) and a.startswith('r') and a[1:].isdigit()):
+                # 'r' (legacy single-raise) or 'r0', 'r1', ... 'rN' for
+                # multi-bet-size puu. Index selects raise_fractions[idx].
+                idx = 0 if a == 'r' else int(a[1:])
+                raise_add = bet_amount(idx)
                 total = owe + raise_add
                 total = min(total, stacks[p])
                 stacks[p] -= total
@@ -276,9 +285,9 @@ class PostflopNLHE(ExtensiveFormGame):
         my_stack = state["stacks"][p]
         pot = state["pot"]
 
-        def bet_amount():
+        def bet_amount(raise_idx: int = 0):
             effective_pot = pot + owe
-            raise_add = effective_pot * self.raise_fractions[0]
+            raise_add = effective_pot * self.raise_fractions[raise_idx]
             return min(raise_add, my_stack - owe)
 
         result = []
@@ -288,15 +297,34 @@ class PostflopNLHE(ExtensiveFormGame):
         else:
             result.append("c")  # check
 
+        n_raises = len(self.raise_fractions)
+        largest_raise_add = -1.0
         if can_raise and my_stack > owe + 0.01:
-            if bet_amount() > 0.01:
-                result.append("r")
+            if n_raises == 1:
+                # Legacy single-raise: emit 'r' so old tests / blueprints keep
+                # working unchanged when raise_fractions == (X,).
+                if bet_amount(0) > 0.01:
+                    result.append("r")
+                    largest_raise_add = bet_amount(0)
+            else:
+                # Multi-raise puu (Pluribus-tyylinen): yksi action per koko.
+                # Suodatetaan pois duplikaatit (jos kahden eri %:n raise päätyy
+                # samaan capattuun määrään — yleensä short-stackeissa).
+                seen_amounts: list[float] = []
+                for i in range(n_raises):
+                    amt = bet_amount(i)
+                    if amt <= 0.01:
+                        continue
+                    if any(abs(amt - x) < 0.01 for x in seen_amounts):
+                        continue
+                    seen_amounts.append(amt)
+                    result.append(f"r{i}")
+                    largest_raise_add = max(largest_raise_add, amt)
 
-        # All-in: available if it differs from the (capped) raise, or no raise.
+        # All-in: available if it differs from the (capped) largest raise size.
         if my_stack > owe + 0.01:
             allin_add = my_stack - owe
-            raise_add = bet_amount() if (can_raise and my_stack > owe + 0.01) else -1.0
-            if (not can_raise) or allin_add > raise_add + 0.01:
+            if (not can_raise) or allin_add > largest_raise_add + 0.01:
                 result.append("a")
 
         return result

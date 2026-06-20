@@ -196,11 +196,12 @@ class TestNLHEEncoder:
         self.deal = make_deal("AhKh", "QdJd", "7c8s9cTh2d")
 
     def test_state_size(self):
-        assert self.encoder.state_size() == 36
+        # 29 + K_BOARD(=8) = 37. Last dim is the position bit (added 2026-06-14).
+        assert self.encoder.state_size() == 37
 
     def test_output_shape(self):
         state = self.encoder.encode(self.deal, 0)
-        assert state.shape == (36,)
+        assert state.shape == (37,)
 
     def test_output_dtype(self):
         state = self.encoder.encode(self.deal, 0)

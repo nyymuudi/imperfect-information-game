@@ -229,7 +229,10 @@ std::vector<float> NLHEMCCFREngine::model_strategy(
     std::vector<float> result;
     result.reserve(actions.size());
     for(auto a : actions) {
-        int slot = static_cast<int>(a);
+        // Remap ALL_IN to slot 3 in single-raise mode (max_actions==4) so
+        // the all-in probability is read from a trained slot, not from out-
+        // of-bounds slot 5. Multi-raise keeps enum value as-is.
+        int slot = nlhe_action_to_slot(a, config_.max_actions);
         result.push_back(slot < (int)probs.size() ? probs[slot] : 0.0f);
     }
     float total = 0.0f;
@@ -271,10 +274,10 @@ void NLHEMCCFREngine::accumulate_cfrplus(
         e.n_actions = static_cast<int8_t>(legal.size());
     }
     for (size_t i = 0; i < legal.size() && i < NLHE_NUM_ACTIONS; ++i) {
-        // R(I) <- max(R(I) + r^t, 0). Index by ACTION ENUM SLOT (legal[i]) so
-        // the same action always lands in the same R slot regardless of which
-        // subset of actions is legal at this node (matches network output slot).
-        int slot = static_cast<int>(legal[i]);
+        // R(I) <- max(R(I) + r^t, 0). Index by remapped slot so ALL_IN
+        // (enum 5) lands in slot 3 when max_actions==4 (single-raise puu)
+        // and gets actual training signal instead of being filtered out.
+        int slot = nlhe_action_to_slot(legal[i], config_.max_actions);
         if (slot >= 0 && slot < NLHE_NUM_ACTIONS)
             e.R[slot] = std::max(e.R[slot] + instant_regret[i], 0.0f);
     }
@@ -291,7 +294,11 @@ void NLHEMCCFREngine::emit_or_accumulate(
             NLHERegretSample rs{};
             std::memcpy(rs.state, state_vec,
                         NLHEStateEncoder::STATE_SIZE * sizeof(float));
-            rs.action    = static_cast<int8_t>(legal[a]);
+            // Same remap as in accumulate_cfrplus: ALL_IN→slot 3 in
+            // single-raise mode so the Python-side `a_np < max_actions`
+            // filter keeps it.
+            rs.action    = static_cast<int8_t>(
+                nlhe_action_to_slot(legal[a], config_.max_actions));
             rs.regret    = instant_regret[a];
             rs.iteration = config_.iteration;
             regret_buf_.insert(rs);
@@ -346,7 +353,8 @@ float NLHEMCCFREngine::traverse_cb(
             for(int a=0;a<n;++a){
                 NLHEStrategySample ss{};
                 NLHEStateEncoder::encode(state, p, ss.state);
-                ss.action=static_cast<int8_t>(legal[a]);
+                ss.action=static_cast<int8_t>(
+                    nlhe_action_to_slot(legal[a], config_.max_actions));
                 ss.probability=probs[a]*r_opp;
                 ss.iteration=config_.iteration;
                 strategy_buf_.insert(ss);
@@ -395,7 +403,8 @@ float NLHEMCCFREngine::traverse_model(
             for(int a=0;a<n;++a){
                 NLHEStrategySample ss{};
                 NLHEStateEncoder::encode(state, p, ss.state);
-                ss.action=static_cast<int8_t>(legal[a]);
+                ss.action=static_cast<int8_t>(
+                    nlhe_action_to_slot(legal[a], config_.max_actions));
                 ss.probability=probs[a]*r_opp;
                 ss.iteration=config_.iteration;
                 strategy_buf_.insert(ss);
@@ -407,17 +416,53 @@ float NLHEMCCFREngine::traverse_model(
                               tp,r_tp,r_opp*probs[idx]);
     }
 
-    std::vector<float>vals(n);
-    for(int a=0;a<n;++a)
-        vals[a]=traverse_model(NLHEGame::apply_action(state,legal[a]),
-                               tp,r_tp*probs[a],r_opp);
-    float nv=0.0f;
-    for(int a=0;a<n;++a) nv+=probs[a]*vals[a];
+    // Pluribus-style dynamic pruning (Brown & Sandholm 2019, Sec. S6):
+    // skip rollouts for actions whose blueprint probability is below
+    // prune_threshold. node value is computed over visited actions only,
+    // renormalised; pruned actions get no regret update. Pruning activates
+    // only when iteration >= prune_after_iter to avoid early-iter signal loss.
+    const bool prune_enabled =
+        (config_.prune_threshold > 0.0f) &&
+        (config_.iteration >= config_.prune_after_iter);
+
+    std::vector<float> vals(n, 0.0f);
+    std::vector<bool>  visited(n, true);
+    float visited_prob_sum = 0.0f;
+
+    for(int a=0;a<n;++a) {
+        if (prune_enabled && probs[a] < config_.prune_threshold) {
+            visited[a] = false;  // skipped — vals[a] stays at 0
+            continue;
+        }
+        visited_prob_sum += probs[a];
+        vals[a] = traverse_model(NLHEGame::apply_action(state,legal[a]),
+                                 tp, r_tp*probs[a], r_opp);
+    }
+
+    // Renormalise node value over the visited actions only. If all were
+    // pruned (visited_prob_sum ≈ 0, shouldn't happen if argmax never gets
+    // pruned, but be safe), fall back to expanding every action.
+    float nv = 0.0f;
+    if (visited_prob_sum > 1e-9f) {
+        for(int a=0;a<n;++a) {
+            if (visited[a]) nv += (probs[a] / visited_prob_sum) * vals[a];
+        }
+    } else {
+        for(int a=0;a<n;++a) {
+            vals[a] = traverse_model(NLHEGame::apply_action(state,legal[a]),
+                                     tp, r_tp*probs[a], r_opp);
+            visited[a] = true;
+        }
+        for(int a=0;a<n;++a) nv += probs[a]*vals[a];
+    }
 
     float sv[NLHEStateEncoder::STATE_SIZE];
     NLHEStateEncoder::encode(state, p, sv);
-    std::vector<float> instant(n);
-    for(int a=0;a<n;++a) instant[a]=r_opp*(vals[a]-nv);
+    std::vector<float> instant(n, 0.0f);
+    for(int a=0;a<n;++a) {
+        if (visited[a]) instant[a] = r_opp * (vals[a] - nv);
+        // Pruned actions emit 0 regret (no update) — matches Brown's treatment.
+    }
     emit_or_accumulate(sv, legal, instant);
     return nv;
 }

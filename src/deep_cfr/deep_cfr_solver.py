@@ -92,6 +92,23 @@ class DeepCFRSolver:
     # 0.0 = ei diskontausta (vanilla Deep CFR).
     dcfr_alpha: float = 1.5
     dcfr_beta:  float = 0.0
+    # Pluribuksen empiirinen havainto: Linear CFR (α=1.0) auttaa varhaisissa
+    # iteraatioissa mutta hyöty katoaa myöhemmin — jopa hidastaa konvergenssia
+    # myöhäisillä iteraatioilla. linear_cfr_iters > 0 → käytä α=1.0 ensimmäiset
+    # N iteraatiota, sitten vaihda self.dcfr_alpha:han.
+    # 0 = pois päältä (vanha käytös: dcfr_alpha kaikilla iteraatioilla).
+    linear_cfr_iters: int = 0
+    # Pluribus-style dynamic pruning. C++ MCCFR -enginelle: actionit, joiden
+    # blueprint-prob < prune_threshold, jätetään traversoimatta ja niistä ei
+    # päivitetä regretiä. Säästää compute → enemmän iteraatioita samalla
+    # budjetilla. Aktivoituu vasta iter >= prune_after_iter (alkuiteraatiot
+    # ovat liian uniformeja prune:lle). 0.0 = pois.
+    prune_threshold:  float = 0.0
+    prune_after_iter: int   = 0
+    # Position-bit ablation (v15). True = standard SB/BB signal in last dim
+    # (kept for back-compat with v12-v14). False = constant 0.0 in slot →
+    # tests whether the position signal was contributing to the v14 regression.
+    include_position_bit: bool = True
     # Iteraation jälkeen lr_decay_start regret-LR kerrotaan lr_decay_factor:lla
     # joka iteraatio. 1.0 = ei decay:tä. Auttaa kun buffer saturoi ja kohde
     # muuttuu hitaammin — pienempi LR vähentää kohinaa myöhäisissä iteraatioissa.
@@ -104,12 +121,35 @@ class DeepCFRSolver:
     # LR:llä. 0 epochs = pois päältä (vanha käytös). Käyttää strategy_bufferia.
     finetune_epochs: int   = 0
     finetune_lr:     float = 1e-4
+    # Auxiliary EV-prediction loss: when > 0 AND the encoder has a CFR
+    # cache attached (state_size 49 with advisor dims at [37:49]), the
+    # regret network gets a small EV-prediction head trained on the
+    # cache's per-action EVs (slots [43:49]). The shared trunk learns to
+    # encode advisor-derived value information, which the main regret
+    # head then leverages. 0.0 = disabled (default; v4 behaviour).
+    # Suggested starting value: 0.1.
+    aux_ev_weight: float = 0.0
+    # BRD (best-response-defense) sample weighting: when an exploit-gap
+    # map is provided, each regret-buffer sample's loss weight is multi-
+    # plied by (1 + lambda * gap/median). High-exploitation spots get
+    # amplified gradient → blueprint preferentially patches its biggest
+    # leaks. ``exploit_gap_map`` = dict[uint64 key → gap_mbb]; mined by
+    # scripts/mine_exploit_gaps.py. lambda=0 disables.
+    exploit_gap_map: dict | None = None
+    exploit_gap_lambda: float    = 0.0
 
     def __post_init__(self):
         state_sz  = self.encoder.state_size()
         strat_cap = self.strategy_buffer_capacity or self.buffer_capacity
 
-        self.regret_net   = RegretNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
+        # Aux EV head is meaningful only when the encoder has 49 dims
+        # (BASE_STATE_SIZE + 12 advisor slots). Otherwise the EV slots
+        # don't exist in the state vector.
+        ev_head_dim = 6 if (self.aux_ev_weight > 0 and state_sz == 49) else 0
+        self.regret_net   = RegretNetwork(
+            state_sz, self.max_actions, self.hidden_size,
+            ev_head_dim=ev_head_dim,
+        ).to(self.device)
         self.strategy_net = StrategyNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
 
         # Both buffers are reservoirs (see module docstring). The regret buffer
@@ -145,10 +185,21 @@ class DeepCFRSolver:
                         device=self.device,
                         starting_stack=self.game.starting_stack,
                         raise_fraction=self.game.raise_fractions[0],
+                        raise_fractions=self.game.raise_fractions,
+                        max_actions=self.max_actions,
                         max_raises=self.game.max_raises_per_street,
                         regret_target=self.regret_target,
                         seed=self.seed,
+                        prune_threshold=self.prune_threshold,
+                        prune_after_iter=self.prune_after_iter,
+                        include_position_bit=self.include_position_bit,
                     )
+                    # When the encoder carries a CFR advisor cache, wire it
+                    # into cpp_backend.to_tensors so advisor dims get
+                    # backfilled into each sample (Vaihtoehto 1 design).
+                    enc_cache = getattr(self.encoder, "cfr_cache", None)
+                    if enc_cache is not None and hasattr(self._cpp, "set_cache_context"):
+                        self._cpp.set_cache_context(enc_cache, self.encoder)
                 else:
                     self._cpp = CppMCCFRBackend(
                         n_traversals=self.traversals_per_iter,
@@ -268,10 +319,17 @@ class DeepCFRSolver:
         eivät poistu kokonaan reservoirista.
         dcfr_beta ei vaikuta regret-painoon (vaikuttaa strategy-painoon
         paperissa, mutta Linear-CFR strat_w hoitaa sen jo).
+
+        Jos linear_cfr_iters > 0 ja t < linear_cfr_iters, käytetään α=1.0
+        (puhdas Linear CFR). Tämän jälkeen vaihdetaan self.dcfr_alpha:han.
         """
-        if self.dcfr_alpha <= 0.0:
+        if self.linear_cfr_iters > 0 and t < self.linear_cfr_iters:
+            alpha = 1.0
+        else:
+            alpha = self.dcfr_alpha
+        if alpha <= 0.0:
             return 1.0
-        ta = float(t + 1) ** self.dcfr_alpha
+        ta = float(t + 1) ** alpha
         return ta / (ta + 1.0)
 
     def _run_cpp_iteration(self) -> None:
@@ -338,14 +396,39 @@ class DeepCFRSolver:
 
         class _CurrentStrategy:
             class _Meta:
-                def __init__(self, state_size):
-                    self.state_size = state_size
+                def __init__(self, state_size, action_size):
+                    self.state_size  = state_size
+                    self.action_size = action_size
             def __init__(self):
-                self.metadata = self._Meta(solver.encoder.state_size())
+                self.metadata = self._Meta(
+                    solver.encoder.state_size(),
+                    solver.max_actions,
+                )
             def query(self, state_vec, num_actions):
                 return solver._get_regret_strategy(
                     np.asarray(state_vec, dtype=np.float32), num_actions
                 )
+            def query_by_slots(self, state_vec, slot_indices):
+                # Read regret-matched probabilities at specific network slots,
+                # renormalised. Mirrors Blueprint.query_by_slots so the LBR
+                # estimator can use the same slot-mapping path on the
+                # mid-training current strategy.
+                state = np.asarray(state_vec, dtype=np.float32)
+                n_legal = len(slot_indices)
+                # _get_regret_strategy expects "num_actions" = the position
+                # of the highest legal slot + 1, so the regret network
+                # output is sliced wide enough to cover all requested slots.
+                max_slot = max(slot_indices) if slot_indices else 0
+                full = solver._get_regret_strategy(state, max_slot + 1)
+                # Reindex by slot, renormalise over the legal subset.
+                vals = np.asarray(
+                    [full[s] if s < len(full) else 0.0 for s in slot_indices],
+                    dtype=np.float64,
+                )
+                v = vals.sum()
+                if v > 1e-9:
+                    return vals / v
+                return np.ones(n_legal, dtype=np.float64) / max(n_legal, 1)
 
         return _CurrentStrategy()
 
@@ -400,8 +483,10 @@ class DeepCFRSolver:
                 else:
                     # Cold-start: alustetaan nollista Brown et al. 2019
                     # -suosituksen mukaisesti.
+                    ev_head_dim = 6 if (self.aux_ev_weight > 0 and state_sz == 49) else 0
                     self.regret_net = RegretNetwork(
-                        state_sz, self.max_actions, self.hidden_size
+                        state_sz, self.max_actions, self.hidden_size,
+                        ev_head_dim=ev_head_dim,
                     ).to(net_device)
                     train_lr = self.lr
                 # LR decay buffer-saturaation jälkeen: vähentää myöhäisten
@@ -414,6 +499,12 @@ class DeepCFRSolver:
                     epochs=self.train_epochs,
                     batch_size=self.train_batch,
                     lr=train_lr,
+                    aux_ev_weight=self.aux_ev_weight,
+                    exploit_gap_map=self.exploit_gap_map,
+                    exploit_gap_lambda=self.exploit_gap_lambda,
+                    exploit_gap_encoder=(self.encoder
+                                          if self.exploit_gap_map is not None
+                                          else None),
                 )
 
             if callback and t % callback_freq == 0:

@@ -65,9 +65,24 @@ class NLHEStateEncoder {
 public:
     static constexpr int K_PREFLOP  = 8;
     static constexpr int K_BOARD    = 8;
-    // STATE_SIZE = 8 (preflop) + K_BOARD + 4 (street) + 4 (betting)
-    //            + 8 (history) + 4 (continuous tail) = 28 + K_BOARD.
-    static constexpr int STATE_SIZE = 28 + K_BOARD;
+    // STATE_SIZE layout:
+    //   8 (preflop bucket) + K_BOARD (board) + 4 (street) + 4 (betting)
+    //   + 8 (history) + 4 (continuous tail) + 1 (position bit) +
+    //   12 (CFR advisor: 6 probs + 6 EVs)
+    //   = 41 + K_BOARD.
+    //
+    // Position bit at index 28+K_BOARD: 1.0 if SB, 0.0 if BB.
+    // CFR advisor slots at [29+K_BOARD : 41+K_BOARD] are written as ZEROS
+    // by C++ (the C++ engine doesn't yet read the advisor cache; it leaves
+    // these slots blank and the Python wrapper backfills them via cache
+    // lookup before the sample reaches the regret buffer). The trained
+    // model still has 49-dim input — at MCCFR-traversal time the in-engine
+    // inference sees zeros in advisor slots, which the network treats as
+    // a no-information default. Cheap "Vaihtoehto 1" — see project memory
+    // ``project_c2_advisor_cache.md`` for the cost/benefit discussion.
+    static constexpr int BASE_STATE_SIZE = 29 + K_BOARD;
+    static constexpr int ADVISOR_DIMS    = 12;
+    static constexpr int STATE_SIZE      = BASE_STATE_SIZE + ADVISOR_DIMS;
 
     // Bucket scheme — runtime-switchable so training and h2h can use the same
     // .so. 0 = flat (K=8 one-hot, v3 production), 1 = tree (4-hot super +
@@ -76,6 +91,14 @@ public:
     static void set_scheme(int s);
     static int  get_scheme();
 
+    // Toggle the position-bit signal at the last index. When true (default),
+    // the slot carries 1.0 for SB and 0.0 for BB. When false, the slot is a
+    // constant 0.0 for both players — used for the v15 ablation testing
+    // whether the position signal helps or hurts vs the legacy v11 encoder.
+    // State size is unchanged either way (37 dims, K_BOARD=8).
+    static void set_zero_position_bit(bool z);
+    static bool get_zero_position_bit();
+
     static void encode(const NLHEState& state, int player, float* out);
     static std::vector<float> encode_vec(const NLHEState& state, int player);
 
@@ -83,8 +106,25 @@ public:
     static torch::Tensor encode_tensor(const NLHEState& state, int player);
 #endif
 
+    // CFR advisor cache integration. When a cache is loaded, encode()
+    // writes per-action probs+EVs into slots [BASE_STATE_SIZE:STATE_SIZE]
+    // (else they stay at 0). The key derivation mirrors Python's
+    // ``cfr_cache.key_from_state_vector`` so train/inference parity holds.
+    //   set_cache_path("") clears the cache.
+    //   set_cache_path("/path/to/cache.bin") loads it; returns true on
+    //   success. Binary format is produced by Python's
+    //   ``CFRCache.save_binary()`` (see cfr_cache_loader.hpp).
+    static bool set_cache_path(const std::string& path);
+    static bool cache_loaded();
+    static size_t cache_size();
+
 private:
     static float board_strength(const NLHEState& state, int player);
+    // Re-derive the abstraction key from an encoded state vector
+    // (slots 0..BASE_STATE_SIZE-1). Mirrors Python's
+    // cfr_cache.key_from_state_vector — must agree bit-for-bit so cache
+    // hits match between Python and C++ paths.
+    static uint64_t key_from_state_vector(const float* sv, float starting_stack);
 };
 
 // ── TorchModel ────────────────────────────────────────────────────────────────

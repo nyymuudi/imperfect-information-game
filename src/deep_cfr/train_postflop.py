@@ -38,16 +38,17 @@ Notes on buffer sizing:
     buffer is likewise a large reservoir (time-average strategy).
 
 Exploitability units:
-    estimate_exploitability returns a PER-DECISION proxy in mbb/decision (milli-
-    big-blinds per decision node), NOT per hand. The callback and final report
-    below print mbb/decision accordingly.
+    estimate_exploitability returns an LBR (Local Best Response) proxy in
+    mbb/decision (milli-big-blinds per decision node), NOT per hand. It
+    marginalises opponent hands at each evaluated node and integrates all-in
+    runouts by default. The returned ExplResult is a float subclass — it
+    also carries .stderr_mbb, used below to log noise alongside the mean.
 
-Validated 50BB / 1-raise baseline (2026-06-08, blueprint v2_subcat):
-    --iterations 500 --traversals 1000 --hidden 256 --buffer 1000000 --epochs 50
-    (and let --lr-decay-factor / --finetune-epochs at their defaults).
-    Final exploitability: ~3397 mbb/decision — beats the previous monotone-proxy
-    baseline (~3585) by ~190. State encoder uses subcategory board bucketing
-    (cat + top-rank / pair-rank sub-bin) — see state_encoder.py:_board_bucket.
+    Pre-2026-06-14 baselines reported under the deal-specific clairvoyant
+    estimator (no opp-card marginalisation, ev_adjusted=False default) are
+    NOT comparable: that version overstated exploitability ~2x via runout
+    variance and ~2-5x further via clairvoyant best-response. Re-baseline
+    before comparing against historical numbers.
 
     Ablations that REGRESSED the baseline (do not turn on without re-validating):
       * --lr-decay-factor 0.97 from iter 100  → +850 mbb/decision (strategy
@@ -77,12 +78,44 @@ ACTION_LABELS = {
     "postflop": ["check/fold", "call", "raise", "all-in"],
 }
 
+
+def _action_labels_for_game(game, deal, prefix: str) -> list[str]:
+    """Build snapshot labels that match the actual legal_actions list.
+
+    Labels are produced by mapping each action SYMBOL to a human label.
+    Previously this took ``ACTION_LABELS[prefix][:N]`` which assumed slot
+    1 was always "call" — false on postflop no-bet states (legal_actions
+    returns ['c','r','a']: slot 1 is "raise", slot 2 is "all-in"). The
+    symbol-based map is correct for any subset of legal actions and for
+    both single-raise and multi-raise puu.
+    """
+    legal = game.legal_actions(deal)
+    base  = "fold/check" if prefix == "preflop" else "check/fold"
+    label_map = {"f": base, "c": base, "k": "call", "a": "all-in"}
+    n_raises = len(game.raise_fractions)
+    if n_raises <= 1:
+        # Single-raise legacy: action symbol is plain 'r'.
+        label_map["r"] = "raise"
+    else:
+        # Multi-raise puu: 'r0','r1','r2' indexed by raise_fractions.
+        for i, frac in enumerate(game.raise_fractions):
+            label_map[f"r{i}"] = f"r{int(round(frac * 100))}%"
+    return [label_map.get(str(a), str(a)) for a in legal]
+
 SAMPLE_HANDS = [
-    # (description, hole_cards_p0, board, player, label)
-    ("AA preflop",   (48, 49), (),                     0, "value"),
-    ("72o preflop",  (24, 1),  (),                     0, "trash"),
-    ("KK flop top",  (44, 45), (0, 5, 10, 15, 20),    0, "value"),
-    ("Q hi bluff",   (11, 22), (0, 5, 10, 15, 20),    0, "bluff"),
+    # (description, hole_p0, board, hero, prefix_actions, label)
+    #
+    # Prefix actions: applied verbatim before encoding so the snapshot
+    # reflects the intended street/role. Pre-2026-06-14 entries omitted
+    # prefix_actions, which made every "flop" snapshot collapse to a
+    # preflop state — see project_evaluate_snapshot_fix.
+    #
+    # ('k','c') sequence after deal: SB calls preflop → BB checks first
+    # on flop → hand reaches SB's flop decision with to_call=0.
+    ("AA preflop SB",   (48, 49), (),                    0, (),          "value"),
+    ("72o preflop SB",  (24, 1),  (),                    0, (),          "trash"),
+    ("KK flop top SB",  (44, 45), (0, 5, 10, 15, 20),    0, ("k", "c"), "value"),
+    ("Q-hi flop SB",    (11, 22), (0, 5, 10, 15, 20),    0, ("k", "c"), "bluff"),
 ]
 
 
@@ -92,29 +125,56 @@ def evaluate_blueprint(bp: Blueprint, encoder: NLHEEncoder) -> None:
     print("BLUEPRINT STRATEGY SNAPSHOTS")
     print("=" * 62)
 
+    # Restore multi-raise puu from metadata if present.
+    _rfs = (tuple(bp.metadata.raise_fractions)
+            if bp.metadata.raise_fractions
+            else (bp.metadata.raise_fraction,))
     game = PostflopNLHE(
         starting_stack=bp.metadata.starting_stack,
         max_raises_per_street=bp.metadata.max_raises,
-        raise_fractions=(bp.metadata.raise_fraction,),
+        raise_fractions=_rfs,
     )
     rng = np.random.default_rng(0)
 
-    for desc, hole, board_cards, player, _ in SAMPLE_HANDS:
+    for desc, hole, board_cards, player, prefix_actions, _ in SAMPLE_HANDS:
         remaining = [c for c in range(52) if c not in hole and c not in board_cards]
         rng.shuffle(remaining)
         opp_cards = tuple(remaining[:2])
         full_board = tuple(board_cards) + tuple(remaining[2:2 + (5 - len(board_cards))])
         deal = (hole, opp_cards, full_board)
 
-        state_vec = encoder.encode(deal, player)
-        num_actions = len(game.legal_actions(deal))
-        probs = bp.query(state_vec, num_actions)
+        # Apply prefix actions so the encoded state matches the intended
+        # street and role. Without this, board-only scenarios collapse to
+        # a preflop encoding (see history-only-determines-street invariant).
+        history = deal + tuple(prefix_actions)
+        if game.is_terminal(history):
+            print(f"  {desc:<22s}: SKIPPED (terminal after prefix {prefix_actions})")
+            continue
 
-        labels = ACTION_LABELS["preflop" if not board_cards else "postflop"]
+        actual_player = game.current_player(history)
+        if actual_player != player:
+            print(f"  {desc:<22s}: SKIPPED (expected hero={player}, "
+                  f"got current_player={actual_player} after prefix)")
+            continue
+
+        state_vec   = encoder.encode(history, player)
+        legal       = game.legal_actions(history)
+        num_actions = len(legal)
+        # Slot-indexed query so postflop no-bet states (legal=['c','r','a'])
+        # show actual check/raise/all-in probabilities — the legacy
+        # bp.query(state, num_actions) returned slots [0..n-1] contiguously
+        # which misaligned the snapshot at any non-contiguous legal set.
+        from src.deep_cfr.action_slots import legal_actions_to_slots
+        slots = legal_actions_to_slots(legal, bp.metadata.action_size)
+        probs = bp.query_by_slots(state_vec, slots)
+
+        prefix = "preflop" if not prefix_actions else "postflop"
+        labels = _action_labels_for_game(game, history, prefix)
         parts = "  ".join(
-            f"{labels[i]}={p:.0%}" for i, p in enumerate(probs)
+            f"{labels[i] if i < len(labels) else f'slot{i}'}={p:.0%}"
+            for i, p in enumerate(probs)
         )
-        print(f"  {desc:<20s}: {parts}")
+        print(f"  {desc:<22s}: {parts}")
 
     print("=" * 62)
 
@@ -141,9 +201,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="DCFR temporaalipainotuksen eksponentti γ. "
                         "0 = uniform (vanilla Deep CFR), 2 = DCFR (oletus). "
                         "Näytteet painotetaan t^γ näytteistysvaiheessa.")
-    p.add_argument("--dcfr-alpha",           type=float, default=1.5,
-                   help="DCFR regret-diskontaus α (oletus 1.5). "
-                        "Näytepaino = t^α/(t^α+1). 0 = ei diskontausta.")
+    p.add_argument("--dcfr-alpha",           type=float, default=1.0,
+                   help="DCFR regret-diskontaus α (oletus 1.0 = Linear CFR). "
+                        "Näytepaino = t^α/(t^α+1). 0 = ei diskontausta, "
+                        "1.0 = puhdas Linear CFR (Brown & Sandholm 2019), "
+                        "1.5 = aggressiivisempi DCFR-diskontaus.")
+    p.add_argument("--linear-cfr-iters",    type=int, default=0,
+                   help="Pluribus-tyylinen Linear CFR -varhaisbias: kun N > 0, "
+                        "ensimmäisillä N iteraatiolla käytetään α=1.0 (linear), "
+                        "ja N:n jälkeen vaihdetaan --dcfr-alpha:han. "
+                        "Pluribus: linear vain alkuun koska myöhemmin hyöty "
+                        "katoaa. Suositus: N ≈ iteraatiomäärä/3.")
+    p.add_argument("--prune-threshold",     type=float, default=0.0,
+                   help="Pluribus-tyylinen dynaaminen pruning C++ MCCFR:lle. "
+                        "Actionit, joiden blueprint-prob < threshold, jätetään "
+                        "traversoimatta. Säästää compute → enemmän iteraatioita "
+                        "samalla budjetilla. 0 = pois. Suositus: 0.001…0.01.")
+    p.add_argument("--prune-after-iter",    type=int, default=100,
+                   help="Iteraatio, jonka jälkeen pruning aktivoituu. "
+                        "Alkuiteraatioilla blueprint on liian uniformi → kaikki "
+                        "actionit nikkaroituisi pois. Suositus: ≥100.")
+    p.add_argument("--no-position-bit",     action="store_true",
+                   help="Encoderin position-bit pois käytöstä (v15 ablation). "
+                        "Kirjoittaa vakio 0.0 viimeiseen dimensioon SB/BB-signaalin "
+                        "sijaan. State_size pysyy 37:nä → yhteensopiva ilman C++ "
+                        "rebuildiä. Testaa onko position-bitti aiheuttanut v14:n "
+                        "regression v11-baseliniin verrattuna.")
+    p.add_argument("--save-best-checkpoint", action="store_true",
+                   help="Tallentaa parhaan LBR-iteraation snapshotin erikseen "
+                        "polkuun {--save-blueprint}_best. Vaatii --save-blueprint:n "
+                        "ja --expl-games>0:n. Treenaa snapshot-strategy-netin "
+                        "current strategy-bufferista (--best-snapshot-epochs).")
+    p.add_argument("--best-snapshot-epochs", type=int, default=50,
+                   help="Best-checkpoint snapshot-treenin epoch-määrä per "
+                        "tallennus. Pienempi = nopeampi, suurempi = polishoidumpi "
+                        "snapshot. Suositus 50 (vs Final 300).")
+    p.add_argument("--best-margin-stderr",   type=float, default=0.25,
+                   help="Margin uudelle 'best':lle: uusi expl < best_expl - "
+                        "margin * combined_stderr. Estää tallentamasta marginaalisia "
+                        "sample-kohina-parannuksia. Suositus 0.25-1.0.")
+    p.add_argument("--cfr-cache",            type=str, default="",
+                   help="Polku CFR advisor cache:hen (rakennettu komennolla "
+                        "build_cfr_cache.py). Kun asetettu, encoder appendaa 12 "
+                        "advisor-dimiä (6 action-probs + 6 EVs) state-vektoriin. "
+                        "State_size 37 → 49 → verkko on suurempi mutta saa "
+                        "korkealaatuista ohjausta jokaisessa decisionissa. Pakottaa "
+                        "Python-solverin (C++ engine ei vielä tunne cache:ta).")
     p.add_argument("--regret-target",        type=str,   default="instant",
                    choices=["instant", "cfrplus"],
                    help="Regret-kohde C++-traversaalille. "
@@ -158,8 +261,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-raises",          type=int,   default=1,
                    help="Max raises per street (default: 1). 2 kasvattaa "
                         "puun koon ~4x per street.")
-    p.add_argument("--raise-fraction",       type=float, default=0.75,
-                   help="Raise size as fraction of pot (default: 0.75)")
+    p.add_argument("--raise-fraction",       type=float, default=0.50,
+                   help="Raise size as fraction of pot (default: 0.50). "
+                        "Vaihdettu 0.75:stä 2026-06-14 — LBR-diagnostiikka "
+                        "näytti että 75%% raise oli liian iso useille spotille; "
+                        "50%% pot on tyypillisempi GTO-koko ja antaa verkolle "
+                        "paremman value/bluff-balanssin 4-action-puussa. "
+                        "Ohitetaan jos --raise-fractions on annettu.")
+    p.add_argument("--raise-fractions",      type=str, default="",
+                   help="Pluribus-tyylinen multi-raise puu: pilkulla erotettu "
+                        "lista raise-kokoja pottin osuutena, esim. "
+                        "'0.33,0.66,1.0'. 1-3 kokoa tuettu (C++ enum-kapasiteetti). "
+                        "Tyhjä = yksittäisraise --raise-fraction:lla. "
+                        "Multi-raise muuttaa action-spacen 4 → 4+(N-1) ja "
+                        "vaatii saman --raise-fractions:n h2h-arvioinnissa.")
 
     p.add_argument("--seed",                 type=int,   default=42,
                    help="RNG seed for C++ MCCFR (default 42). Eri seedit "
@@ -189,6 +304,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "B vs alkuperäinen baseline: ei signaalia.")
     p.add_argument("--finetune-lr",          type=float, default=1e-4,
                    help="Fine-tune-vaiheen LR (default: 1e-4).")
+    p.add_argument("--aux-ev-weight",        type=float, default=0.0,
+                   help="Painokerroin regret-verkon auxiliary EV-prediction "
+                        "headille. Vaatii --cfr-cache (state_size=49). Verkko "
+                        "saa pienen sivuhead:n joka oppii ennustamaan advisor-"
+                        "EV:t [slots 43:49] siten että jaettu trunk pakottuu "
+                        "internalisoimaan cache-signaalia. 0.0 = pois päältä "
+                        "(default; v4-käytös). Suositus aloitukseen: 0.1.")
+    p.add_argument("--exploit-gap-map",      type=str, default="",
+                   help="Polku scripts/mine_exploit_gaps.py:n tuottamaan .npz-"
+                        "tiedostoon. Aktivoi BRD (best-response-defense) -"
+                        "painotuksen: regret-buffer-näytteet, joiden "
+                        "abstraktio-avain mappaa korkeaan exploit-gap:iin, "
+                        "saavat suuremman loss-painon. Tarvitsee --exploit-gap-"
+                        "lambda > 0 jotta vaikutus on >0.")
+    p.add_argument("--exploit-gap-lambda",   type=float, default=0.0,
+                   help="BRD-painotuksen voimakkuus. Sample-paino = base * "
+                        "(1 + lambda * gap/median_gap). 0 = ei BRD-painotusta, "
+                        "5-10 voimakas painotus. Suositus aloitukseen: 5.0.")
 
     p.add_argument("--expl-games",           type=int,   default=500,
                    help="Games per exploitability estimate in callback "
@@ -343,8 +476,30 @@ def main() -> int:
             print(f"[warn] cfr_engine.set_scheme not available — running flat-only "
                   f"(rebuild .so for {args.bucket_scheme} scheme).")
 
+    # Parse multi-raise fractions early so the encoder gets the same list
+    # the game uses (encoder._parse_state needs all 'rN' actions resolvable).
+    if args.raise_fractions.strip():
+        _early_raise_fracs = tuple(
+            float(x) for x in args.raise_fractions.split(",") if x.strip()
+        )
+    else:
+        _early_raise_fracs = (args.raise_fraction,)
+
+    # Optional CFR advisor cache (C2 design): adds 12 dims to state_size
+    # via cache lookup + live MC EV fallback. State_size becomes 49 when
+    # set, forces Python solver path (use_cpp_engine=False) until C++
+    # cache loader lands.
+    cfr_cache = None
+    if args.cfr_cache:
+        from src.deep_cfr.cfr_cache import CFRCache
+        cfr_cache = CFRCache.load(args.cfr_cache)
+        print(f"Loaded CFR cache: {len(cfr_cache)} entries from {args.cfr_cache}")
+
     encoder = NLHEEncoder(starting_stack=args.stack,
-                          bucket_scheme=args.bucket_scheme)
+                          bucket_scheme=args.bucket_scheme,
+                          raise_fractions=_early_raise_fracs,
+                          include_position_bit=not args.no_position_bit,
+                          cfr_cache=cfr_cache)
 
     # ── Load-only path ────────────────────────────────────────────────────────
     if args.load_blueprint:
@@ -386,23 +541,54 @@ def main() -> int:
         )
 
     # ── Training path ─────────────────────────────────────────────────────────
+    # Parse --raise-fractions (multi-raise puu) tai fall back to single
+    # --raise-fraction (legacy 4-action puu).
+    if args.raise_fractions.strip():
+        raise_fracs = tuple(
+            float(x) for x in args.raise_fractions.split(",") if x.strip()
+        )
+        if not raise_fracs:
+            raise ValueError("--raise-fractions parsed to empty list")
+        if len(raise_fracs) > 3:
+            raise ValueError(
+                "--raise-fractions max 3 entries (C++ enum NLHE_RAISE_0..2)"
+            )
+    else:
+        raise_fracs = (args.raise_fraction,)
+
+    # Action space size: fold/check + (optional call) + N raises + allin.
+    # Capacity (network output dim, regret sample slots): 3 + N raises.
+    # Single raise → 4 actions (legacy). Multi raise N=2 → 5, N=3 → 6.
+    n_actions_capacity = 3 + len(raise_fracs)
+
     game = PostflopNLHE(
         starting_stack=args.stack,
         max_raises_per_street=args.max_raises,
-        raise_fractions=(args.raise_fraction,),
+        raise_fractions=raise_fracs,
     )
+
+    # C++ engine emits 49-dim state vectors (advisor slots at [37:49] = 0).
+    # When a CFR cache is attached, cpp_backend.to_tensors backfills those
+    # slots via key_from_state_vector lookup before samples reach the regret
+    # buffer (see DeepCFRSolver._run_cpp_iteration → set_cache_context wiring).
+    # Cache build, Python lookup, and C++ backfill all go through the same
+    # key_from_state_vector path → keys agree by construction.
+    _use_cpp = bool(args.use_cpp) if hasattr(args, "use_cpp") else True
+    if cfr_cache is not None:
+        print(f"[note] CFR cache attached → C++ path with state-vector "
+              f"backfill (use_cpp={_use_cpp}).")
 
     solver = DeepCFRSolver(
         game=game,
         encoder=encoder,
-        max_actions=4,
+        max_actions=n_actions_capacity,
         buffer_capacity=regret_buf,
         strategy_buffer_capacity=strat_buf,
         hidden_size=args.hidden,
         train_epochs=args.epochs,
         train_batch=args.train_batch,
         traversals_per_iter=args.traversals,
-        use_cpp_engine=True,
+        use_cpp_engine=_use_cpp,
         device=device,
         lr=args.lr,
         warm_start=not args.no_warm_start,
@@ -410,12 +596,31 @@ def main() -> int:
         seed=args.seed,
         dcfr_gamma=args.dcfr_gamma,
         dcfr_alpha=args.dcfr_alpha,
+        linear_cfr_iters=args.linear_cfr_iters,
+        prune_threshold=args.prune_threshold,
+        prune_after_iter=args.prune_after_iter,
+        include_position_bit=not args.no_position_bit,
         regret_target=args.regret_target,
         lr_decay_start=args.lr_decay_start,
         lr_decay_factor=args.lr_decay_factor,
         finetune_epochs=args.finetune_epochs,
         finetune_lr=args.finetune_lr,
+        aux_ev_weight=args.aux_ev_weight,
     )
+
+    # BRD exploit-gap map (loaded once before solver fully constructed).
+    if args.exploit_gap_map and args.exploit_gap_lambda > 0:
+        from pathlib import Path as _P
+        if not _P(args.exploit_gap_map).exists():
+            sys.exit(f"[error] exploit gap map not found: {args.exploit_gap_map}")
+        d = np.load(args.exploit_gap_map, allow_pickle=True)
+        keys = np.asarray(d["keys"], dtype=np.uint64)
+        gaps = np.asarray(d["gaps"], dtype=np.float32)
+        gap_map = {int(k): float(g) for k, g in zip(keys, gaps)}
+        solver.exploit_gap_map    = gap_map
+        solver.exploit_gap_lambda = float(args.exploit_gap_lambda)
+        print(f"[BRD] loaded {len(gap_map)} exploit-gap entries from "
+              f"{args.exploit_gap_map}, lambda={args.exploit_gap_lambda}")
 
     print(f"Deep CFR — HU Postflop NLHE")
     print(f"  Stack: {args.stack:.0f}BB | "
@@ -434,6 +639,11 @@ def main() -> int:
     t0 = time.time()
     # Rolling window of recent exploitability estimates for stddev diagnostic.
     expl_history: list[float] = []
+    # Best-LBR-iteration checkpoint tracking. None until --save-best-checkpoint
+    # observes the first LBR measurement. best_stderr is tracked so the margin
+    # rule (--best-margin-stderr) can demand a statistically meaningful drop
+    # before incurring snapshot-train cost.
+    best_state = {"expl": None, "stderr": None, "iter": None, "saved_to": None}
 
     def _print_diagnostics(s) -> None:
         """Buffer-level convergence diagnostics — see --diagnostics."""
@@ -486,7 +696,8 @@ def main() -> int:
                     cur, game, encoder, n_games=args.expl_games, seed=0,
                     ev_adjusted=args.ev_adjusted_expl,
                 )
-                expl_str = f"  expl={expl:6.1f} mbb/decision"
+                expl_str = (f"  expl={expl:6.1f} ± {expl.stderr_mbb:5.1f}"
+                            f" mbb/decision")
                 expl_history.append(float(expl))
             except Exception as e:
                 expl_str = f"  expl=ERR ({type(e).__name__})"
@@ -509,12 +720,79 @@ def main() -> int:
             if expl_history:
                 mlf.log_metric("expl_current_strategy",
                                expl_history[-1], step=i)
+                # Log stderr alongside so we can tell sample noise from
+                # actual strategy quality changes between iterations.
+                if hasattr(expl, "stderr_mbb"):
+                    mlf.log_metric("expl_current_strategy_stderr",
+                                   float(expl.stderr_mbb), step=i)
         if args.diagnostics:
             _print_diagnostics(s)
         if args.save_blueprint and i % 1000 == 0:
             ckpt_path = args.save_blueprint + f"_ckpt{i}"
             Blueprint.from_solver(s, device="cpu").save(ckpt_path)
             print(f"  [checkpoint saved → {ckpt_path}]")
+
+        # ── Best-LBR-iteration checkpoint (--save-best-checkpoint) ────────────
+        if (args.save_best_checkpoint and args.save_blueprint
+                and args.expl_games > 0 and expl_history):
+            cur_expl   = float(expl_history[-1])
+            cur_stderr = float(expl.stderr_mbb) if hasattr(expl, "stderr_mbb") else 0.0
+            be = best_state["expl"]
+            if be is None:
+                _new_best = True
+            else:
+                # Margin rule: insist current is sig. lower than best by
+                # `margin` × combined stderr — avoids snapshot-thrashing on
+                # noise. Larger margin = stricter criterion.
+                combined = (cur_stderr**2 + (best_state["stderr"] or 0.0)**2) ** 0.5
+                _new_best = (cur_expl + args.best_margin_stderr * combined) < be
+            if _new_best:
+                from src.deep_cfr.networks import (
+                    StrategyNetwork, train_strategy_network,
+                )
+                from src.deep_cfr.blueprint import (
+                    BlueprintMetadata, ScriptableStrategyNet,
+                )
+                t_snap = time.time()
+                # Train a fresh strategy-net from the current buffer. Fewer
+                # epochs than the final pass — fast enough to run multiple
+                # times during training.
+                snap_net = StrategyNetwork(
+                    s.encoder.state_size(),
+                    solver.max_actions,
+                    s.hidden_size,
+                ).to(device)
+                train_strategy_network(
+                    snap_net, s.strategy_buffer,
+                    epochs=args.best_snapshot_epochs,
+                    batch_size=args.train_batch,
+                    lr=args.lr,
+                )
+                wrapper = ScriptableStrategyNet.from_strategy_network(snap_net)
+                _rfs = solver.game.raise_fractions
+                meta = BlueprintMetadata(
+                    state_size=s.encoder.state_size(),
+                    action_size=solver.max_actions,
+                    hidden_size=s.hidden_size,
+                    starting_stack=solver.game.starting_stack,
+                    raise_fraction=float(_rfs[0]),
+                    raise_fractions=([float(x) for x in _rfs]
+                                     if len(_rfs) > 1 else []),
+                    max_raises=solver.game.max_raises_per_street,
+                    iterations=i,
+                    traversals_per_iter=solver.traversals_per_iter,
+                    strategy_samples=len(solver.strategy_buffer),
+                    timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                )
+                best_path = args.save_blueprint + "_best"
+                Blueprint(wrapper, meta, device="cpu").save(best_path)
+                print(f"  [best snapshot saved → {best_path}  "
+                      f"iter={i}, expl={cur_expl:.1f} mbb/dec, "
+                      f"snap_time={time.time() - t_snap:.1f}s]")
+                best_state["expl"]     = cur_expl
+                best_state["stderr"]   = cur_stderr
+                best_state["iter"]     = i
+                best_state["saved_to"] = best_path
 
     if resume_strategy_state is not None:
         solver.strategy_net.load_state_dict(resume_strategy_state)
@@ -551,8 +829,19 @@ def main() -> int:
             bp, game, encoder, n_games=max(args.expl_games, 200), seed=0,
             ev_adjusted=args.ev_adjusted_expl,
         )
-        print(f"\nFinal blueprint exploitability: {final_expl:.1f} mbb/decision "
-              f"(untrained ≈ order 100s; lower is better)")
+        print(f"\nFinal blueprint LBR exploitability: "
+              f"{final_expl:.1f} ± {final_expl.stderr_mbb:.1f} mbb/decision "
+              f"(lower is better; large stderr → metric is noise-dominated)")
+        # Best-LBR-iteration summary (if --save-best-checkpoint was on).
+        if best_state["saved_to"] is not None:
+            print(f"Best LBR snapshot     : {best_state['saved_to']}")
+            print(f"  iter={best_state['iter']}, "
+                  f"during-train LBR={best_state['expl']:.1f} mbb/dec")
+            if float(best_state["expl"]) < float(final_expl):
+                gap = float(final_expl) - float(best_state["expl"])
+                print(f"  → Best snapshot has {gap:.0f} mbb/dec LOWER mid-training "
+                      f"LBR than final. Measure both with compare_ablations.py "
+                      f"to confirm whether the snapshot is actually better.")
     except Exception as e:
         print(f"[warn] Final exploitability measurement failed: {e}")
 

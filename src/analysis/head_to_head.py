@@ -88,10 +88,19 @@ def _equity_at_street(hole_a: tuple, hole_b: tuple, board: tuple,
             elif ha == hb: ties += 1
             total += 1
         return (wins + 0.5 * ties) / total
-    # Preflop all-in: 2.6M combos, too many for exact. MC with fixed seed.
-    rng = np.random.default_rng((hash((tuple(sorted(hole_a)),
-                                       tuple(sorted(hole_b))))) & 0x7FFFFFFF)
-    n_sims = 2000
+    # Preflop all-in: 2.6M combos, too many for exact. MC with deterministic
+    # seed derived from the SORTED card values — NOT Python's hash(), which
+    # is salted by PYTHONHASHSEED and gives different equity estimates
+    # between processes (silent reproducibility break).
+    sa = sorted(int(c) for c in hole_a)
+    sb = sorted(int(c) for c in hole_b)
+    seed_int = (sa[0] * 53**3 + sa[1] * 53**2 + sb[0] * 53 + sb[1]) & 0x7FFFFFFF
+    rng = np.random.default_rng(seed_int)
+    # 5000 sims → stderr ~0.7% per equity (was 2000 → 1.1%). Cumulative
+    # h2h noise from 800 pairs × ~10% all-in rate halves accordingly. Cost
+    # is ~3× CPU on the affected spots, still cheap relative to a single
+    # CFR iteration.
+    n_sims = 5000
     wins = 0.0
     for _ in range(n_sims):
         runout = rng.choice(live, size=5, replace=False)
@@ -149,7 +158,17 @@ def play_hand(bp_a, bp_b, game, encoder_a, encoder_b, deal, hero: int,
 
     ev_adjusted=True replaces post-all-in showdown payoffs with equity over
     remaining board cards — eliminates runout variance for all-in spots.
+
+    Action selection uses ``bp.query_by_slots`` with the C++-enum slot
+    mapping so a postflop no-bet state (legal=['c','r','a']) correctly
+    reads slots [0, 2, 3] (instead of broken contiguous [0, 1, 2]) and
+    the single-raise ALL_IN slot 3 lines up with the trained all-in
+    probability rather than the untrained RAISE_1 junk slot.
     """
+    import warnings
+
+    from src.deep_cfr.action_slots import legal_actions_to_slots
+
     history = deal
     while not game.is_terminal(history):
         player  = game.current_player(history)
@@ -158,10 +177,22 @@ def play_hand(bp_a, bp_b, game, encoder_a, encoder_b, deal, hero: int,
         enc = encoder_a if is_hero else encoder_b
         bp  = bp_a      if is_hero else bp_b
         state = enc.encode(history, player)
-        probs = bp.query(state, len(actions))
+
+        # Map each legal action symbol to the network output slot the
+        # blueprint was trained at, then read those slots directly.
+        slots = legal_actions_to_slots(actions, bp.metadata.action_size)
+        probs = bp.query_by_slots(state, slots)
         probs = np.asarray(probs, dtype=np.float64)
         s = probs.sum()
         if s <= 0:
+            warnings.warn(
+                f"blueprint returned all-zero probs at {actions} "
+                f"(slots={slots}, hist tail={history[-3:] if len(history) > 3 else history}). "
+                f"Falling back to uniform — likely indicates an untrained or "
+                f"shape-mismatched network slot.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             probs = np.ones_like(probs) / len(probs)
         else:
             probs /= s
@@ -193,8 +224,11 @@ def match_crn(bp_a, bp_b, game, encoder_a, encoder_b=None,
     2·Cov(A,B), with positive covariance from shared deal). Typically 5–10×
     fewer pairs needed than naive h2h for the same significance threshold.
 
-    Returns a dict with mean/stderr in mbb/hand (per-pair, i.e. per matched
-    deal — each "pair" consumes 2 hands).
+    Returns a dict with ``win_rate_mbb`` and ``stderr_mbb`` reported in
+    **mbb/PAIR** (each pair = 2 hands played: one with A at the hero seat,
+    one with B at the hero seat). To convert to mbb/hand divide by 2 — but
+    the per-pair number IS the useful "edge" metric since both seats are
+    seen exactly once.
     """
     enc_a = encoder_a
     enc_b = encoder_b if encoder_b is not None else encoder_a

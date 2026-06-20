@@ -108,6 +108,7 @@ set(CPP_SOURCES
     src/nlhe_game.cpp
     src/nlhe_mccfr.cpp
     src/torch_model.cpp
+    src/cfr_cache_loader.cpp
     src/bindings.cpp
 )
 
@@ -135,7 +136,7 @@ add_executable(test_engine
     tests/test_game.cpp
     src/leduc_game.cpp src/mccfr.cpp
     src/nlhe_game.cpp  src/nlhe_mccfr.cpp
-    src/torch_model.cpp
+    src/torch_model.cpp src/cfr_cache_loader.cpp
 )
 target_include_directories(test_engine PRIVATE include)
 if(Torch_FOUND)

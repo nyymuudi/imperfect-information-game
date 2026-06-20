@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
 
@@ -47,13 +47,20 @@ class BlueprintMetadata:
     traversals_per_iter: int   = 0
     strategy_samples:    int   = 0
     timestamp:           str   = ""
+    # Multi-raise puu (Pluribus-tyylinen). Tyhjä lista → legacy single-raise
+    # käyttäen `raise_fraction`-arvoa. Esimerkki: [0.33, 0.66, 1.0].
+    raise_fractions: list[float] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
 
     @classmethod
     def from_json(cls, s: str) -> "BlueprintMetadata":
-        return cls(**json.loads(s))
+        # Backward-compat: pre-2026-06-14 metadata-tiedostoissa ei ole
+        # raise_fractions-kenttää. Hyväksytään puuttuvana ja jätetään
+        # default-arvo (tyhjä lista = single-raise puu).
+        data = json.loads(s)
+        return cls(**data)
 
 
 # ── ScriptableStrategyNet ─────────────────────────────────────────────────────
@@ -117,12 +124,16 @@ class Blueprint:
         arch    = _infer_arch(solver.strategy_net)
         wrapper = ScriptableStrategyNet(**arch)
         wrapper.net.load_state_dict(solver.strategy_net.net.state_dict())
+        # Persist full raise_fractions tuple when multi-raise. Snapshot &
+        # evaluate paths read this to reconstruct the same game tree.
+        _rfs = solver.game.raise_fractions
         meta = BlueprintMetadata(
             state_size=arch["state_size"],
             action_size=arch["action_size"],
             hidden_size=arch["hidden_size"],
             starting_stack=solver.game.starting_stack,
-            raise_fraction=float(solver.game.raise_fractions[0]),
+            raise_fraction=float(_rfs[0]),
+            raise_fractions=([float(x) for x in _rfs] if len(_rfs) > 1 else []),
             max_raises=solver.game.max_raises_per_street,
             iterations=solver.iterations,
             traversals_per_iter=solver.traversals_per_iter,
@@ -274,7 +285,18 @@ class Blueprint:
     # ── Query ─────────────────────────────────────────────────────────────────
 
     def query(self, state_vec: np.ndarray, num_actions: int) -> np.ndarray:
-        """Single-state query. Returns float32 array [num_actions], sums to 1."""
+        """Single-state query. Returns float32 array [num_actions], sums to 1.
+
+        WARNING: this method assumes legal_actions occupy the first
+        ``num_actions`` slots of the network output (contiguous, in-order).
+        That is FALSE for postflop no-bet states (legal = ['c','r','a']
+        which maps to slots [0, 2, 5/3]) and for single-raise face-bet
+        all-in (slot 5/3 not 3). Use :meth:`query_by_slots` with an
+        explicit slot index list to avoid this misalignment.
+
+        Kept for backward compatibility with legacy callers that already
+        assume the (broken) contiguous layout.
+        """
         assert 1 <= num_actions <= self.metadata.action_size, (
             f"num_actions={num_actions} out of range [1, {self.metadata.action_size}]"
         )
@@ -284,6 +306,37 @@ class Blueprint:
         with torch.no_grad():
             probs = self._net(s, mask).squeeze(0).cpu().numpy()
         return probs[:num_actions]
+
+    def query_by_slots(self, state_vec: np.ndarray,
+                       slot_indices: list[int]) -> np.ndarray:
+        """Read network probabilities at SPECIFIC output slots, renormalised.
+
+        Each entry in ``slot_indices`` is an integer in
+        [0, metadata.action_size). The returned array has the same length
+        as the input list; element i is the probability of the i-th
+        requested slot, renormalised so the slice sums to 1.
+
+        Use ``action_slots.action_symbol_to_slot(symbol, max_actions)``
+        to build ``slot_indices`` from a Python ``legal_actions`` list.
+        This is the **correct** API for evaluating a trained blueprint:
+        it respects the C++ enum slot assignment, so non-contiguous
+        legal-action subsets (postflop no-bet, ALL_IN remap) work right.
+        """
+        action_size = self.metadata.action_size
+        for slot in slot_indices:
+            if not (0 <= slot < action_size):
+                raise ValueError(
+                    f"slot {slot} out of range [0, {action_size}); "
+                    f"blueprint trained with action_size={action_size}"
+                )
+        s    = torch.tensor(state_vec, dtype=torch.float32).unsqueeze(0).to(self._device)
+        mask = torch.zeros(1, action_size, device=self._device)
+        for slot in slot_indices:
+            mask[0, slot] = 1.0
+        with torch.no_grad():
+            probs = self._net(s, mask).squeeze(0).cpu().numpy()
+        return np.asarray([probs[slot] for slot in slot_indices],
+                          dtype=np.float32)
 
     def query_batch(self, state_matrix: np.ndarray,
                     num_actions_per_row: np.ndarray | list[int]) -> np.ndarray:

@@ -125,11 +125,24 @@ PYBIND11_MODULE(cfr_engine, m) {
 
     py::class_<NLHEGameConfig>(m, "NLHEGameConfig")
         .def(py::init<>())
-        .def_readwrite("starting_stack", &NLHEGameConfig::starting_stack)
-        .def_readwrite("sb",             &NLHEGameConfig::sb)
-        .def_readwrite("bb",             &NLHEGameConfig::bb)
-        .def_readwrite("raise_fraction", &NLHEGameConfig::raise_fraction)
-        .def_readwrite("max_raises",     &NLHEGameConfig::max_raises);
+        .def("set_raise_fractions",
+             [](NLHEGameConfig& c, const std::vector<float>& fracs) {
+                 int n = std::min<int>((int)fracs.size(),
+                                       NLHEGameConfig::MAX_RAISE_FRACTIONS);
+                 for (int i = 0; i < n; ++i)
+                     c.raise_fractions[i] = fracs[i];
+                 c.n_raise_fractions = n;
+             },
+             py::arg("fractions"),
+             "Set Pluribus-style multi-raise sizes (1..MAX_RAISE_FRACTIONS=4 "
+             "entries). Sets n_raise_fractions; empty list keeps the legacy "
+             "single-raise behaviour via cfg.raise_fraction.")
+        .def_readwrite("starting_stack",    &NLHEGameConfig::starting_stack)
+        .def_readwrite("sb",                &NLHEGameConfig::sb)
+        .def_readwrite("bb",                &NLHEGameConfig::bb)
+        .def_readwrite("raise_fraction",    &NLHEGameConfig::raise_fraction)
+        .def_readwrite("n_raise_fractions", &NLHEGameConfig::n_raise_fractions)
+        .def_readwrite("max_raises",        &NLHEGameConfig::max_raises);
 
     // NLHEBufferExport — flat state vectors, no string parsing needed
     py::class_<NLHEBufferExport>(m, "NLHEBufferExport")
@@ -152,6 +165,8 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def_readwrite("seed",              &NLHETraversalConfig::seed)
         .def_readwrite("max_actions",       &NLHETraversalConfig::max_actions)
         .def_readwrite("target",            &NLHETraversalConfig::target)
+        .def_readwrite("prune_threshold",   &NLHETraversalConfig::prune_threshold)
+        .def_readwrite("prune_after_iter",  &NLHETraversalConfig::prune_after_iter)
         .def_readwrite("game_cfg",          &NLHETraversalConfig::game_cfg);
 
     py::class_<NLHEMCCFREngine>(m, "NLHEMCCFREngine")
@@ -254,7 +269,25 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def_static("set_scheme", &NLHEStateEncoder::set_scheme,
             py::arg("scheme"),
             "0 = flat (v3 production), 1 = tree (hierarchical two-hot).")
-        .def_static("get_scheme", &NLHEStateEncoder::get_scheme);
+        .def_static("get_scheme", &NLHEStateEncoder::get_scheme)
+        .def_static("set_zero_position_bit",
+            &NLHEStateEncoder::set_zero_position_bit,
+            py::arg("zero"),
+            "If True, encode() writes 0.0 in the position-bit slot for both "
+            "players (keeps shape, removes signal).")
+        .def_static("get_zero_position_bit",
+            &NLHEStateEncoder::get_zero_position_bit)
+        .def_static("set_cache_path",
+            &NLHEStateEncoder::set_cache_path,
+            py::arg("path"),
+            "Load a binary CFR advisor cache (built via CFRCache.save_binary). "
+            "Empty path clears the cache. Returns True on success.")
+        .def_static("cache_loaded",
+            &NLHEStateEncoder::cache_loaded,
+            "True if a cache is currently loaded.")
+        .def_static("cache_size",
+            &NLHEStateEncoder::cache_size,
+            "Number of entries in the loaded cache (0 if none).");
 
     m.attr("NLHE_STACK")      = NLHE_STACK;
     m.attr("NLHE_BB")         = NLHE_BB;

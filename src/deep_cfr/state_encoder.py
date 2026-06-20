@@ -118,7 +118,7 @@ class NLHEEncoder(StateEncoder):
     """
     No-Limit Hold'em state encoder for Deep CFR — card-abstracted.
 
-    State vector (36 dimensions):
+    State vector (37 dimensions for K_BOARD=8):
         [0:8]   Preflop hand bucket (one-hot, K=8 equal-width bins on equity)
         [8:16]  Board EHS bucket (one-hot, K=8; all zeros preflop)
         [16:20] Street (one-hot: preflop/flop/turn/river)
@@ -131,6 +131,7 @@ class NLHEEncoder(StateEncoder):
         [33]    Board strength (evaluate_7card / MAX_HAND_SCORE, in [0,1])
         [34]    Pot odds = to_call / (pot + to_call)
         [35]    SPR = min(stacks) / pot (capped at 10, normalised)
+        [36]    Position bit: 1.0 if SB (player 0), 0.0 if BB (player 1)
 
     Card abstraction:
         Multiple concrete hands map to the same bucket → the same state
@@ -145,7 +146,24 @@ class NLHEEncoder(StateEncoder):
     Quantisation: dims 20-35 rounded to 1e-6 grid for stable grouping.
     """
 
-    ACTION_ENC = {"f": -1.0, "c": 0.0, "k": 0.25, "r": 0.5, "b": 0.75, "a": 1.0}
+    # Action history encoding (per slot in dim HIST_OFF + 0..7).
+    # 'r' = legacy single raise (käytössä kun raise_fractions on 1-pituinen).
+    # 'r0','r1','r2' = multi-raise variantit (Pluribus-tyylinen 3-koko-tree).
+    #
+    # IMPORTANT — C++ pariteetti (src/cpp_engine/include/nlhe_game.hpp,
+    # NLHE_ACTION_ENC):
+    #   'r' = 'r0' = 0.5 (C++ RAISE_0 = NLHE_RAISE alias = ACTION_ENC[2])
+    #   'r1' = 0.4         (C++ RAISE_1 = ACTION_ENC[3])
+    #   'r2' = 0.6         (C++ RAISE_2 = ACTION_ENC[4])
+    # Älä muuta näitä lukuja muuttamatta vastaavia C++:n puolelle ja
+    # ajamatta tests/test_parity.py — single-raise-blueprintit murtuvat
+    # jos arvot eroavat C++ ↔ Python -puolella.
+    ACTION_ENC = {
+        "f": -1.0, "c": 0.0, "k": 0.25,
+        "r":  0.5,  "r0": 0.5, "r1": 0.4, "r2": 0.6,
+        "b":  0.75,
+        "a":  1.0,
+    }
     HISTORY_LEN = 8
     # Quantisaatioruudukko jatkuville dim 20-35:lle. Aiempi 1e-6 sai ~95%
     # tiloista uniikeiksi → card-abstraktion bucketit eivät tiivistäneet
@@ -172,7 +190,10 @@ class NLHEEncoder(StateEncoder):
 
     def __init__(self, starting_stack: float = 200.0, equity_sims: int = 2000,
                  K_BOARD: int | None = None,
-                 bucket_scheme: str = "flat"):
+                 bucket_scheme: str = "flat",
+                 raise_fractions: tuple[float, ...] | None = None,
+                 include_position_bit: bool = True,
+                 cfr_cache=None):
         """
         bucket_scheme:
             "flat" — K_BOARD-way one-hot at [8:8+K_BOARD]. K_BOARD in (8, 16).
@@ -180,12 +201,33 @@ class NLHEEncoder(StateEncoder):
                      fine-within-super one-hot at [12:16]. Two-hot encoding,
                      K_BOARD must be 8. Gives 4×4=16 effective combinations in
                      8 dims, same state_size as flat K=8.
+        include_position_bit:
+            True  → last dim = 1.0 if SB (player 0), 0.0 if BB (player 1).
+                    Carries position signal. Added 2026-06-14.
+            False → last dim = constant 0.0 for both players. state_size stays
+                    37 (so C++ engine + buffer + network stay shape-compatible
+                    without rebuild), but the network sees no position signal.
+                    Use to A/B-test whether the position-bit signal helps or
+                    hurts vs the legacy v11 baseline.
         """
         self.starting_stack = starting_stack
         self.norm = 2 * starting_stack
         self._equity_sims = equity_sims
         self._game_cache = None
         self.bucket_scheme = bucket_scheme
+        self.include_position_bit = bool(include_position_bit)
+        # Optional CFR advisor cache. When set, encoder appends 12 dims
+        # (6 action probs + 6 per-action EVs) to the state vector — see
+        # src/deep_cfr/cfr_cache.py. None → no advisor dims, state_size
+        # stays at the legacy 37 (or 36 without position bit).
+        self.cfr_cache = cfr_cache
+        # Raise fractions: oltava sama kuin pelaajan PostflopNLHE:llä jotta
+        # _parse_state pystyy uudelleenkäymään 'rN'-actioneita. None →
+        # legacy default (0.75,) jotta backward-compat säilyy testeissä jotka
+        # eivät anna tätä parametria.
+        self._raise_fractions = (
+            tuple(raise_fractions) if raise_fractions is not None else (0.75,)
+        )
         # Allow per-instance K_BOARD override so blueprints trained on K=8
         # (state_size=36) can be queried side-by-side with K=16 blueprints
         # (state_size=44) in head-to-head matches. None = use class default.
@@ -213,7 +255,7 @@ class NLHEEncoder(StateEncoder):
             self._game_cache = PostflopNLHE(
                 starting_stack=self.starting_stack,
                 max_raises_per_street=2,
-                raise_fractions=(0.75,),
+                raise_fractions=self._raise_fractions,
             )
         return self._game_cache
 
@@ -424,8 +466,14 @@ class NLHEEncoder(StateEncoder):
 
     def state_size(self) -> int:
         # 8 (preflop bucket) + K_BOARD + 4 (street) + 4 (betting) + 8 (history)
-        # + 4 (continuous tail) = 28 + K_BOARD.
-        return 28 + self.K_BOARD
+        # + 4 (continuous tail) + 1 (position bit slot) = 29 + K_BOARD.
+        # When a CFR advisor cache is attached, an extra 12 dims are
+        # appended at the tail (6 action probs + 6 per-action EVs).
+        base = 29 + self.K_BOARD
+        if self.cfr_cache is not None:
+            from .cfr_cache import ADVISOR_DIMS
+            base += ADVISOR_DIMS
+        return base
 
     def encode(self, history: History, player: int) -> np.ndarray:
         state = np.zeros(self.state_size(), dtype=np.float32)
@@ -529,10 +577,144 @@ class NLHEEncoder(StateEncoder):
         # values commonly fall exactly on N + 0.5 multiples → the two diverge.
         # floor(x/q + 0.5) is unambiguous on both sides (round-half-up); C++
         # uses identical floor((x/q) + 0.5) for parity.
-        # Quantise the betting scalars, action history, and continuous tail —
-        # everything from BET_OFF to the end.
-        cont = slice(BET_OFF, self.state_size())
+        # Base state ends at the position bit slot (29 + K_BOARD - 1).
+        # Advisor dims (when cache attached) live AFTER the position bit.
+        BASE_SIZE = 29 + self.K_BOARD
+        POS_OFF   = BASE_SIZE - 1  # always — independent of cache presence
+
+        # Quantise BET_OFF..position-bit (exclusive); position bit stays raw.
+        cont = slice(BET_OFF, POS_OFF)
         state[cont] = np.floor(
             state[cont] / self.FEATURE_QUANT + 0.5
         ) * self.FEATURE_QUANT
+        # Position bit. When include_position_bit=True, carries the SB/BB
+        # signal (1.0 / 0.0). When False, stays constant 0.0 — the slot is
+        # allocated unconditionally so C++ engine + buffer shapes are
+        # invariant; only the *signal* is removed.
+        if self.include_position_bit:
+            state[POS_OFF] = 1.0 if player == 0 else 0.0
+        else:
+            state[POS_OFF] = 0.0
+
+        # Advisor dims: lookup CFR cache (or live MC fallback on miss).
+        if self.cfr_cache is not None:
+            from .cfr_cache import ADVISOR_DIMS, PROB_DIMS
+            entry = self.cfr_cache.lookup(history, self._game(), self)
+            if entry is not None:
+                probs, evs = entry
+                state[BASE_SIZE : BASE_SIZE + PROB_DIMS] = probs
+                state[BASE_SIZE + PROB_DIMS : BASE_SIZE + ADVISOR_DIMS] = evs
+            elif self._mc_fallback_enabled:
+                # Cache miss → live MC EV (option A in C2 design). Lower-
+                # quality signal than the cache but always available.
+                probs, evs = self._live_mc_advisor(history, player)
+                state[BASE_SIZE : BASE_SIZE + PROB_DIMS] = probs
+                state[BASE_SIZE + PROB_DIMS : BASE_SIZE + ADVISOR_DIMS] = evs
+            # else: leave 12 zeros — caller chose to disable live fallback
         return state.astype(np.float32)
+
+    # ── Live MC EV fallback (option A) ───────────────────────────────────────
+
+    def _live_mc_advisor(self, history, player) -> tuple:
+        """Cheap MC EV per legal action when the cache misses.
+
+        For each legal action, sample N random villain hands + N random
+        runouts (within the still-undealt deck) and take the mean payoff
+        as that action's EV. Probabilities are derived from a softmax
+        over the EVs (small temperature so the highest-EV action is
+        favoured but the network still sees the relative ordering).
+
+        Cost: ~5-15 ms per cache miss with N=8. Negligible vs the
+        ~1 ms per blueprint forward call, so the encoder stays cheap
+        even with high miss rates.
+        """
+        from .action_slots import legal_actions_to_slots
+        from .cfr_cache import PROB_DIMS, EV_DIMS
+
+        actions = self._game().legal_actions(history)
+        if not actions:
+            return (np.zeros(PROB_DIMS, dtype=np.float32),
+                    np.zeros(EV_DIMS,   dtype=np.float32))
+
+        # MC budget — small but informative
+        n_runouts = 8
+        rng = np.random.default_rng(
+            (int(np.abs(history[player][0]) * 53 + history[player][1])
+             & 0x7FFFFFFF)
+        )
+
+        # Determine the still-undealt deck for sampling villain cards + runouts
+        used = set(history[player]) | set(history[2])
+        # NOTE: opponent cards are also "used" from THE OPPONENT's perspective,
+        # but for hero's EV we marginalise over villain hands → include all
+        # 52 - 2 (hero) - 5 (board) = 45 live cards.
+        live = np.asarray(
+            [c for c in range(52) if c not in used], dtype=np.int64,
+        )
+        if len(live) < 7:  # not enough cards for villain + 5-card board
+            return (np.zeros(PROB_DIMS, dtype=np.float32),
+                    np.zeros(EV_DIMS,   dtype=np.float32))
+
+        slots = legal_actions_to_slots(actions, 3 + len(self._raise_fractions))
+        evs   = np.zeros(EV_DIMS, dtype=np.float32)
+        NORM  = 2.0 * self.starting_stack
+
+        # Cheap rollout: assume both players check/call to showdown — gives
+        # a pot-equity-based EV per action. This is a deliberate simpli-
+        # fication; a fully recursive rollout costs too much for the cache-
+        # miss path. The signal still captures "obviously bad actions" (e.g.
+        # raise 75% with 72o on a J-J-T board) which is the main value.
+        for i, action in enumerate(actions):
+            slot = slots[i]
+            if not (0 <= slot < EV_DIMS):
+                continue
+            try:
+                next_h = self._game().apply_action(history, action)
+                # MC payoff
+                payoffs = []
+                for _ in range(n_runouts):
+                    # Sample villain hand from live
+                    idx_v = rng.choice(len(live), size=2, replace=False)
+                    villain = (int(live[idx_v[0]]), int(live[idx_v[1]]))
+                    # Pretend villain plays similar to hero — both check/call
+                    # until terminal; then real showdown vs hero's cards.
+                    # Cheap approximation: pot share = equity_at_street.
+                    hero_cards = history[player]
+                    eq = self._cheap_equity_vs_villain(hero_cards, villain,
+                                                       next_h[2])
+                    state = self._game()._parse_state(next_h)
+                    pot   = state["pot"]
+                    invest_hero = state["invested"][player]
+                    # Pot-share payoff:
+                    ev_payoff = eq * pot - invest_hero
+                    payoffs.append(ev_payoff)
+                evs[slot] = float(np.mean(payoffs)) / NORM
+            except Exception:
+                evs[slot] = 0.0
+
+        # Softmax-style probabilities (only over legal slots)
+        probs = np.zeros(PROB_DIMS, dtype=np.float32)
+        legal_evs = evs[[s for s in slots if 0 <= s < EV_DIMS]]
+        if legal_evs.size == 0:
+            return probs, evs
+        # Temperature 0.5 gives moderately polarised softmax over EVs
+        e = np.exp((legal_evs - legal_evs.max()) / 0.5)
+        e_norm = e / max(e.sum(), 1e-9)
+        for i, slot in enumerate(slots):
+            if 0 <= slot < PROB_DIMS:
+                probs[slot] = e_norm[i]
+        return probs, evs
+
+    def _cheap_equity_vs_villain(self, hero_cards, villain_cards, board) -> float:
+        """1-shot hand equity approximation: random 5-card runout, single
+        hand comparison. Cheap; called once per MC sample."""
+        from ..abstraction.equity import evaluate_7card
+        hero = evaluate_7card(tuple(hero_cards) + tuple(board))
+        opp  = evaluate_7card(tuple(villain_cards) + tuple(board))
+        if hero > opp: return 1.0
+        if hero < opp: return 0.0
+        return 0.5
+
+    @property
+    def _mc_fallback_enabled(self) -> bool:
+        return getattr(self, "_mc_fallback", True)

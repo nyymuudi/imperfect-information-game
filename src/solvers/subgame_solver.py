@@ -362,7 +362,11 @@ def _rollout_expected_value(
     actions = game.legal_actions(history)
 
     state_vec = encoder.encode(history, player)
-    probs     = blueprint.query(state_vec, len(actions))
+    # Slot-indexed query — correct for postflop no-bet (legal=['c','r','a']
+    # → slots [0, 2, 3] not [0, 1, 2]) and single-raise ALL_IN remap.
+    from ..deep_cfr.action_slots import legal_actions_to_slots
+    slots     = legal_actions_to_slots(actions, blueprint.metadata.action_size)
+    probs     = blueprint.query_by_slots(state_vec, slots)
 
     ev0, ev1 = 0.0, 0.0
     for prob, action in zip(probs, actions):

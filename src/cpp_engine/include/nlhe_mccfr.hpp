@@ -67,6 +67,16 @@ struct NLHETraversalConfig {
     int      max_actions       = 4;
     RegretTarget target        = RegretTarget::CFRPLUS;  // shares Leduc enum
     NLHEGameConfig game_cfg;
+
+    // Pluribus-style dynamic pruning (Brown & Sandholm 2019).
+    // At a traversing-player node, actions with blueprint probability below
+    // prune_threshold are skipped (not rolled out, not regret-updated).
+    // The node value is computed over the visited actions only, renormalised.
+    // 0.0 = pruning disabled. Recommended 0.001…0.01. Pruning activates only
+    // when iteration >= prune_after_iter so early-iteration regret signal
+    // (which often shows uniform-ish blueprint output) is not lost.
+    float prune_threshold     = 0.0f;
+    int   prune_after_iter    = 0;
 };
 
 // ── Engine ────────────────────────────────────────────────────────────────────

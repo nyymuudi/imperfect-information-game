@@ -1,4 +1,11 @@
 #include "torch_model.hpp"
+#include "cfr_cache_loader.hpp"
+
+namespace cfr {
+// Forward decl — defined later in this file (see "CFR cache loader integration").
+const CFRCacheLoader& cfr_cache_loader();
+}
+
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -144,9 +151,16 @@ private:
 
 // Process-global scheme. Set from Python (bindings) before training so the
 // MCCFR loop's encoder calls produce the right layout. Default: flat (v3).
-static int g_scheme = 0;
+static int  g_scheme = 0;
 void NLHEStateEncoder::set_scheme(int s) { g_scheme = s; }
 int  NLHEStateEncoder::get_scheme()      { return g_scheme; }
+
+// Process-global position-bit toggle. Default false → encode() writes the
+// SB/BB signal as usual. When true, encode() writes 0.0 in the position-bit
+// slot for both players (v15 ablation).
+static bool g_zero_position_bit = false;
+void NLHEStateEncoder::set_zero_position_bit(bool z) { g_zero_position_bit = z; }
+bool NLHEStateEncoder::get_zero_position_bit()       { return g_zero_position_bit; }
 
 void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     const float STACK = state.cfg.starting_stack;
@@ -286,13 +300,15 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
     out[BET_OFF + 2] = std::min(state.stacks[player]   / STACK, 1.0f);
     out[BET_OFF + 3] = std::min(state.stacks[1-player] / STACK, 1.0f);
 
-    // Action history (last 8 actions)
+    // Action history (last 8 actions). NLHE_ACTION_ENC has NLHE_NUM_ACTIONS
+    // (=6) entries; bound-check against capacity so a corrupt action_history
+    // value can't reach into adjacent memory.
     static constexpr int HIST_SLOTS = 8;
     int hist_begin = std::max(0, state.action_count - HIST_SLOTS);
     for(int i = hist_begin; i < state.action_count; ++i) {
         int slot   = HIST_OFF + (i - hist_begin);
         int8_t act = state.action_history[i];
-        if(act >= 0 && act < 4)
+        if(act >= 0 && act < NLHE_NUM_ACTIONS)
             out[slot] = NLHE_ACTION_ENC[act];
     }
 
@@ -306,11 +322,42 @@ void NLHEStateEncoder::encode(const NLHEState& state, int player, float* out) {
                        ? std::min(eff_stack / state.pot, 10.0f) / 10.0f
                        : 1.0f;
 
-    // Quantise BET_OFF..STATE_SIZE to FEATURE_QUANT grid. floor(x/q + 0.5)
-    // matches numpy semantics on the 0.5 boundary (vs std::round).
+    // Quantise BET_OFF..(BASE_STATE_SIZE-1) to FEATURE_QUANT grid.
+    // floor(x/q + 0.5) matches numpy semantics on the 0.5 boundary (vs
+    // std::round). The position bit (BASE_STATE_SIZE-1) is intentionally
+    // excluded so it stays exactly {0, 1}. The advisor slots [BASE_STATE_SIZE
+    // : STATE_SIZE] are NOT quantised either — they are left at 0.0 by the
+    // fill() above and Python will overwrite them with cache lookup values.
     constexpr float FEATURE_QUANT = 0.05f;
-    for (int i = BET_OFF; i < STATE_SIZE; ++i)
+    constexpr int POS_OFF = BASE_STATE_SIZE - 1;
+    for (int i = BET_OFF; i < POS_OFF; ++i)
         out[i] = std::floor(out[i] / FEATURE_QUANT + 0.5f) * FEATURE_QUANT;
+
+    // Position bit (at index BASE_STATE_SIZE-1).
+    out[POS_OFF] = g_zero_position_bit ? 0.0f
+                                       : ((player == 0) ? 1.0f : 0.0f);
+
+    // Advisor slots [BASE_STATE_SIZE : STATE_SIZE] = 12 zeros from the
+    // initial std::fill at line 162. If a CFR cache has been attached via
+    // set_cache_path(), look it up and overwrite the 12 advisor slots
+    // with cache values (probs at [37:43], EVs at [43:49]). On miss, slots
+    // stay at zero — the regret network will see "no advisor info" for
+    // those states, matching the legacy Python cache-miss behaviour.
+    {
+        const auto& loader = cfr_cache_loader();
+        if (loader.loaded()) {
+            uint64_t k = key_from_state_vector(out, STACK);
+            const CacheEntry* e = loader.lookup(k);
+            if (e != nullptr) {
+                // probs[0:6] -> slots [BASE_STATE_SIZE : BASE_STATE_SIZE+6]
+                // evs  [0:6] -> slots [BASE_STATE_SIZE+6 : STATE_SIZE]
+                for (int i = 0; i < 6; ++i)
+                    out[BASE_STATE_SIZE + i]     = e->probs[i];
+                for (int i = 0; i < 6; ++i)
+                    out[BASE_STATE_SIZE + 6 + i] = e->evs[i];
+            }
+        }
+    }
 }
 
 // NOTE: this file previously hosted a Monte Carlo EHS cache + canonical-key
@@ -340,6 +387,141 @@ std::vector<float> NLHEStateEncoder::encode_vec(const NLHEState& state, int play
     std::vector<float> v(STATE_SIZE);
     encode(state, player, v.data());
     return v;
+}
+
+// ── CFR cache loader integration ──────────────────────────────────────────────
+//
+// Static instance held in this TU so the encoder can write advisor dims
+// inline during encode(). Single-process, single-shared-state — matches
+// the existing set_scheme() / set_zero_position_bit() pattern in this file.
+
+namespace {
+CFRCacheLoader& cfr_cache_loader_mut() {
+    static CFRCacheLoader instance;
+    return instance;
+}
+} // namespace
+
+const CFRCacheLoader& cfr_cache_loader() {
+    return cfr_cache_loader_mut();
+}
+
+bool NLHEStateEncoder::set_cache_path(const std::string& path) {
+    auto& loader = cfr_cache_loader_mut();
+    if (path.empty()) {
+        loader = CFRCacheLoader{};   // reset → not loaded
+        return true;
+    }
+    return loader.load(path);
+}
+
+bool NLHEStateEncoder::cache_loaded() {
+    return cfr_cache_loader().loaded();
+}
+
+size_t NLHEStateEncoder::cache_size() {
+    return cfr_cache_loader().size();
+}
+
+// Mirrors src/deep_cfr/cfr_cache.py::key_from_state_vector. The cache build
+// pipeline (collect_visit_distribution + lookup) uses the SAME derivation, so
+// keys generated here MUST agree bit-for-bit with the Python keys for hits to
+// happen. The encoded state vector layout is:
+//
+//   [0:8]   preflop bucket one-hot
+//   [8:16]  board bucket one-hot (zeros preflop)
+//   [16:20] street one-hot
+//   [20]    pot / (2*stack)
+//   [21]    to_call / (2*stack)
+//   [22]    my stack / stack
+//   [23]    opp stack / stack
+//   [24:32] action history (last 8, encoded scalars)
+//   [32:36] continuous features
+//   [36]    position bit
+uint64_t NLHEStateEncoder::key_from_state_vector(const float* sv, float starting_stack) {
+    auto argmax_block = [&](int lo, int hi) -> int {
+        int best = 0; float bv = sv[lo];
+        for (int i = lo + 1; i < hi; ++i) {
+            if (sv[i] > bv) { bv = sv[i]; best = i - lo; }
+        }
+        return best;
+    };
+
+    int hand_bucket = argmax_block(0, 8);
+
+    int board_bucket = 0;
+    {
+        float bsum = 0.0f;
+        for (int i = 8; i < 16; ++i) bsum += sv[i];
+        if (bsum > 0.0f) board_bucket = argmax_block(8, 16);
+    }
+
+    int street = argmax_block(16, 20);
+    int player = (sv[36] > 0.5f) ? 0 : 1;
+
+    // Raise count heuristic: count history slots that look like raise/all-in.
+    // 'r0'=0.5, 'r1'=0.4, 'r2'=0.6, allin=1.0
+    int raises = 0;
+    for (int i = 24; i < 32; ++i) {
+        float v = sv[i];
+        bool raise_like = (v > 0.35f && v < 0.65f) || (std::abs(v - 0.6f) < 0.02f);
+        bool allin_like = (v >= 0.95f);
+        if (raise_like || allin_like) ++raises;
+    }
+    int last_aggressor_rel = (raises > 0) ? 2 : 0;
+
+    // Pot/SPR buckets — undo encoder normalisation, then re-bucket.
+    float pot_norm  = sv[20];
+    float pot_chips = pot_norm * (2.0f * starting_stack);
+    float my_stack  = sv[22] * starting_stack;
+    float opp_stack = sv[23] * starting_stack;
+    float sb_chips  = 1.0f;   // matches PostflopNLHE default sb=1
+
+    auto pot_bucket_fn = [&](float pc, float sb) -> int {
+        float pot_bb = pc / (2.0f * sb);
+        if (pot_bb < 5)   return 0;
+        if (pot_bb < 8)   return 1;
+        if (pot_bb < 14)  return 2;
+        if (pot_bb < 22)  return 3;
+        if (pot_bb < 35)  return 4;
+        if (pot_bb < 60)  return 5;
+        if (pot_bb < 100) return 6;
+        return 7;
+    };
+    auto spr_bucket_fn = [&](float ms, float os, float pc) -> int {
+        float eff = std::min(ms, os);
+        if (pc <= 1e-6f) return 7;
+        float spr = eff / pc;
+        if (spr < 0.5)  return 0;
+        if (spr < 1.5)  return 1;
+        if (spr < 3)    return 2;
+        if (spr < 5)    return 3;
+        if (spr < 9)    return 4;
+        if (spr < 15)   return 5;
+        if (spr < 25)   return 6;
+        return 7;
+    };
+    int pb = pot_bucket_fn(pot_chips, sb_chips);
+    int sb = spr_bucket_fn(my_stack, opp_stack, std::max(pot_chips, 1e-6f));
+
+    // Pack: same field widths as Python encode_key().
+    //   street(2) player(1) raises(3) last_aggressor(2)
+    //   pot_bucket(3) spr_bucket(3) board_bucket(3) hand_bucket(3) = 20 bits
+    auto clamp = [](int v, int width) -> uint64_t {
+        int max = (1 << width) - 1;
+        return (uint64_t)std::max(0, std::min(v, max));
+    };
+    uint64_t key = 0;
+    int off = 0;
+    key |= clamp(street, 2)             << off; off += 2;
+    key |= clamp(player, 1)             << off; off += 1;
+    key |= clamp(raises, 3)             << off; off += 3;
+    key |= clamp(last_aggressor_rel, 2) << off; off += 2;
+    key |= clamp(pb, 3)                 << off; off += 3;
+    key |= clamp(sb, 3)                 << off; off += 3;
+    key |= clamp(board_bucket, 3)       << off; off += 3;
+    key |= clamp(hand_bucket, 3)        << off; off += 3;
+    return key;
 }
 
 #ifdef CFR_TORCH_AVAILABLE
@@ -431,11 +613,14 @@ std::vector<float> OnnxStrategyModel::forward(
 #ifdef CFR_ORT_AVAILABLE
     if (!loaded_) return {};
 
-    std::vector<float> mask(4, 0.0f);
-    for (int i = 0; i < max_actions && i < 4; ++i) mask[i] = 1.0f;
+    // ONNX action mask is sized to engine capacity (NLHE_NUM_ACTIONS).
+    // Old 4-action ONNX models will fail with a shape mismatch — re-export
+    // the .onnx file with NLHE_NUM_ACTIONS outputs before deploying.
+    std::vector<float> mask(NLHE_NUM_ACTIONS, 0.0f);
+    for (int i = 0; i < max_actions && i < NLHE_NUM_ACTIONS; ++i) mask[i] = 1.0f;
 
     std::vector<int64_t> state_shape = {1, (int64_t)state_vec.size()};
-    std::vector<int64_t> mask_shape  = {1, 4};
+    std::vector<int64_t> mask_shape  = {1, NLHE_NUM_ACTIONS};
 
     auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
@@ -458,7 +643,7 @@ std::vector<float> OnnxStrategyModel::forward(
     );
 
     auto* data = outputs[0].GetTensorMutableData<float>();
-    return std::vector<float>(data, data + 4);
+    return std::vector<float>(data, data + NLHE_NUM_ACTIONS);
 #else
     (void)state_vec; (void)max_actions;
     return {};
@@ -475,13 +660,13 @@ std::vector<float> OnnxStrategyModel::forward_batch(
     int batch      = (int)max_actions_vec.size();
     int state_size = (int)states.size() / batch;
 
-    std::vector<float> masks(batch * 4, 0.0f);
+    std::vector<float> masks(batch * NLHE_NUM_ACTIONS, 0.0f);
     for (int b = 0; b < batch; ++b)
-        for (int a = 0; a < max_actions_vec[b] && a < 4; ++a)
-            masks[b * 4 + a] = 1.0f;
+        for (int a = 0; a < max_actions_vec[b] && a < NLHE_NUM_ACTIONS; ++a)
+            masks[b * NLHE_NUM_ACTIONS + a] = 1.0f;
 
     std::vector<int64_t> state_shape = {batch, state_size};
-    std::vector<int64_t> mask_shape  = {batch, 4};
+    std::vector<int64_t> mask_shape  = {batch, NLHE_NUM_ACTIONS};
 
     auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 

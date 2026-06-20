@@ -2,8 +2,9 @@
 src/deep_cfr/cpp_backend.py
 
 C++ MCCFR backend for DeepCFRSolver.
-Buffer samples carry full 36-dim state vectors — training features
-are identical to LibTorch inference features.
+Buffer samples carry full 37-dim state vectors — training features
+are identical to LibTorch inference features. (Was 36-dim before
+2026-06-14; position bit added at last index.)
 """
 
 from __future__ import annotations
@@ -196,12 +197,26 @@ class NLHECppBackend:
     conflicting-one-hot pathology that _collapse_by_state exists to remove.
     """
 
-    STATE_SIZE = 36  # matches NLHEStateEncoder::STATE_SIZE (K_BOARD=8)
+    # 2026-06-16: STATE_SIZE bumped 37 → 49 to make room for the 12 CFR
+    # advisor dims appended at the tail (6 probs + 6 EVs). C++ writes
+    # ZEROS to those slots (no cache lookup in-engine yet); the Python
+    # wrapper backfills them in to_tensors() when a cache is attached.
+    # When no cache is attached, advisor dims stay at 0.0 and the network
+    # treats them as a no-information default — equivalent to the legacy
+    # 37-dim layout from a learnability standpoint.
+    BASE_STATE_SIZE = 37
+    ADVISOR_DIMS    = 12
+    STATE_SIZE      = BASE_STATE_SIZE + ADVISOR_DIMS  # 49
 
     def __init__(self, n_traversals=500, regret_capacity=1 << 20,
                  strategy_capacity=1 << 20, device="cpu", seed=42,
                  starting_stack=200.0, raise_fraction=0.75, max_raises=2,
-                 regret_target: str = "instant"):
+                 regret_target: str = "instant",
+                 prune_threshold: float = 0.0,
+                 prune_after_iter: int = 0,
+                 raise_fractions: tuple[float, ...] | None = None,
+                 max_actions: int = 4,
+                 include_position_bit: bool = True):
         if not _ENGINE_AVAILABLE:
             raise ImportError("cfr_engine.so not found.")
         self.device = device
@@ -213,7 +228,27 @@ class NLHECppBackend:
         cfg.strategy_capacity = strategy_capacity
         cfg.collect_strategy  = True
         cfg.seed              = seed
-        cfg.max_actions       = 4
+        cfg.max_actions       = int(max_actions)
+        # Pluribus-style dynamic pruning. 0.0 = off (default; backward compat).
+        cfg.prune_threshold   = float(prune_threshold)
+        cfg.prune_after_iter  = int(prune_after_iter)
+        # Position-bit ablation: when False, both Python encoder and C++
+        # engine write 0.0 in the slot for both players. State shape stays 37
+        # so all buffers and networks remain compatible without a rebuild —
+        # but the SB/BB signal is dropped at the source.
+        self.include_position_bit = bool(include_position_bit)
+        try:
+            _eng.NLHEStateEncoder.set_zero_position_bit(
+                not self.include_position_bit
+            )
+        except AttributeError:
+            # Old .so without the binding — log and rely on Python encoder
+            # alone. C++ traversal will still write the SB/BB signal, which
+            # means the v15 ablation is not clean. Rebuild the .so to fix.
+            if not self.include_position_bit:
+                print("[warn] cfr_engine.so missing set_zero_position_bit — "
+                      "C++ traversal will still emit position bit. Rebuild "
+                      "src/cpp_engine for a clean ablation.")
 
         # Regret target: INSTANT = per-traversal instantaneous regret (Brown et al.
         # 2019 Algorithm 1). CFRPLUS = CFR+/visits kumulatiivisena kohteena.
@@ -230,6 +265,11 @@ class NLHECppBackend:
         game_cfg.bb             = 2.0
         game_cfg.raise_fraction = raise_fraction
         game_cfg.max_raises     = max_raises
+        # Pluribus-style multi-raise puu. None tai single-element tuple
+        # → legacy single-raise (n_raise_fractions=0). 2..MAX-element tuple
+        # → multi-raise: legal_actions tuottaa RAISE_0..RAISE_{N-1}.
+        if raise_fractions is not None and len(raise_fractions) > 1:
+            game_cfg.set_raise_fractions(list(raise_fractions))
         cfg.game_cfg            = game_cfg
 
         self._engine    = _eng.NLHEMCCFREngine(cfg)
@@ -275,8 +315,15 @@ class NLHECppBackend:
 
     def to_tensors(self, export) -> tuple:
         """
-        Convert NLHEBufferExport → (X [N,STATE_SIZE], actions [N], values [N]).
-        State vectors come directly from C++ — no string parsing.
+        Convert NLHEBufferExport → (X [N, STATE_SIZE], actions [N], values [N]).
+        State vectors come directly from C++ (49 dims since 2026-06-16,
+        with advisor dims [37:49] left at zero).
+
+        When a CFR cache + encoder is attached (via ``set_cache_context``),
+        this method re-derives the abstraction key from each state vector
+        and backfills the advisor dims via cache lookup. The result is a
+        49-dim state vector matching what the Python encoder would have
+        produced — the network trains on consistent advisor signals.
         """
         n = export.n_samples
         if n == 0:
@@ -285,8 +332,41 @@ class NLHECppBackend:
                     torch.zeros(0, dtype=torch.float32))
 
         states = np.array(export.states, dtype=np.float32).reshape(n, self.STATE_SIZE)
-        X      = torch.from_numpy(states)
 
+        if not self.include_position_bit:
+            # Position bit is at index BASE_STATE_SIZE-1 (= 36) — slot 48
+            # belongs to the advisor pad, NOT the position bit.
+            states[:, self.BASE_STATE_SIZE - 1] = 0.0
+
+        # Backfill advisor dims from the cache when a context is set.
+        cache    = getattr(self, "_cache", None)
+        encoder  = getattr(self, "_encoder", None)
+        if cache is not None and encoder is not None:
+            from .cfr_cache import (
+                ADVISOR_DIMS, EV_DIMS, PROB_DIMS,
+                key_from_state_vector,
+            )
+            base = self.BASE_STATE_SIZE
+            for i in range(n):
+                k = key_from_state_vector(states[i], encoder)
+                entry = cache.lookup_by_key(k)
+                if entry is not None:
+                    probs, evs = entry
+                    states[i, base               : base + PROB_DIMS] = probs
+                    states[i, base + PROB_DIMS   : base + ADVISOR_DIMS] = evs
+                # cache miss → leave 12 zeros (Python's encoder would have
+                # used the live MC fallback here, but doing MC inside the
+                # buffer-export hot path would add ~10ms per sample. Accept
+                # the zeros — training tolerates partial advisor coverage).
+
+        X = torch.from_numpy(states)
         actions = np.array(list(export.actions), dtype=np.int64)
         values  = np.array(list(export.values),  dtype=np.float32)
         return X, torch.from_numpy(actions), torch.from_numpy(values)
+
+    def set_cache_context(self, cfr_cache, encoder) -> None:
+        """Wire a CFRCache + encoder so that to_tensors() backfills advisor
+        dims into each buffer entry. Called by DeepCFRSolver when the
+        encoder has a cache attached and the C++ engine is in use."""
+        self._cache   = cfr_cache
+        self._encoder = encoder

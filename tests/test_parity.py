@@ -123,10 +123,20 @@ def _both_vecs(hole0, hole1, board, char_actions, player):
 class TestEncoderParity:
 
     @cpp_required
-    def test_state_size_is_36(self):
+    def test_state_size_is_49(self):
+        # 29 + K_BOARD(=8) base + 12 advisor dims. Position bit at index 36,
+        # advisor slots [37:49] left at zero by C++ (Python wrapper fills
+        # them via CFR cache lookup when one is attached).
         state = make_cpp_state("AhKh", "QdJd", "7c8s9c")
         vec   = _eng.NLHEStateEncoder.encode_vec(state, 0)
-        assert len(vec) == 36
+        assert len(vec) == 49
+        assert vec[36] == pytest.approx(1.0)  # SB position bit
+        vec_bb = _eng.NLHEStateEncoder.encode_vec(state, 1)
+        assert vec_bb[36] == pytest.approx(0.0)  # BB position bit
+        # Advisor slots are always zeros from the C++ side.
+        for i in range(37, 49):
+            assert vec[i]    == pytest.approx(0.0)
+            assert vec_bb[i] == pytest.approx(0.0)
 
     @cpp_required
     def test_preflop_bucket_is_one_hot(self):

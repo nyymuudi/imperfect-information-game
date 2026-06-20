@@ -127,30 +127,58 @@ std::vector<NLHEAction> NLHEGame::legal_actions(const NLHEState& s) {
         a.push_back(NLHE_FOLD_OR_CHECK);  // check
     }
 
+    float largest_raise_add = -1.0f;
     if(can_raise && my_stack > owe + 0.01f) {
-        float raise_add = bet_amount(s);
-        if(raise_add > 0.01f)
-            a.push_back(NLHE_RAISE);
+        const int n_raises = (s.cfg.n_raise_fractions > 0)
+                             ? s.cfg.n_raise_fractions : 1;
+        // n_raises capped to enum capacity (RAISE_0..RAISE_2 = 3 slots).
+        const int n_capped = std::min(n_raises, 3);
+        // Emit one RAISE_i per distinct sized raise. Pluribuksen multi-puu.
+        float seen[3] = {-1.0f, -1.0f, -1.0f};
+        int   seen_n = 0;
+        for(int i = 0; i < n_capped; ++i) {
+            float amt = bet_amount_idx(s, i);
+            if(amt <= 0.01f) continue;
+            bool dup = false;
+            for(int j = 0; j < seen_n; ++j) {
+                if(std::fabs(amt - seen[j]) < 0.01f) { dup = true; break; }
+            }
+            if(dup) continue;
+            seen[seen_n++] = amt;
+            a.push_back(static_cast<NLHEAction>(NLHE_RAISE_0 + i));
+            if(amt > largest_raise_add) largest_raise_add = amt;
+        }
     }
 
-    // All-in: available if has chips, and is different from raise
+    // All-in: available if has chips, and is different from the largest raise.
     if(my_stack > owe + 0.01f) {
         float allin_add = my_stack - owe;
-        float raise_add = (can_raise && my_stack > owe + 0.01f) ? bet_amount(s) : -1.0f;
-        // Add ALL_IN if raise option exists and all-in is larger, or no raise option
-        if(!can_raise || allin_add > raise_add + 0.01f)
+        if(!can_raise || allin_add > largest_raise_add + 0.01f)
             a.push_back(NLHE_ALL_IN);
     }
     return a;
 }
 
-// ── Bet sizing: 75% pot (matching Python raise_fractions[0]=0.75) ─────────────
-float NLHEGame::bet_amount(const NLHEState& s) {
+// ── Bet sizing helpers ────────────────────────────────────────────────────────
+// bet_amount_idx: index into cfg.raise_fractions[]. Backward compat: when
+// n_raise_fractions == 0, falls back to cfg.raise_fraction for idx 0 only.
+float NLHEGame::bet_amount_idx(const NLHEState& s, int raise_idx) {
     const int   p   = s.current_player;
     const float owe = s.street_invest[1-p] - s.street_invest[p];
-    const float effective_pot = s.pot + owe;   // pot after calling
-    float raise_add = effective_pot * s.cfg.raise_fraction;
+    const float effective_pot = s.pot + owe;
+    float frac;
+    if(s.cfg.n_raise_fractions > 0 && raise_idx < s.cfg.n_raise_fractions) {
+        frac = s.cfg.raise_fractions[raise_idx];
+    } else {
+        // Legacy path: idx must be 0 in single-raise config.
+        frac = s.cfg.raise_fraction;
+    }
+    float raise_add = effective_pot * frac;
     return std::min(raise_add, s.stacks[p] - owe);
+}
+
+float NLHEGame::bet_amount(const NLHEState& s) {
+    return bet_amount_idx(s, 0);
 }
 
 // ── Street transition ─────────────────────────────────────────────────────────
@@ -220,8 +248,11 @@ NLHEState NLHEGame::apply_action(const NLHEState& state, NLHEAction action) {
         break;
     }
 
-    case NLHE_RAISE: {
-        float raise_add = bet_amount(s);
+    case NLHE_RAISE_0:
+    case NLHE_RAISE_1:
+    case NLHE_RAISE_2: {
+        const int raise_idx = static_cast<int>(action) - static_cast<int>(NLHE_RAISE_0);
+        float raise_add = bet_amount_idx(s, raise_idx);
         float total = owe + raise_add;
         total = std::min(total, s.stacks[p]);
         s.stacks[p]        -= total;

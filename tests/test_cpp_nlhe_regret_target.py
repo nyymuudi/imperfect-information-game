@@ -98,13 +98,18 @@ def _cpp_matrix():
     states = np.array(exp.states, dtype=np.float32).reshape(n, exp.state_size)
     actions = np.array(list(exp.actions), dtype=np.int64)
     values = np.array(list(exp.values), dtype=np.float32)
-    # collapse to {state_key: [4]}
+    # collapse to {state_key: [4]}. C++ emit_cfrplus_targets emits slots
+    # 0..NLHE_NUM_ACTIONS-1 (=6 since 2026-06-14 multi-raise refactor),
+    # but the single-raise puu only ever populates slots 0..3 (with ALL_IN
+    # remapped to 3). Filter out the trailing zero slots that would
+    # over-index the shape-4 array.
     out = {}
     for i in range(n):
         k = _state_key(states[i])
         if k not in out:
             out[k] = np.zeros(4, dtype=np.float32)
-        out[k][actions[i]] += values[i]
+        if 0 <= actions[i] < 4:
+            out[k][actions[i]] += values[i]
     return out
 
 
