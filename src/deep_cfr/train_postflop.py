@@ -322,6 +322,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="BRD-painotuksen voimakkuus. Sample-paino = base * "
                         "(1 + lambda * gap/median_gap). 0 = ei BRD-painotusta, "
                         "5-10 voimakas painotus. Suositus aloitukseen: 5.0.")
+    p.add_argument("--teacher-blueprint",    type=str, default="",
+                   help="Polku olemassa olevaan blueprint-hakemistoon joka "
+                        "toimii teacher-mallina strategy-network "
+                        "distillationiin. Vaatii --teacher-kl-weight > 0. "
+                        "Teacher-mallin metadata.state_size + action_size + "
+                        "raise-fractions tulee vastata treenattavaa konfiguraatiota.")
+    p.add_argument("--teacher-kl-weight",    type=float, default=0.0,
+                   help="KL(teacher || student) -painokerroin strategy-"
+                        "network-koulutuksen loss-funktioon. 0 = ei "
+                        "distillationia (default). Suositus aloitukseen: 0.5.")
+    p.add_argument("--aug-bucket-prob",      type=float, default=0.0,
+                   help="Counterfactual hand-bucket -augmentaation "
+                        "todennäköisyys per regret-näyte. Siirtää "
+                        "hand-bucket-one-hotin naapuriin (±radius) ja "
+                        "päivittää cache-advisor-dimit uudella bucket:lla. "
+                        "Regret-target säilyy → pakottaa verkon olemaan "
+                        "sileä equity-abstraktion sisällä. 0 = pois (default). "
+                        "Suositus aloitukseen: 0.3.")
+    p.add_argument("--aug-bucket-radius",    type=int, default=1,
+                   help="Maksimi siirtyma hand-bucket-augmentaatiossa "
+                        "(±radius). Default 1 = vain välittömät naapurit.")
+    p.add_argument("--predictive-alpha",     type=float, default=0.0,
+                   help="Predictive CFR+ (Brown 2020) momentum-kerroin. "
+                        "Lisää R_t -päivitykseen termin alpha*(r_t - r_{t-1}) "
+                        "joka ennakoi seuraavan iteraation regretia. "
+                        "Empirically 3-5x nopeampi konvergenssi vs vanilla "
+                        "CFR+. 0 = pois (default). Suositus aloitukseen: 1.0.")
+    p.add_argument("--value-head-weight",    type=float, default=0.0,
+                   help="V(s) scalar value head -painokerroin. Verkko saa "
+                        "rinnakkaisen value-head:n joka oppii ennustamaan "
+                        "Σ probs * EVs (cache:n implikoiman state-arvon). "
+                        "DeepStack/ReBeL-tyylinen tukisignaali joka pakottaa "
+                        "trunkin enkoodamaan state-tason expected valuen. "
+                        "Vaatii --cfr-cache. 0 = pois (default). Suositus: 0.1.")
 
     p.add_argument("--expl-games",           type=int,   default=500,
                    help="Games per exploitability estimate in callback "
@@ -606,7 +640,37 @@ def main() -> int:
         finetune_epochs=args.finetune_epochs,
         finetune_lr=args.finetune_lr,
         aux_ev_weight=args.aux_ev_weight,
+        aug_bucket_prob=args.aug_bucket_prob,
+        aug_bucket_radius=args.aug_bucket_radius,
+        predictive_alpha=args.predictive_alpha,
+        value_head_weight=args.value_head_weight,
     )
+
+    # Teacher distillation: load teacher blueprint's strategy net and pin
+    # it to the solver so train_strategy_network can add the KL term.
+    if args.teacher_blueprint and args.teacher_kl_weight > 0:
+        from pathlib import Path as _P
+        if not _P(args.teacher_blueprint).exists():
+            sys.exit(f"[error] teacher blueprint not found: {args.teacher_blueprint}")
+        teacher_bp = Blueprint.load(args.teacher_blueprint, device=device)
+        if teacher_bp.metadata.state_size != solver.encoder.state_size():
+            sys.exit(
+                f"[error] teacher state_size {teacher_bp.metadata.state_size} "
+                f"≠ student encoder state_size {solver.encoder.state_size()}. "
+                f"Match --cfr-cache / --raise-fractions to teacher's config."
+            )
+        if teacher_bp.metadata.action_size != solver.max_actions:
+            sys.exit(
+                f"[error] teacher action_size {teacher_bp.metadata.action_size} "
+                f"≠ student action_size {solver.max_actions}."
+            )
+        solver.teacher_net = teacher_bp._net          # frozen, just for forward
+        solver.teacher_kl_weight = float(args.teacher_kl_weight)
+        # Ensure no gradient tracking on teacher.
+        for p_ in solver.teacher_net.parameters():
+            p_.requires_grad = False
+        print(f"[teacher] loaded {args.teacher_blueprint}, "
+              f"KL weight={args.teacher_kl_weight}")
 
     # BRD exploit-gap map (loaded once before solver fully constructed).
     if args.exploit_gap_map and args.exploit_gap_lambda > 0:

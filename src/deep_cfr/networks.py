@@ -42,9 +42,11 @@ class RegretNetwork(nn.Module):
     """
 
     def __init__(self, state_size: int, action_size: int,
-                 hidden_size: int = 256, ev_head_dim: int = 0):
+                 hidden_size: int = 256, ev_head_dim: int = 0,
+                 value_head: bool = False):
         super().__init__()
         self.ev_head_dim = ev_head_dim
+        self.value_head_enabled = value_head
         # Trunk + regret head as one Sequential so that ``self.net`` keeps
         # the legacy single-output layout for LibTorch export.
         self.net = nn.Sequential(
@@ -62,10 +64,17 @@ class RegretNetwork(nn.Module):
             # at index 5 in self.net). Forward computes both heads in
             # one pass when ``return_aux=True``.
             self.ev_head = nn.Linear(hidden_size, ev_head_dim)
+        if value_head:
+            # Scalar state-value head (DeepStack / ReBeL style). Trained on
+            # an auxiliary V(s) target — defaults to Σ probs * EVs from
+            # the cache when state has advisor dims. Output is a single
+            # scalar normalised by 2*starting_stack (same scale as cache EVs).
+            self.value_head = nn.Linear(hidden_size, 1)
 
     def forward(self, x: torch.Tensor,
                 return_aux: bool = False) -> torch.Tensor:
-        if not return_aux or self.ev_head_dim == 0:
+        has_extra = self.ev_head_dim > 0 or self.value_head_enabled
+        if not return_aux or not has_extra:
             return self.net(x)
         # Run all trunk layers except the final Linear (= regret head).
         h = x
@@ -73,8 +82,9 @@ class RegretNetwork(nn.Module):
         for layer in layers[:-1]:
             h = layer(h)
         regret = layers[-1](h)
-        ev = self.ev_head(h)
-        return regret, ev
+        ev = self.ev_head(h)         if self.ev_head_dim > 0       else None
+        value = self.value_head(h).squeeze(-1) if self.value_head_enabled else None
+        return regret, ev, value
 
 
 class StrategyNetwork(nn.Module):
@@ -119,6 +129,13 @@ def train_regret_network(
     exploit_gap_map: dict | None = None,
     exploit_gap_lambda: float = 0.0,
     exploit_gap_encoder=None,
+    aug_bucket_prob:   float = 0.0,
+    aug_bucket_radius: int   = 1,
+    aug_cache=None,
+    aug_encoder=None,
+    value_head_weight: float = 0.0,
+    value_head_offset: int   = 37,
+    value_head_dim:    int   = 12,
 ) -> float:
     """
     Train the regret network on the replay buffer.
@@ -146,8 +163,17 @@ def train_regret_network(
         optimizer = torch.optim.Adam(network.parameters(), lr=lr)
 
     use_aux = aux_ev_weight > 0.0 and getattr(network, "ev_head_dim", 0) > 0
+    use_value = (value_head_weight > 0.0
+                 and getattr(network, "value_head_enabled", False))
     use_bd  = (exploit_gap_map is not None and exploit_gap_lambda > 0
                and exploit_gap_encoder is not None)
+    use_aug = (aug_bucket_prob > 0.0 and aug_bucket_radius >= 1
+               and aug_cache is not None and aug_encoder is not None)
+    if use_aug:
+        # Reuse Python's keying so re-derived cache keys match the cache build.
+        import numpy as _np_aug
+        from .cfr_cache import key_from_state_vector as _key_fn_aug
+
     if use_bd:
         # Normalise gaps to median for stable lambda interpretation. Mapping
         # values are in mbb/decision; median is a reasonable per-spot baseline.
@@ -163,6 +189,47 @@ def train_regret_network(
     for _ in range(epochs):
         states, targets, weights = buffer.sample_batch(batch_size)
         device = next(network.parameters()).device
+
+        if use_aug:
+            # Counterfactual hand-bucket augmentation: with prob p, shift
+            # each sample's hand bucket by a small random offset (±radius)
+            # and re-lookup the cache to refresh advisor dims. Regret
+            # target stays fixed → the network learns that adjacent
+            # equity buckets should produce similar regrets (smoothness
+            # over the abstraction). The cache's [37:43] probs and [43:49]
+            # EVs are updated to match the new bucket so the input stays
+            # internally consistent.
+            BASE = 37
+            P_OFF = BASE
+            EV_OFF = BASE + 6
+            for i in range(len(states)):
+                if _np_aug.random.random() >= aug_bucket_prob:
+                    continue
+                hb = int(_np_aug.argmax(states[i, :8]))
+                # Pick a non-zero offset in [-radius, radius]
+                offsets = [o for o in range(-aug_bucket_radius, aug_bucket_radius + 1)
+                           if o != 0]
+                if not offsets:
+                    continue
+                new_hb = max(0, min(7, hb + int(_np_aug.random.choice(offsets))))
+                if new_hb == hb:
+                    continue
+                states[i, :8] = 0.0
+                states[i, new_hb] = 1.0
+                # Re-derive cache key from the perturbed state; rewrite
+                # advisor on hit, zero them on miss (matches cache lookup
+                # semantics).
+                try:
+                    k = _key_fn_aug(states[i], aug_encoder)
+                    entry = aug_cache.lookup_by_key(int(k))
+                    if entry is not None:
+                        probs_n, evs_n = entry
+                        states[i, P_OFF:P_OFF + 6] = probs_n
+                        states[i, EV_OFF:EV_OFF + 6] = evs_n
+                    else:
+                        states[i, P_OFF:P_OFF + 12] = 0.0
+                except Exception:
+                    pass
 
         if use_bd:
             # Per-sample BRD weight: 1 + λ * min(gap / median_gap, MAX_RATIO).
@@ -190,12 +257,26 @@ def train_regret_network(
         t = torch.tensor(targets, dtype=torch.float32).to(device)
         w = torch.tensor(weights, dtype=torch.float32).to(device)
 
-        if use_aux:
-            pred_regret, pred_ev = network(s, return_aux=True)
-            ev_target = s[:, aux_ev_offset : aux_ev_offset + aux_ev_dim]
+        if use_aux or use_value:
+            pred_regret, pred_ev, pred_v = network(s, return_aux=True)
             regret_loss = F.huber_loss(pred_regret, t, reduction='none').mean(dim=1)
-            ev_loss     = F.mse_loss(pred_ev, ev_target, reduction='none').mean(dim=1)
-            element_loss = regret_loss + aux_ev_weight * ev_loss
+            element_loss = regret_loss
+            if use_aux and pred_ev is not None:
+                ev_target = s[:, aux_ev_offset : aux_ev_offset + aux_ev_dim]
+                ev_loss   = F.mse_loss(pred_ev, ev_target, reduction='none').mean(dim=1)
+                element_loss = element_loss + aux_ev_weight * ev_loss
+            if use_value and pred_v is not None:
+                # V(s) target = Σ_a probs[a] * EVs[a] across the cache slots
+                # in the state vector. Slots [37:43] are probs, [43:49] are
+                # EVs (NORM-scaled). Cache miss → both blocks are zero so
+                # target = 0 (network learns "no info → zero value"). For
+                # cache hits this is a legitimate expected-value scalar in
+                # the same NORM scale as the cache EVs.
+                p_slice = s[:, value_head_offset : value_head_offset + 6]
+                e_slice = s[:, value_head_offset + 6 : value_head_offset + value_head_dim]
+                v_target = (p_slice * e_slice).sum(dim=1)
+                v_loss   = F.mse_loss(pred_v, v_target, reduction='none')
+                element_loss = element_loss + value_head_weight * v_loss
             weighted_loss = (element_loss * w).mean()
         else:
             pred = network(s)
@@ -218,6 +299,8 @@ def train_strategy_network(
     batch_size: int = 256,
     lr: float = 1e-3,
     optimizer=None,
+    teacher_net=None,
+    teacher_kl_weight: float = 0.0,
 ) -> float:
     """
     Train the strategy network on the strategy buffer.
@@ -226,13 +309,29 @@ def train_strategy_network(
     iterations carry more weight because their strategies are closer to
     equilibrium). Trained ONCE at the end of all CFR iterations.
 
-    Returns average loss over the final epoch.
+    When ``teacher_net`` + ``teacher_kl_weight > 0`` are given, an extra
+    KL-divergence term anchors the student's output to the teacher's
+    output on each training state. Typical use: distil v5_aux into v6
+    so the new blueprint inherits v5_aux's calibrated strategies and
+    refines from there (self-distillation reduces seed variance and can
+    smooth noisy CFR-buffer targets). teacher_net is frozen — no
+    gradient flows through it.
+
+    Returns average TOTAL loss over the final epoch.
     """
     if len(buffer) < batch_size:
         return 0.0
 
     if optimizer is None:
         optimizer = torch.optim.Adam(network.parameters(), lr=lr)
+
+    use_teacher = teacher_net is not None and teacher_kl_weight > 0.0
+    if use_teacher:
+        teacher_net.eval()
+        teacher_device = next(teacher_net.parameters()).device
+        student_device = next(network.parameters()).device
+        if teacher_device != student_device:
+            teacher_net = teacher_net.to(student_device)
 
     final_loss = 0.0
     for _ in range(epochs):
@@ -246,6 +345,24 @@ def train_strategy_network(
         # Weighted cross-entropy: -sum(target * log(pred)), clamp to avoid log(0)
         log_pred = torch.log(pred.clamp(min=1e-8))
         element_loss = -(t * log_pred).sum(dim=1)
+
+        if use_teacher:
+            with torch.no_grad():
+                # Teacher inference. Mask = all ones because the strategy
+                # buffer samples store the target policy over the full
+                # action_size; per-state legality is already baked into
+                # the saved probs via cpp_backend / Python solver.
+                mask = torch.ones_like(pred)
+                teacher_pred = teacher_net(s, mask)
+            # KL(student || teacher) = Σ student * (log student - log teacher).
+            # We use Σ teacher * (log teacher - log student) instead so the
+            # student matches the teacher's mode (standard knowledge-
+            # distillation direction; cf. Hinton 2015). Element-wise so we
+            # can weight by per-sample iteration weight too.
+            log_t = torch.log(teacher_pred.clamp(min=1e-8))
+            kl_term = (teacher_pred * (log_t - log_pred)).sum(dim=1)
+            element_loss = element_loss + teacher_kl_weight * kl_term
+
         weighted_loss = (element_loss * w).mean()
 
         optimizer.zero_grad()

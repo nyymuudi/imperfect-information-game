@@ -273,13 +273,22 @@ void NLHEMCCFREngine::accumulate_cfrplus(
                     NLHEStateEncoder::STATE_SIZE * sizeof(float));
         e.n_actions = static_cast<int8_t>(legal.size());
     }
+    const float alpha = config_.predictive_alpha;
+    const bool  use_pred = alpha > 0.0f && e.visits > 0;
     for (size_t i = 0; i < legal.size() && i < NLHE_NUM_ACTIONS; ++i) {
-        // R(I) <- max(R(I) + r^t, 0). Index by remapped slot so ALL_IN
-        // (enum 5) lands in slot 3 when max_actions==4 (single-raise puu)
-        // and gets actual training signal instead of being filtered out.
+        // R(I) <- max(R(I) + r^t [+ alpha*(r^t - prev_r^t)], 0). Indexed
+        // by remapped slot so ALL_IN (enum 5) lands in slot 3 when
+        // max_actions==4 (single-raise puu).
         int slot = nlhe_action_to_slot(legal[i], config_.max_actions);
-        if (slot >= 0 && slot < NLHE_NUM_ACTIONS)
-            e.R[slot] = std::max(e.R[slot] + instant_regret[i], 0.0f);
+        if (slot < 0 || slot >= NLHE_NUM_ACTIONS) continue;
+        const float r_t = instant_regret[i];
+        float delta = r_t;
+        if (use_pred) {
+            // Predictive CFR+ momentum: add alpha * (current - previous).
+            delta += alpha * (r_t - e.prev_r[slot]);
+        }
+        e.R[slot] = std::max(e.R[slot] + delta, 0.0f);
+        e.prev_r[slot] = r_t;  // always record current for next iter
     }
     e.visits += 1;
 }

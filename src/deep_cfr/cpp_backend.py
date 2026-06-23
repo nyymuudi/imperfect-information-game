@@ -216,7 +216,8 @@ class NLHECppBackend:
                  prune_after_iter: int = 0,
                  raise_fractions: tuple[float, ...] | None = None,
                  max_actions: int = 4,
-                 include_position_bit: bool = True):
+                 include_position_bit: bool = True,
+                 predictive_alpha: float = 0.0):
         if not _ENGINE_AVAILABLE:
             raise ImportError("cfr_engine.so not found.")
         self.device = device
@@ -232,6 +233,14 @@ class NLHECppBackend:
         # Pluribus-style dynamic pruning. 0.0 = off (default; backward compat).
         cfg.prune_threshold   = float(prune_threshold)
         cfg.prune_after_iter  = int(prune_after_iter)
+        # Predictive CFR+ (Brown 2020): adds momentum term alpha*(r_t-r_{t-1})
+        # to each accumulator update. Only active when target=CFRPLUS.
+        try:
+            cfg.predictive_alpha = float(predictive_alpha)
+        except AttributeError:
+            if predictive_alpha > 0:
+                print("[warn] cfr_engine.so missing predictive_alpha — "
+                      "rebuild engine for Predictive CFR+ support.")
         # Position-bit ablation: when False, both Python encoder and C++
         # engine write 0.0 in the slot for both players. State shape stays 37
         # so all buffers and networks remain compatible without a rebuild —

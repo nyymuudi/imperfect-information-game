@@ -129,6 +129,32 @@ class DeepCFRSolver:
     # head then leverages. 0.0 = disabled (default; v4 behaviour).
     # Suggested starting value: 0.1.
     aux_ev_weight: float = 0.0
+    # Teacher-student distillation: when ``teacher_net`` (a StrategyNetwork or
+    # compatible callable, e.g. a Blueprint's underlying net) is provided
+    # AND teacher_kl_weight > 0, the final strategy-network training adds
+    # KL(teacher || student) to the cross-entropy loss. Used for self-
+    # distillation from a previous production blueprint to reduce seed
+    # variance and inherit calibrated mixing.
+    teacher_net = None
+    teacher_kl_weight: float = 0.0
+    # Counterfactual hand-bucket augmentation (Path A). With probability
+    # ``aug_bucket_prob`` per sample, the hand-bucket one-hot is shifted
+    # by ±aug_bucket_radius and the cache is re-queried to refresh the
+    # advisor dims. Forces the regret network to be smooth across the
+    # equity-bucket abstraction. 0 = disabled (default).
+    aug_bucket_prob:   float = 0.0
+    aug_bucket_radius: int   = 1
+    # Predictive CFR+ (Brown 2020) momentum coefficient. > 0 enables the
+    # accelerated update rule on the C++ CFR+ accumulator. 0.0 = vanilla
+    # CFR+ (default; safe fallback). Only meaningful when regret_target
+    # == 'cfrplus' (the C++ engine's default with cache).
+    predictive_alpha: float = 0.0
+    # Value head (DeepStack / ReBeL style): scalar V(s) prediction trained
+    # to match Σ_a probs[a] * EVs[a] from the cache. When > 0, the
+    # RegretNetwork gains a value_head and the loss adds value_head_weight
+    # × MSE(V_pred, V_target). Forces the trunk to encode state-level
+    # expected value as a separate signal alongside per-action regrets.
+    value_head_weight: float = 0.0
     # BRD (best-response-defense) sample weighting: when an exploit-gap
     # map is provided, each regret-buffer sample's loss weight is multi-
     # plied by (1 + lambda * gap/median). High-exploitation spots get
@@ -139,16 +165,35 @@ class DeepCFRSolver:
     exploit_gap_lambda: float    = 0.0
 
     def __post_init__(self):
-        state_sz  = self.encoder.state_size()
+        # Buffer / network width must match what the SAMPLE EMITTER
+        # produces. The C++ NLHEStateEncoder always emits 49-dim vectors
+        # (advisor slots zero when no cache). The Python encoder returns
+        # 37 or 49 depending on cache attachment. On C++ path, pin to 49
+        # so buffer + network + emitter all agree (advisor stays zero
+        # when no cache; behaviour matches legacy 37-dim training because
+        # the network's input slots [37:49] all see constant zero and
+        # collapse the corresponding weights to a constant bias term).
+        if self.use_cpp_engine:
+            try:
+                from .cpp_backend import NLHECppBackend as _CppBp
+                state_sz = _CppBp.STATE_SIZE
+            except Exception:
+                state_sz = self.encoder.state_size()
+        else:
+            state_sz = self.encoder.state_size()
         strat_cap = self.strategy_buffer_capacity or self.buffer_capacity
 
         # Aux EV head is meaningful only when the encoder has 49 dims
         # (BASE_STATE_SIZE + 12 advisor slots). Otherwise the EV slots
-        # don't exist in the state vector.
+        # don't exist in the state vector. The value head shares the
+        # same precondition (its target is derived from the same advisor
+        # slots).
         ev_head_dim = 6 if (self.aux_ev_weight > 0 and state_sz == 49) else 0
+        use_value   = self.value_head_weight > 0 and state_sz == 49
         self.regret_net   = RegretNetwork(
             state_sz, self.max_actions, self.hidden_size,
             ev_head_dim=ev_head_dim,
+            value_head=use_value,
         ).to(self.device)
         self.strategy_net = StrategyNetwork(state_sz, self.max_actions, self.hidden_size).to(self.device)
 
@@ -193,6 +238,7 @@ class DeepCFRSolver:
                         prune_threshold=self.prune_threshold,
                         prune_after_iter=self.prune_after_iter,
                         include_position_bit=self.include_position_bit,
+                        predictive_alpha=self.predictive_alpha,
                     )
                     # When the encoder carries a CFR advisor cache, wire it
                     # into cpp_backend.to_tensors so advisor dims get
@@ -465,7 +511,14 @@ class DeepCFRSolver:
             self.iterations += 1
 
             if len(self.regret_buffer) >= self.train_batch:
-                state_sz   = self.encoder.state_size()
+                if self.use_cpp_engine:
+                    try:
+                        from .cpp_backend import NLHECppBackend as _CppBp
+                        state_sz = _CppBp.STATE_SIZE
+                    except Exception:
+                        state_sz = self.encoder.state_size()
+                else:
+                    state_sz = self.encoder.state_size()
                 net_device = next(self.regret_net.parameters()).device
                 # INSTANT-mode: aina cold-start (Brown et al. 2019 Algorithm 1).
                 # Warm-start on haitallinen INSTANT-moden kanssa koska kohdejakauma
@@ -484,9 +537,11 @@ class DeepCFRSolver:
                     # Cold-start: alustetaan nollista Brown et al. 2019
                     # -suosituksen mukaisesti.
                     ev_head_dim = 6 if (self.aux_ev_weight > 0 and state_sz == 49) else 0
+                    use_value_cs = self.value_head_weight > 0 and state_sz == 49
                     self.regret_net = RegretNetwork(
                         state_sz, self.max_actions, self.hidden_size,
                         ev_head_dim=ev_head_dim,
+                        value_head=use_value_cs,
                     ).to(net_device)
                     train_lr = self.lr
                 # LR decay buffer-saturaation jälkeen: vähentää myöhäisten
@@ -505,6 +560,16 @@ class DeepCFRSolver:
                     exploit_gap_encoder=(self.encoder
                                           if self.exploit_gap_map is not None
                                           else None),
+                    aug_bucket_prob=self.aug_bucket_prob,
+                    aug_bucket_radius=self.aug_bucket_radius,
+                    aug_cache=(self.encoder.cfr_cache
+                                if self.aug_bucket_prob > 0
+                                   and getattr(self.encoder, "cfr_cache", None) is not None
+                                else None),
+                    aug_encoder=(self.encoder
+                                  if self.aug_bucket_prob > 0
+                                  else None),
+                    value_head_weight=self.value_head_weight,
                 )
 
             if callback and t % callback_freq == 0:
@@ -517,6 +582,8 @@ class DeepCFRSolver:
                 epochs=300,
                 batch_size=self.train_batch,
                 lr=self.lr,
+                teacher_net=self.teacher_net,
+                teacher_kl_weight=self.teacher_kl_weight,
             )
             # Fine-tune phase: ekstra-epochit pienemmällä LR:llä.
             # Painottuu strategy-bufferin Linear-CFR-painojen kautta
@@ -529,6 +596,8 @@ class DeepCFRSolver:
                     epochs=self.finetune_epochs,
                     batch_size=self.train_batch,
                     lr=self.finetune_lr,
+                    teacher_net=self.teacher_net,
+                    teacher_kl_weight=self.teacher_kl_weight,
                 )
 
         return self.strategy_net

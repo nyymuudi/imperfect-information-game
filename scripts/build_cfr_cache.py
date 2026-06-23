@@ -515,9 +515,29 @@ def main() -> int:
         max_raises_per_street=bp.metadata.max_raises,
         raise_fractions=_rfs,
     )
+    # If blueprint was trained at state_size=49 (cache-augmented or
+    # cpp-engine-emitted padding), attach a stub empty cache so encoder
+    # state_size matches the network. Every lookup will miss → advisor
+    # slots stay zero, which is exactly the training-time behaviour for
+    # blueprints that haven't yet been retrained against a real cache.
+    stub_cache = None
+    if bp.metadata.state_size == 49:
+        from src.deep_cfr.cfr_cache import CFRCache, CFRCacheMeta
+        stub_cache = CFRCache(
+            keys=np.zeros(0, dtype=np.uint64),
+            probs=np.zeros((0, 6), dtype=np.float32),
+            evs=np.zeros((0, 6), dtype=np.float32),
+            meta=CFRCacheMeta(
+                starting_stack=bp.metadata.starting_stack,
+                raise_fractions=_rfs,
+                max_actions=bp.metadata.action_size,
+                iter_per_spot=0, n_spots_requested=0, timestamp="stub",
+            ),
+        )
     encoder = NLHEEncoder(
         starting_stack=bp.metadata.starting_stack,
         raise_fractions=_rfs,
+        cfr_cache=stub_cache,
     )
     max_actions = bp.metadata.action_size
     print(f"  state_size={bp.metadata.state_size}, "

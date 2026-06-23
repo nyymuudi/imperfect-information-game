@@ -49,7 +49,13 @@ struct NLHEBufferExport {
 // is a DIFFERENT granularity than the encoder). See design notes in
 // nlhe_mccfr.cpp.
 struct NLHECfrPlusEntry {
-    std::array<float, NLHE_NUM_ACTIONS> R{};   // clipped cumulative regret
+    std::array<float, NLHE_NUM_ACTIONS> R{};         // clipped cumulative regret
+    // Previous-iteration per-action instantaneous regret. Used by
+    // Predictive CFR+ (Brown 2020) to add a momentum term:
+    //     R_{t+1} = max(R_t + r_t + alpha*(r_t - prev_r), 0)
+    // The alpha coefficient is config_.predictive_alpha. Zeroed before any
+    // visits → first-iteration update degenerates to vanilla CFR+.
+    std::array<float, NLHE_NUM_ACTIONS> prev_r{};
     std::array<float, NLHEStateEncoder::STATE_SIZE> state{};  // encoder output
     int32_t visits    = 0;
     int8_t  n_actions = 0;
@@ -77,6 +83,14 @@ struct NLHETraversalConfig {
     // (which often shows uniform-ish blueprint output) is not lost.
     float prune_threshold     = 0.0f;
     int   prune_after_iter    = 0;
+
+    // Predictive CFR+ momentum (Brown 2020). When > 0 AND target == CFRPLUS,
+    // each iteration's CFR+ update folds in (predictive_alpha) × (r_t - r_{t-1})
+    // so the cumulative regret tracks not just the current iter's regret but
+    // also its rate of change → 3-5× faster convergence empirically on the
+    // games Brown benchmarked. 0.0 = vanilla CFR+ (default; safe fallback).
+    // Brown's paper used alpha=1.0 implicitly via R_{t+1} = max(R_t + 2r_t - r_{t-1}).
+    float predictive_alpha    = 0.0f;
 };
 
 // ── Engine ────────────────────────────────────────────────────────────────────

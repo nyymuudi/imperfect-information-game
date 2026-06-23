@@ -167,6 +167,7 @@ PYBIND11_MODULE(cfr_engine, m) {
         .def_readwrite("target",            &NLHETraversalConfig::target)
         .def_readwrite("prune_threshold",   &NLHETraversalConfig::prune_threshold)
         .def_readwrite("prune_after_iter",  &NLHETraversalConfig::prune_after_iter)
+        .def_readwrite("predictive_alpha",  &NLHETraversalConfig::predictive_alpha)
         .def_readwrite("game_cfg",          &NLHETraversalConfig::game_cfg);
 
     py::class_<NLHEMCCFREngine>(m, "NLHEMCCFREngine")
