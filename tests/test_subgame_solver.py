@@ -78,6 +78,10 @@ class MockBlueprint:
     def query(self, state_vec, num_actions):
         return np.ones(num_actions) / num_actions
 
+    def query_by_slots(self, state_vec, slot_indices):
+        n = len(slot_indices)
+        return np.ones(n) / n
+
 
 class MockEncoder:
     """Returns a random state vector."""

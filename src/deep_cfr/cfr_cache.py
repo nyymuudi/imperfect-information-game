@@ -140,43 +140,6 @@ def _spr_bucket(stacks: tuple, pot_chips: float) -> int:
     else:            return 7
 
 
-def _board_bucket(board_visible: tuple, encoder) -> int:
-    """Use the encoder's existing 8-bucket board strength as the texture key.
-
-    For preflop (no visible board) we return 0 — bucket 0 is the "no
-    board" state, distinct from postflop bucket 0 because the street
-    field separates them in the higher bits of the key.
-    """
-    if not board_visible:
-        return 0
-    try:
-        # Use the encoder's flat board bucket as the texture. Hero cards
-        # aren't yet known here so we pass two placeholder cards that
-        # aren't on the board (the bucket cares mostly about board cards).
-        used = set(board_visible)
-        placeholder = [c for c in range(52) if c not in used][:2]
-        return int(encoder._board_bucket(tuple(placeholder),
-                                          tuple(board_visible))) & 0x7
-    except AttributeError:
-        # Encoder doesn't expose the helper; conservative fallback.
-        return 0
-
-
-def _hand_bucket(hero_cards: tuple, encoder) -> int:
-    """Hero hand bucket via the encoder's 8-way preflop equity classes."""
-    try:
-        equity = encoder._get_preflop_equity(hero_cards[0], hero_cards[1])
-        eq_range = encoder._eq_max - encoder._eq_min
-        if eq_range > 0:
-            eq_norm = (equity - encoder._eq_min) / eq_range
-        else:
-            eq_norm = equity
-        bucket = min(int(eq_norm * 8), 7)
-        return max(0, bucket)
-    except AttributeError:
-        return 0
-
-
 def key_from_state_vector(state_vec, encoder) -> int:
     """Re-derive the abstraction key from an already-encoded state vector.
 
@@ -276,42 +239,21 @@ def public_state_key(history, game, encoder) -> int:
     in 1:1 correspondence with the encoder's view of the state. Including
     the hand bucket means different hero hands at the same public state
     get distinct advisor signals — which is what we want.
+
+    Delegates to ``key_from_state_vector`` on the encoded state so the
+    raw-history path and the state-vector path (C++ pipeline, lookup())
+    produce identical keys by construction. A hand-rolled _parse_state
+    version drifted from the encoder's pot/stack semantics (pot included
+    posted blinds differently), silently breaking cache-hit parity.
     """
-    state   = game._parse_state(history)
-    street  = state["street_idx"]
-    player  = state["current_player"]
-    raises  = state["raises_this_street"]
-    pot     = state["pot"]
-    stacks  = state["stacks"]
-    sb_chips = float(getattr(game, "sb", 1.0))
-
-    # Relative last-aggressor: encode "me / opponent / none" so the key
-    # is position-invariant (SB and BB facing a bet from each other share
-    # the same advisor signal at otherwise-identical states).
-    la = state["last_aggressor"]
-    if la < 0:
-        la_rel = 0           # no aggressor on this street
-    elif la == player:
-        la_rel = 1           # I made the last raise (post-bet, my turn-back)
-    else:
-        la_rel = 2           # opponent did
-
-    # Board visible at this street
-    n_visible = (0, 3, 4, 5)[min(street, 3)]
-    board_visible = tuple(history[2][:n_visible])
-
-    hero_cards = history[player]
-
-    return encode_key(
-        street=street,
-        player=player,
-        raises=raises,
-        last_aggressor_rel=la_rel,
-        pot_bucket=_pot_bucket(pot, sb_chips),
-        spr_bucket=_spr_bucket(tuple(stacks), pot),
-        board_bucket=_board_bucket(board_visible, encoder),
-        hand_bucket=_hand_bucket(hero_cards, encoder),
-    )
+    player = game.current_player(history)
+    saved  = getattr(encoder, "cfr_cache", None)
+    encoder.cfr_cache = None
+    try:
+        sv = encoder.encode(history, player)
+    finally:
+        encoder.cfr_cache = saved
+    return key_from_state_vector(sv, encoder)
 
 
 # ── Cache container ─────────────────────────────────────────────────────────
