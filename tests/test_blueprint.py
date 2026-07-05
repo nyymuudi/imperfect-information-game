@@ -5,8 +5,6 @@ Run with:  pytest tests/test_blueprint.py -v
 """
 
 import json
-import tempfile
-from pathlib import Path
 
 import numpy as np
 import pytest

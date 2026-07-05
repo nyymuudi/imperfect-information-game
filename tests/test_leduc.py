@@ -284,7 +284,6 @@ class TestLeducDeepCFRConvergence:
     def solve(self):
         import numpy as np
         import torch
-        from src.solvers.cfr import CFRSolver
         from src.deep_cfr.state_encoder import LeducEncoder
         from src.deep_cfr.deep_cfr_solver import DeepCFRSolver
 

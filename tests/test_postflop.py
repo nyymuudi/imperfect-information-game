@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.games.postflop_nlhe import PostflopNLHE
 from src.deep_cfr.state_encoder import NLHEEncoder
 from src.deep_cfr.replay_buffer import ReservoirBuffer
-from src.abstraction.equity import str_to_card, card_to_str
+from src.abstraction.equity import str_to_card
 
 
 # ── Helper: build a specific deal ──

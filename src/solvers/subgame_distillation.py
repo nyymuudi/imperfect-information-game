@@ -50,7 +50,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Iterable, Iterator
+from typing import Iterable
 
 import numpy as np
 

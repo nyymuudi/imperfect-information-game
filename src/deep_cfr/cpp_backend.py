@@ -352,7 +352,7 @@ class NLHECppBackend:
         encoder  = getattr(self, "_encoder", None)
         if cache is not None and encoder is not None:
             from .cfr_cache import (
-                ADVISOR_DIMS, EV_DIMS, PROB_DIMS,
+                ADVISOR_DIMS, PROB_DIMS,
                 key_from_state_vector,
             )
             base = self.BASE_STATE_SIZE

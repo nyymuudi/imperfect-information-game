@@ -73,12 +73,6 @@ from src.analysis.exploitability import estimate_exploitability
 
 # ── Strategy evaluation helpers ───────────────────────────────────────────────
 
-ACTION_LABELS = {
-    "preflop": ["fold/check", "call", "raise", "all-in"],
-    "postflop": ["check/fold", "call", "raise", "all-in"],
-}
-
-
 def _action_labels_for_game(game, deal, prefix: str) -> list[str]:
     """Build snapshot labels that match the actual legal_actions list.
 
@@ -168,7 +162,6 @@ def evaluate_blueprint(bp: Blueprint, encoder: NLHEEncoder) -> None:
                          dtype=np.float32),
             ])
         legal       = game.legal_actions(history)
-        num_actions = len(legal)
         # Slot-indexed query so postflop no-bet states (legal=['c','r','a'])
         # show actual check/raise/all-in probabilities — the legacy
         # bp.query(state, num_actions) returned slots [0..n-1] contiguously

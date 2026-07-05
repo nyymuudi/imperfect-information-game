@@ -121,10 +121,7 @@ def replay_state(action_str: str, client_pos: int) -> dict:
             actor = bb_player
 
         for tok in segment:
-            other = 1 - actor
             actor_is_hero = (actor == client_pos)
-            actor_street_ref = "my_street" if actor_is_hero else "opp_street"
-            other_street     = opp_street if actor_is_hero else my_street
 
             # Translate to our 4-slot history code (0/check or fold, 1/call,
             # 2/raise, 3/all-in). Only used by the encoder; we just need it
@@ -218,7 +215,6 @@ def pick_action(blueprint, encoder, game, *,
     my_total    = state["my_total_invest"]
     to_call     = max(0, opp_street - my_street)
     my_stack    = STACK_CHIPS - my_total
-    street_idx  = state["street_idx"]
     history     = state["action_codes"]
 
     # Build a synthetic PostflopNLHE history that approximates the spot.

@@ -42,7 +42,7 @@ from src.search.pbs import (
 from src.search.resolve import build_resolving_strategy
 from src.search.depth_limited import build_dl_resolving_strategy
 from src.search.cfv import ENCODING_DIMS, encode_round2_pbs, fast_round2_cfvs
-from src.search.cfv_net import CFVNet, train_cfv_net, net_leaf_evaluator
+from src.search.cfv_net import train_cfv_net, net_leaf_evaluator
 
 from scripts.phase1_leduc_resolve import exact_exploitability_of
 

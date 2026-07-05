@@ -39,7 +39,6 @@ from ..games.leduc import LeducHoldem
 from ..solvers.cfr import CFRSolver
 from .pbs import (
     LEDUC_CARDS,
-    CARD_IDX,
     LeducPBS,
     representative_history,
     update_on_action,

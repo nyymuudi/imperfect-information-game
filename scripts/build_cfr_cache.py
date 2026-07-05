@@ -37,11 +37,10 @@ import numpy as np
 from src.deep_cfr.action_slots import legal_actions_to_slots
 from src.deep_cfr.blueprint import Blueprint
 from src.deep_cfr.cfr_cache import (
-    ADVISOR_DIMS, EV_DIMS, PROB_DIMS,
+    EV_DIMS, PROB_DIMS,
     CFRCache, CFRCacheMeta,
     collect_visit_distribution,
     make_meta,
-    public_state_key,
 )
 from src.deep_cfr.state_encoder import NLHEEncoder
 from src.games.postflop_nlhe import PostflopNLHE
@@ -522,7 +521,6 @@ def main() -> int:
     # blueprints that haven't yet been retrained against a real cache.
     stub_cache = None
     if bp.metadata.state_size == 49:
-        from src.deep_cfr.cfr_cache import CFRCache, CFRCacheMeta
         stub_cache = CFRCache(
             keys=np.zeros(0, dtype=np.uint64),
             probs=np.zeros((0, 6), dtype=np.float32),

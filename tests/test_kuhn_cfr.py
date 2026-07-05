@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.games.kuhn import KuhnPoker, CARD_RANK
+from src.games.kuhn import KuhnPoker
 from src.solvers.cfr import CFRSolver
 from src.analysis.convergence import ConvergenceTracker, verify_kuhn_nash
 

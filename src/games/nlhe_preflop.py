@@ -79,9 +79,6 @@ class PreflopNLHE(ExtensiveFormGame):
             b = self.abstraction.get_bucket(hc)
             bucket_combos[b] = bucket_combos.get(b, 0) + _hand_combos(hc)
         
-        # Total possible deals (approximate: 1326 × 1225 ≈ 1.6M)
-        total_hero = sum(bucket_combos.values())  # = 1326
-        
         pair_probs = {}
         total_weight = 0.0
         for b0 in range(self.abstraction.num_buckets):
@@ -127,8 +124,7 @@ class PreflopNLHE(ExtensiveFormGame):
         actions = self._get_actions(history)
         invested = [0.5, 1.0]  # SB, BB
         num_raises = 0
-        last_aggressor = -1
-        
+
         player = 0  # SB acts first preflop
         
         for a in actions:
@@ -157,12 +153,10 @@ class PreflopNLHE(ExtensiveFormGame):
                     new_total = self.raise_sizes[num_raises]
                     invested[player] = min(new_total, self.stack_bb)
                     num_raises += 1
-                    last_aggressor = player
-                    
+
             elif a == 'a':
                 invested[player] = self.stack_bb
                 num_raises += 1
-                last_aggressor = player
             
             player = 1 - player
         
@@ -223,7 +217,6 @@ class PreflopNLHE(ExtensiveFormGame):
         # Fold: folder loses their investment
         if state.get("folder") is not None:
             folder = state["folder"]
-            winner = 1 - folder
             return (
                 -invested[0] if folder == 0 else invested[1],
                 -invested[1] if folder == 1 else invested[0],
@@ -259,7 +252,6 @@ class PreflopNLHE(ExtensiveFormGame):
 
     def legal_actions(self, history: History) -> list[Action]:
         state = self._betting_state(history)
-        actions_list = self._get_actions(history)
         invested = state["invested"]
         num_raises = state["num_raises"]
         player = state["current_player"]
@@ -299,7 +291,7 @@ class PreflopNLHE(ExtensiveFormGame):
         return f"B{bucket}({exemplar}, eq={lo:.2f}-{hi:.2f})"
 
     def strategy_summary(
-        self, strategy: dict[str, 'np.ndarray']
+        self, strategy: dict
     ) -> str:
         """
         Format strategy as a readable range chart.
@@ -312,7 +304,7 @@ class PreflopNLHE(ExtensiveFormGame):
         
         # Group info sets by action sequence
         from collections import defaultdict
-        by_sequence: dict[str, list[tuple[int, 'np.ndarray']]] = defaultdict(list)
+        by_sequence: dict = defaultdict(list)
         
         for key, strat in sorted(strategy.items()):
             parts = key.split("|")

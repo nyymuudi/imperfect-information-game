@@ -42,8 +42,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import numpy as np
-
 from src.analysis.exploitability import estimate_exploitability
 from src.analysis.head_to_head import match_crn
 from src.deep_cfr.blueprint import Blueprint

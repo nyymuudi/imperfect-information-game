@@ -95,7 +95,6 @@ def make_cpp_state(hole0_str, hole1_str, board_str, actions=()):
 
 def make_python_vec(hole0_str, hole1_str, board_str, actions, player):
     """Encode the equivalent Python history. `actions` are char actions."""
-    from src.games.postflop_nlhe import PostflopNLHE  # noqa: F401
     NLHEEncoder._shared_equity_cache = None
     enc  = NLHEEncoder(starting_stack=200.0, equity_sims=2000)
 

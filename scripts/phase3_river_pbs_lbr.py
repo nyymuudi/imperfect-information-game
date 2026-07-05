@@ -43,7 +43,7 @@ from src.analysis.head_to_head import ev_adjusted_payoffs
 from src.search.nlhe_pbs import compute_ranges, range_sampler, top_k_range
 from src.solvers.subgame_solver import UnsafeSubgameSolver
 from scripts.resolve_h2h import (
-    RIVER_STREET, BlueprintPolicy, load_bundle, _uniform_range, _resolve_seed,
+    BlueprintPolicy, load_bundle, _uniform_range, _resolve_seed,
 )
 from scripts.resolve_river_lbr import _walk_to_river_decision
 

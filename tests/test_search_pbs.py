@@ -5,7 +5,6 @@ import pytest
 
 from src.games.leduc import LeducHoldem
 from src.search.pbs import (
-    LEDUC_CARDS,
     CARD_IDX,
     initial_pbs,
     representative_history,

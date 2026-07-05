@@ -39,7 +39,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..games.leduc import LeducHoldem, RANKS
-from .pbs import LEDUC_CARDS, CARD_IDX, LeducPBS, representative_history
+from .pbs import LEDUC_CARDS, LeducPBS, representative_history
 
 N_CARDS = 6
 _RANK_OF = np.array([0, 0, 1, 1, 2, 2])          # card idx → rank idx
@@ -276,7 +276,6 @@ class VectorCFR:
             raise ValueError("root_values requires exact expand mode")
         strategies = self.average_strategies()
         r0, r1 = self.root_ranges
-        x_tr = (r0 if traverser == 0 else r1).copy()
         x_opp = (r1 if traverser == 0 else r0).copy()
         return self._value_pass(self.root_actions, self.root_comm,
                                 x_opp, traverser, strategies)

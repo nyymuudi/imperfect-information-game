@@ -16,8 +16,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.abstraction.equity import (
-    evaluate_5card, evaluate_7card, card_rank, card_suit,
-    str_to_card, card_to_str, canonical_hand_class,
+    evaluate_5card, evaluate_7card,
+    str_to_card, canonical_hand_class,
     all_169_classes, representative_hand, equity_vs_random,
 )
 from src.abstraction.card_abstraction import CardAbstraction

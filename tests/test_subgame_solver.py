@@ -12,8 +12,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
-import torch
-import torch.nn as nn
 
 from src.games.postflop_nlhe import PostflopNLHE
 from src.abstraction.equity import str_to_card
@@ -124,7 +122,6 @@ class TestSubgameGame:
 
     def test_no_card_conflicts(self, setup):
         sg, _, _ = setup
-        board5 = make_board5()
         for history, _ in sg.initial_histories():
             p0 = set(history[0])
             p1 = set(history[1])
@@ -252,7 +249,6 @@ class TestGadgetGame:
     def test_opt_out_not_available_after_action(self):
         gadget = self._make_gadget()
         h, _ = gadget.initial_histories()[0]
-        player = gadget.current_player(h)
         regular_actions = [a for a in gadget.legal_actions(h) if a != _OPT_OUT]
         if regular_actions:
             h2 = gadget.apply_action(h, regular_actions[0])
@@ -327,7 +323,6 @@ class TestUnsafeSubgameSolver:
             opponent_range=opp_range,
             iterations=20,
         )
-        game = make_game()
         board5 = make_board5()
         h = (
             (c("Ah"), c("Kd")),
@@ -504,7 +499,6 @@ class TestSafeSubgameSolver:
             iterations=10,
         )
         # No info set should reference the opt-out action
-        game = make_game()
         h = (
             (c("Ah"), c("Kd")),
             (c("Tc"), c("9s")),

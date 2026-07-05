@@ -20,19 +20,12 @@ where:
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 
 # Hashable, immutable game state identifier
 InfoSetKey = str
 Action = str
 History = tuple
-
-
-@dataclass(frozen=True)
-class TerminalState:
-    """Result of a completed game."""
-    payoffs: tuple[float, ...]  # One per player
 
 
 class ExtensiveFormGame(ABC):

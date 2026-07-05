@@ -25,7 +25,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
-import torch
 
 from src.games.postflop_nlhe import PostflopNLHE
 from src.deep_cfr.deep_cfr_solver import DeepCFRSolver

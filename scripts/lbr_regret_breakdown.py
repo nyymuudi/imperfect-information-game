@@ -29,9 +29,7 @@ import numpy as np
 from src.abstraction.equity import card_to_str, canonical_hand_class
 from src.analysis.exploitability import (
     _lbr_action_evs,
-    _live_cards,
     _sample_deal,
-    _substitute_opp_cards,
     _walk_to_depth,
 )
 from src.analysis.head_to_head import ev_adjusted_payoffs
