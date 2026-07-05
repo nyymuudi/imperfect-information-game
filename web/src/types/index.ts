@@ -6,13 +6,5 @@ export const STREET_NAMES: Record<Street, string> = {
   3: 'River',
 }
 
-// Actions match NLHEAction enum in nlhe_game.hpp
-export type ActionIndex = 0 | 1 | 2 | 3
-export const ACTION_LABELS: Record<ActionIndex, string> = {
-  0: 'Fold / Check',
-  1: 'Call',
-  2: 'Raise',
-  3: 'All-in',
-}
 
 // SolverRun removed — Supabase integration not active.

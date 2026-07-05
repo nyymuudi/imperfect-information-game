@@ -41,7 +41,6 @@ export const ADVISOR_DIMS    = 12
 export const STATE_SIZE      = BASE_STATE_SIZE + ADVISOR_DIMS  // 49
 export const K_PREFLOP  = 8
 export const K_BOARD    = 8
-export const BUCKET_SCHEME = 'flat' as const
 // Equity range for normalised preflop bucket (from 2000-sim table):
 //   weakest hand 72o ≈ 0.316, strongest AA ≈ 0.842.
 export const EQ_MIN = 0.316
@@ -77,10 +76,6 @@ let _advisorCache: AdvisorCache | null = null
  * fill the [37:49] advisor dims by per-spot lookup. */
 export function setAdvisorCache(cache: AdvisorCache | null): void {
   _advisorCache = cache
-}
-
-export function getAdvisorCache(): AdvisorCache | null {
-  return _advisorCache
 }
 
 export function cardRank(card: number): number {
