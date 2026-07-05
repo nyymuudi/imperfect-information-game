@@ -158,6 +158,15 @@ def evaluate_blueprint(bp: Blueprint, encoder: NLHEEncoder) -> None:
             continue
 
         state_vec   = encoder.encode(history, player)
+        # No-cache runs: the Python encoder emits 37 dims but the C++-trained
+        # net expects 49 (advisor dims zeroed). Zero-padding matches the C++
+        # traversal's no-cache semantics exactly.
+        if len(state_vec) < bp.metadata.state_size:
+            state_vec = np.concatenate([
+                state_vec,
+                np.zeros(bp.metadata.state_size - len(state_vec),
+                         dtype=np.float32),
+            ])
         legal       = game.legal_actions(history)
         num_actions = len(legal)
         # Slot-indexed query so postflop no-bet states (legal=['c','r','a'])
@@ -591,9 +600,14 @@ def main() -> int:
         raise_fracs = (args.raise_fraction,)
 
     # Action space size: fold/check + (optional call) + N raises + allin.
-    # Capacity (network output dim, regret sample slots): 3 + N raises.
-    # Single raise → 4 actions (legacy). Multi raise N=2 → 5, N=3 → 6.
-    n_actions_capacity = 3 + len(raise_fracs)
+    # Single raise → 4 slots (legacy; ALL_IN enum 5 remapped to slot 3).
+    # Multi raise → ALWAYS 6 slots, also for N=2: the ALL_IN slot remap
+    # (both C++ nlhe_action_to_slot and Python action_symbol_to_slot)
+    # only covers max_actions ∈ {4, 6}. Capacity 5 leaves ALL_IN at raw
+    # slot 5 ≥ max_actions, so the a<max_actions buffer filter silently
+    # drops EVERY all-in sample from training and eval crashes on slot 5.
+    # N=2 just leaves the RAISE_2 slot unused (harmless padding).
+    n_actions_capacity = 4 if len(raise_fracs) == 1 else 6
 
     game = PostflopNLHE(
         starting_stack=args.stack,

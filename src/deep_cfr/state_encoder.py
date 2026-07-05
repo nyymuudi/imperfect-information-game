@@ -193,7 +193,8 @@ class NLHEEncoder(StateEncoder):
                  bucket_scheme: str = "flat",
                  raise_fractions: tuple[float, ...] | None = None,
                  include_position_bit: bool = True,
-                 cfr_cache=None):
+                 cfr_cache=None,
+                 pad_advisor_dims: bool = False):
         """
         bucket_scheme:
             "flat" — K_BOARD-way one-hot at [8:8+K_BOARD]. K_BOARD in (8, 16).
@@ -221,6 +222,12 @@ class NLHEEncoder(StateEncoder):
         # src/deep_cfr/cfr_cache.py. None → no advisor dims, state_size
         # stays at the legacy 37 (or 36 without position bit).
         self.cfr_cache = cfr_cache
+        # pad_advisor_dims: emit the 12 advisor slots as ZEROS even without
+        # a cache, so state_size matches C++-trained 49-dim blueprints. The
+        # C++ traversal always writes 49 dims (advisor slots zeroed when no
+        # cache) — evaluating a no-cache blueprint therefore needs this
+        # padding for train/eval input parity.
+        self.pad_advisor_dims = bool(pad_advisor_dims)
         # Raise fractions: oltava sama kuin pelaajan PostflopNLHE:llä jotta
         # _parse_state pystyy uudelleenkäymään 'rN'-actioneita. None →
         # legacy default (0.75,) jotta backward-compat säilyy testeissä jotka
@@ -470,7 +477,7 @@ class NLHEEncoder(StateEncoder):
         # When a CFR advisor cache is attached, an extra 12 dims are
         # appended at the tail (6 action probs + 6 per-action EVs).
         base = 29 + self.K_BOARD
-        if self.cfr_cache is not None:
+        if self.cfr_cache is not None or self.pad_advisor_dims:
             from .cfr_cache import ADVISOR_DIMS
             base += ADVISOR_DIMS
         return base
