@@ -41,7 +41,6 @@ public:
     const T* data() const { return data_.data(); }
     T*       data()       { return data_.data(); }
     void clear() { data_.clear(); size_ = 0; total_seen_ = 0; }
-    std::vector<T> sample_batch(size_t n, std::mt19937& rng) const;
 private:
     size_t        capacity_;
     size_t        size_;

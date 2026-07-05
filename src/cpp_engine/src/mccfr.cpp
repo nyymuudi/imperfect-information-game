@@ -27,21 +27,6 @@ bool ReservoirBuffer<T>::insert(const T& sample) {
     return false;
 }
 
-template <typename T>
-std::vector<T> ReservoirBuffer<T>::sample_batch(size_t n, std::mt19937& rng) const {
-    if (n >= size_) {
-        return std::vector<T>(data_.begin(), data_.end());
-    }
-    std::vector<size_t> indices(size_);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::shuffle(indices.begin(), indices.end(), rng);
-    indices.resize(n);
-    std::vector<T> batch;
-    batch.reserve(n);
-    for (size_t i : indices) batch.push_back(data_[i]);
-    return batch;
-}
-
 template class ReservoirBuffer<RegretSample>;
 template class ReservoirBuffer<StrategySample>;
 

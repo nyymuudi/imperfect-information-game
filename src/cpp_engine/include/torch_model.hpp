@@ -179,14 +179,6 @@ public:
     std::vector<float> forward(const std::vector<float>& state_vec,
                                int max_actions) const;
 
-    // Batch inference — more efficient for subgame solving.
-    // states:       [batch * STATE_SIZE] flat row-major float array.
-    // max_actions:  per-row action count, length batch.
-    // Returns:      [batch * 4] flat row-major float array.
-    std::vector<float> forward_batch(
-        const std::vector<float>& states,
-        const std::vector<int>&   max_actions) const;
-
 private:
 #ifdef CFR_ORT_AVAILABLE
     mutable Ort::Env     env_;
