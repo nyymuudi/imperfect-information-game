@@ -51,6 +51,13 @@ def main():
     ap.add_argument("--river-iters", type=int, default=300)
     ap.add_argument("--turn-iters", type=int, default=150)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", type=str, default=None,
+                    help="comma list; overrides --seed, aggregates with a "
+                         "per-seed paired t-test")
+    ap.add_argument("--opp-beliefs", choices=["uniform", "bayes"],
+                    default="uniform")
+    ap.add_argument("--depth-sampling", choices=["uniform", "stratified"],
+                    default="uniform")
     ap.add_argument("--baseline-only", action="store_true")
     args = ap.parse_args()
 
@@ -89,32 +96,73 @@ def main():
             print(f"  [override-fail] {type(e).__name__}: {e}", flush=True)
             return None
 
-    t0 = time.time()
-    print(f"[1/2] baseline: v16c plain (n={args.n_games}, seed={args.seed})")
-    base = estimate_exploitability(bp, game, encoder, n_games=args.n_games,
-                                   seed=args.seed, verbose=False)
-    print(f"      LBR = {float(base):.1f} ± {base.stderr_mbb:.1f} mbb/dec "
-          f"(n={base.n_decisions}, {time.time()-t0:.0f}s)")
-    if args.baseline_only:
+    seeds = ([int(s) for s in args.seeds.split(",")]
+             if args.seeds else [args.seed])
+    metric = dict(opp_beliefs=args.opp_beliefs,
+                  depth_sampling=args.depth_sampling)
+
+    per_seed_delta, per_seed_pse = [], []
+    for sd in seeds:
+        t0 = time.time()
+        base = estimate_exploitability(bp, game, encoder,
+                                       n_games=args.n_games, seed=sd,
+                                       verbose=False, **metric)
+        print(f"seed {sd} baseline: {float(base):7.1f} ± {base.stderr_mbb:5.1f} "
+              f"mbb/dec (n={base.n_decisions}, {time.time()-t0:.0f}s)")
+        if args.baseline_only:
+            continue
+
+        t0 = time.time()
+        agent = estimate_exploitability(bp, game, encoder,
+                                        n_games=args.n_games, seed=sd,
+                                        verbose=False,
+                                        strategy_override=override, **metric)
+        d = float(agent) - float(base)
+        # Proper CRN-paired SE from aligned per-node samples (identical
+        # node sets — override consumes no shared rng draws). Falls back
+        # to quadrature only if alignment broke (differing skips).
+        if (agent.samples_mbb is not None and base.samples_mbb is not None
+                and len(agent.samples_mbb) == len(base.samples_mbb)):
+            dd = agent.samples_mbb - base.samples_mbb
+            if metric["depth_sampling"] == "stratified" \
+                    and agent.strata_weights is not None:
+                pse, dmean = 0.0, 0.0
+                for s in range(4):
+                    m = dd[agent.streets == s]
+                    if len(m) == 0:
+                        continue
+                    dmean += agent.strata_weights[s] * float(m.mean())
+                    if len(m) >= 2:
+                        pse += (agent.strata_weights[s] ** 2
+                                * float(m.var(ddof=1)) / len(m))
+                d, pse = dmean, float(np.sqrt(pse))
+            else:
+                pse = float(dd.std(ddof=1) / np.sqrt(len(dd)))
+        else:
+            pse = (base.stderr_mbb ** 2 + agent.stderr_mbb ** 2) ** 0.5
+        per_seed_delta.append(d)
+        per_seed_pse.append(pse)
+        print(f"seed {sd} agent   : {float(agent):7.1f} ± {agent.stderr_mbb:5.1f} "
+              f"| paired Δ = {d:+7.1f} ± {pse:5.1f} mbb/dec "
+              f"(turn={stats['turn']} river={stats['river']} "
+              f"fail={stats['fail']}, {time.time()-t0:.0f}s)")
+        stats.update({"turn": 0, "river": 0, "skip": 0, "fail": 0})
+
+    if args.baseline_only or not per_seed_delta:
         return 0
-
-    t0 = time.time()
-    print(f"[2/2] search agent: turn+river re-solve override")
-    agent = estimate_exploitability(bp, game, encoder, n_games=args.n_games,
-                                    seed=args.seed, verbose=False,
-                                    strategy_override=override)
-    print(f"      LBR = {float(agent):.1f} ± {agent.stderr_mbb:.1f} mbb/dec "
-          f"(n={agent.n_decisions}, {time.time()-t0:.0f}s)")
-    print(f"      resolves: turn={stats['turn']} river={stats['river']} "
-          f"skip={stats['skip']} fail={stats['fail']}")
-
-    d = float(agent) - float(base)
-    se = (base.stderr_mbb ** 2 + agent.stderr_mbb ** 2) ** 0.5
-    print(f"\n== Stage B gate ==")
-    print(f"Δ(search − blueprint) = {d:+.1f} ± {se:.1f} mbb/dec "
-          f"(CRN-paired trajectories)")
-    print("PASS" if d < 0 else "no improvement")
-    return 0 if d < 0 else 1
+    d = np.asarray(per_seed_delta)
+    print(f"\n== Stage B gate ({len(d)} seeds, "
+          f"beliefs={args.opp_beliefs}, sampling={args.depth_sampling}) ==")
+    if len(d) >= 2:
+        se = float(d.std(ddof=1) / np.sqrt(len(d)))
+        t = d.mean() / se if se > 0 else float("nan")
+        print(f"Δ(search − blueprint) = {d.mean():+.1f} ± {se:.1f} mbb/dec  "
+              f"t = {t:+.2f}  ({int((d < 0).sum())}/{len(d)} seeds negative)")
+    else:
+        print(f"Δ(search − blueprint) = {d[0]:+.1f} ± {per_seed_pse[0]:.1f} "
+              f"mbb/dec (single seed, paired SE)")
+    print("PASS" if d.mean() < 0 else "no improvement")
+    return 0 if d.mean() < 0 else 1
 
 
 if __name__ == "__main__":
