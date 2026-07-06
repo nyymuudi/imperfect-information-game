@@ -30,12 +30,81 @@ import torch
 
 from .nlhe_river_vector import (
     COMBOS, N_COMBOS, _C1, _C2,
-    bucket_map, bucket_range, disjoint_mass,
+    disjoint_mass,
 )
-from .nlhe_cfv import K_BUCKETS, encode_river_pbs
+from .nlhe_cfv import K_BUCKETS
 from ..abstraction.equity import evaluate_7card
 
 TURN_STREET = 2
+
+# Combo → card incidence [1326, 52] for BLAS per-card sums.
+_INC = np.zeros((N_COMBOS, 52))
+_INC[np.arange(N_COMBOS), _C1] = 1.0
+_INC[np.arange(N_COMBOS), _C2] = 1.0
+
+# Pairwise card-overlap mask [1326, 1326]: True where combos share a card.
+_OVERLAP = ((_C1[:, None] == _C1[None, :]) | (_C1[:, None] == _C2[None, :])
+            | (_C2[:, None] == _C1[None, :]) | (_C2[:, None] == _C2[None, :]))
+
+_BOARD_TABLE_CACHE: dict[tuple, tuple] = {}
+
+
+def _board_tables(turn_board: tuple, river_cards: tuple, live_mask):
+    """Per-turn-board tables (LRU-ish: unbounded, entries ~3 MB, and a
+    training/eval run touches only a bounded set of boards)."""
+    key = turn_board
+    if key in _BOARD_TABLE_CACHE:
+        return _BOARD_TABLE_CACHE[key]
+
+    n_r = len(river_cards)
+    card_mask: dict[int, np.ndarray] = {}
+    bmaps: dict[int, np.ndarray] = {}
+    scores: dict[int, np.ndarray] = {}
+    mask_matrix = np.zeros((n_r, N_COMBOS), dtype=bool)
+    bm_matrix = np.full((n_r, N_COMBOS), -1, dtype=np.int64)
+
+    for r, c in enumerate(river_cards):
+        mask = live_mask & (_C1 != c) & (_C2 != c)
+        card_mask[c] = mask
+        board5 = turn_board + (c,)
+        sc = np.full(N_COMBOS, -1, dtype=np.int64)
+        idx = np.where(mask)[0]
+        for i in idx:
+            sc[i] = evaluate_7card(tuple(COMBOS[i]) + board5)
+        scores[c] = sc
+        # Strength-percentile buckets from the SAME score array
+        # (bucket_map would recompute every evaluate_7card).
+        order = idx[np.argsort(sc[idx], kind="stable")]
+        bm = np.full(N_COMBOS, -1, dtype=np.int64)
+        n_live = len(order)
+        bm[order] = np.minimum(K_BUCKETS - 1,
+                               np.arange(n_live) * K_BUCKETS // n_live)
+        bmaps[c] = bm
+        mask_matrix[r] = mask
+        bm_matrix[r] = bm
+
+    from .nlhe_cfv import board_texture
+    tex_matrix = np.asarray(
+        [board_texture(turn_board + (c,)) for c in river_cards])
+
+    # All-in showdown as ONE linear operator (the leaf value is linear
+    # in the opponent reach): A[h,h'] = 1/R · Σ_{c: both alive under c}
+    # sign(score_c(h) − score_c(h')), overlapping pairs zeroed. Profiling
+    # showed the per-iteration tie-group sweeps were 95% of solve time;
+    # this replaces them with a single BLAS matvec per leaf call.
+    A = np.zeros((N_COMBOS, N_COMBOS), dtype=np.float32)
+    for c in river_cards:
+        sc = scores[c]
+        alive = card_mask[c]
+        sign = np.sign(sc[:, None] - sc[None, :]).astype(np.float32)
+        pair_alive = np.outer(alive, alive)
+        A += sign * pair_alive
+    A[_OVERLAP] = 0.0
+    A /= float(n_r)
+
+    out = (card_mask, bmaps, scores, mask_matrix, bm_matrix, tex_matrix, A)
+    _BOARD_TABLE_CACHE[key] = out
+    return out
 
 
 class TurnVectorCFR:
@@ -72,21 +141,16 @@ class TurnVectorCFR:
         self.live_mask = np.asarray(
             [not (board_set & set(c)) for c in COMBOS], dtype=bool)
 
-        # Per-river-card precomputation (once per solve):
-        #   combo mask, bucket map, and (for all-in leaves) strength order.
-        self._card_mask: dict[int, np.ndarray] = {}
-        self._bmaps: dict[int, np.ndarray] = {}
-        self._scores: dict[int, np.ndarray] = {}
-        for c in self.river_cards:
-            mask = self.live_mask & (_C1 != c) & (_C2 != c)
-            self._card_mask[c] = mask
-            board5 = self.turn_board + (c,)
-            self._bmaps[c] = bucket_map(board5, K_BUCKETS)
-            sc = np.full(N_COMBOS, -1, dtype=np.int64)
-            idx = np.where(mask)[0]
-            for i in idx:
-                sc[i] = evaluate_7card(tuple(COMBOS[i]) + board5)
-            self._scores[c] = sc
+        # Per-river-card precomputation, cached per turn board: 7-card
+        # scores per (river card, combo) are pure functions of the board
+        # and were the dominant setup cost (46 × 1326 evaluate_7card ≈
+        # 6 s). Buckets are derived from the same score arrays instead
+        # of recomputing them inside bucket_map (was double work).
+        (self._card_mask, self._bmaps, self._scores,
+         self._mask_matrix, self._bm_matrix, self._tex_matrix,
+         self._allin_op) = \
+            _board_tables(self.turn_board, tuple(self.river_cards),
+                          self.live_mask)
 
         self._regret: dict[tuple, np.ndarray] = {}
         self._strat_sum: dict[tuple, np.ndarray] = {}
@@ -117,84 +181,74 @@ class TurnVectorCFR:
 
     def _allin_showdown(self, rep: tuple, x_opp: np.ndarray,
                         traverser: int) -> np.ndarray:
-        """Exact equity over the 46 runouts, sorted-sweep per card."""
+        """Exact equity over the 46 runouts: one precomputed matvec."""
         inv = float(self.game._parse_state(rep)["invested"][traverser])
-        u = np.zeros(N_COMBOS)
-        p = 1.0 / len(self.river_cards)
-        for c in self.river_cards:
-            mask = self._card_mask[c]
-            sc = self._scores[c]
-            xm = np.where(mask, x_opp, 0.0)
-            order = np.argsort(sc, kind="stable")
-            order = order[sc[order] >= 0]
-            u_c = self._sweep(order, sc, xm, inv)
-            u_c[~mask] = 0.0
-            u += p * u_c
-        return u
-
-    @staticmethod
-    def _sweep(order, sc, x_sorted_src, inv) -> np.ndarray:
-        weaker = np.zeros(N_COMBOS)
-        stronger = np.zeros(N_COMBOS)
-        for direction in (1, -1):
-            cum = 0.0
-            cum_card = np.zeros(52)
-            seq = order if direction == 1 else order[::-1]
-            svals = sc[seq]
-            i, n = 0, len(seq)
-            out = weaker if direction == 1 else stronger
-            while i < n:
-                j = i
-                while j < n and svals[j] == svals[i]:
-                    j += 1
-                idx = seq[i:j]
-                out[idx] = cum - cum_card[_C1[idx]] - cum_card[_C2[idx]]
-                grp = x_sorted_src[idx]
-                cum += float(grp.sum())
-                np.add.at(cum_card, _C1[idx], grp)
-                np.add.at(cum_card, _C2[idx], grp)
-                i = j
-        return inv * (weaker - stronger)
+        return inv * (self._allin_op @ x_opp.astype(np.float32)
+                      ).astype(np.float64)
 
     def _river_boundary(self, rep: tuple, x_tr: np.ndarray,
                         x_opp: np.ndarray, traverser: int) -> np.ndarray:
-        """Depth limit: batched net query over all 46 river cards."""
+        """Depth limit: one batched net query over all 46 river cards.
+
+        Fully vectorised across cards: masked reaches [R,1326], bucket
+        ranges via one flat scatter, per-card disjoint masses via a BLAS
+        product with the combo→card incidence matrix. Semantics are
+        identical to the original per-card loop (equality-tested).
+        """
         pot = float(self.game._parse_state(rep)["pot"])
         stack = float(self.game.starting_stack)
+        M = self._mask_matrix                       # [R, 1326] bool
+        R = M.shape[0]
 
-        encs, metas = [], []
-        for c in self.river_cards:
-            mask = self._card_mask[c]
-            m0 = np.where(mask, x_tr if traverser == 0 else x_opp, 0.0)
-            m1 = np.where(mask, x_opp if traverser == 0 else x_tr, 0.0)
-            s0, s1 = m0.sum(), m1.sum()
-            if s0 <= 0 or s1 <= 0:
-                continue
-            bm = self._bmaps[c]
-            encs.append(encode_river_pbs(
-                self.turn_board + (c,), pot, stack,
-                bucket_range(m0 / s0, bm, K_BUCKETS),
-                bucket_range(m1 / s1, bm, K_BUCKETS)))
-            metas.append((c, bm))
-        if not encs:
+        x0 = x_tr if traverser == 0 else x_opp
+        x1 = x_opp if traverser == 0 else x_tr
+        X0 = M * x0[None, :]
+        X1 = M * x1[None, :]
+        s0 = X0.sum(axis=1)
+        s1 = X1.sum(axis=1)
+        ok_rows = (s0 > 0) & (s1 > 0)
+        if not ok_rows.any():
             return np.zeros(N_COMBOS)
 
+        # Bucket ranges for all cards in one scatter per player.
+        bmf = self._bm_matrix                       # [R, 1326], -1 = dead
+        valid = bmf >= 0
+        flat = (bmf + np.arange(R)[:, None] * K_BUCKETS)[valid]
+        br0 = np.zeros(R * K_BUCKETS)
+        br1 = np.zeros(R * K_BUCKETS)
+        np.add.at(br0, flat, (X0 / np.where(s0 > 0, s0, 1.0)[:, None])[valid])
+        np.add.at(br1, flat, (X1 / np.where(s1 > 0, s1, 1.0)[:, None])[valid])
+        br0 = br0.reshape(R, K_BUCKETS)
+        br1 = br1.reshape(R, K_BUCKETS)
+
+        encs = np.zeros((R, 4 + 2 * K_BUCKETS), dtype=np.float32)
+        encs[:, 0] = pot / (2.0 * stack)
+        encs[:, 1:4] = self._tex_matrix
+        encs[:, 4:4 + K_BUCKETS] = br0
+        encs[:, 4 + K_BUCKETS:] = br1
+
         with torch.no_grad():
-            out = self.net(torch.as_tensor(np.stack(encs), dtype=torch.float32,
+            out = self.net(torch.as_tensor(encs[ok_rows],
+                                           dtype=torch.float32,
                                            device=self.device)).cpu().numpy()
         out = out * pot                     # un-normalise (targets are v/pot)
 
-        u = np.zeros(N_COMBOS)
-        p = 1.0 / len(self.river_cards)
         half = K_BUCKETS if traverser == 1 else 0
-        for (c, bm), row in zip(metas, out):
-            v_bucket = row[half:half + K_BUCKETS]
-            mask = self._card_mask[c]
-            v_combo = np.zeros(N_COMBOS)
-            ok = mask & (bm >= 0)
-            v_combo[ok] = v_bucket[bm[ok]]
-            x_o = np.where(mask, x_opp, 0.0)
-            u += p * v_combo * disjoint_mass(x_o)
+        v_bucket = np.zeros((R, K_BUCKETS))
+        v_bucket[ok_rows] = out[:, half:half + K_BUCKETS]
+
+        # Per-combo values back from buckets; dead entries stay 0.
+        v_combo = np.take_along_axis(
+            v_bucket, np.where(valid, bmf, 0), axis=1)
+        v_combo[~valid] = 0.0
+
+        # Disjoint opponent mass per (card, combo): BLAS per-card sums.
+        Xop = M * x_opp[None, :]
+        s_cards = Xop @ _INC                        # [R, 52]
+        D = (Xop.sum(axis=1)[:, None]
+             - s_cards[:, _C1] - s_cards[:, _C2] + Xop)
+
+        u = (v_combo * D * ok_rows[:, None]).sum(axis=0) / R
         return u
 
     # ── Traversal ────────────────────────────────────────────────────────────

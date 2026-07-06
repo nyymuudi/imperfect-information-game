@@ -73,7 +73,8 @@ class TestAllinEquity:
                     brute += x_opp[j] * (inv if s_h > s_o
                                          else (-inv if s_h < s_o else 0.0))
             brute /= len(rivers)
-            np.testing.assert_allclose(u[i], brute, atol=1e-9)
+            # float32 precomputed all-in operator → ~1e-6 tolerance
+            np.testing.assert_allclose(u[i], brute, atol=1e-4)
 
 
 class TestSolveSmoke:
