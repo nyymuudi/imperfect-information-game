@@ -1,0 +1,24 @@
+# Stage B gate (uniform depth sampling, seeds 42-61, 400 games/seed, CRN-paired)
+# Source: reconstructed from scratchpad sweep logs, aggregated 2026-07-06.
+# b4 river CFV net. Δ(search − blueprint) per seed, mbb/decision:
+42  -91.6
+43  +37.4
+44  -76.2
+45  -183.7
+46  +15.2
+47  -40.7
+48  +28.6
+49  +114.1
+50  -76.0
+51  +9.5
+52  -50.5
+53  +33.1
+54  -157.4
+55  -89.8
+56  -10.0
+57  -0.9
+58  -82.4
+59  -4.4
+60  +15.3
+61  -115.9
+# Aggregate: mean = -36.3, SE = 16.4, t = -2.22, 13/20 negative
