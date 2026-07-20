@@ -21,11 +21,17 @@ import { STATE_SIZE, type EncodeInput, encode, setAdvisorCache } from './encoder
 import { loadCache } from './cache'
 
 export type ActionProbs = {
-  fold:  number
-  call:  number
-  raise: number
-  allIn: number
+  fold:     number
+  call:     number
+  raise50:  number   // RAISE_0, 50% pot (slot 2)
+  raise100: number   // RAISE_1, 100% pot (slot 3)
+  allIn:    number   // slot 5
 }
+
+// v16c 2-size tree: 6 network output slots; RAISE_2 (slot 4) is untrained
+// padding and must be masked out. Overridable via manifest.legal_slots.
+export const ACTION_SIZE = 6
+let _legalSlots: number[] = [1, 1, 1, 1, 0, 1]
 
 // Fallback path if manifest not found
 const FALLBACK_MODEL_PATH =
@@ -51,6 +57,12 @@ async function resolveModelPath(): Promise<string> {
       if (typeof manifest.model_path === 'string') {
         _resolvedPath = manifest.model_path
         console.log(`[session] model version: ${manifest.hash ?? 'unknown'} (${manifest.iterations ?? '?'} iter, state_size=${manifest.state_size ?? '?'})`)
+        if (Array.isArray(manifest.legal_slots) && manifest.legal_slots.length === ACTION_SIZE) {
+          _legalSlots = manifest.legal_slots.map((x: number) => (x ? 1 : 0))
+        }
+        if (manifest.action_size !== undefined && manifest.action_size !== ACTION_SIZE) {
+          console.warn(`[session] manifest action_size=${manifest.action_size} != build ACTION_SIZE=${ACTION_SIZE} — strategy display will be WRONG`)
+        }
         // If model uses the cache-augmented 49-dim state, fetch the
         // advisor cache binary in parallel. Cache miss is non-fatal:
         // the encoder leaves advisor dims at zero, network handles it.
@@ -107,7 +119,7 @@ async function _inferSingle(input: EncodeInput): Promise<ActionProbs> {
   const session    = await getSession()
   const stateVec   = encode(input)
   const stateTensor = new ort.Tensor('float32', stateVec, [1, STATE_SIZE])
-  const maskTensor  = new ort.Tensor('float32', new Float32Array([1, 1, 1, 1]), [1, 4])
+  const maskTensor  = new ort.Tensor('float32', new Float32Array(_legalSlots), [1, ACTION_SIZE])
   const output      = await session.run({ state: stateTensor, action_mask: maskTensor })
   return _toActionProbs(output[session.outputNames[0]].data as Float32Array, 0)
 }
@@ -144,11 +156,12 @@ async function _inferBatch(inputs: EncodeInput[]): Promise<ActionProbs[]> {
     stateData.set(encode(inputs[i]), i * STATE_SIZE)
   }
 
-  // All actions legal — uniform mask
-  const maskData = new Float32Array(n * 4).fill(1.0)
+  // Legal-slot mask per row (RAISE_2 padding masked out in the 2-size tree)
+  const maskData = new Float32Array(n * ACTION_SIZE)
+  for (let i = 0; i < n; i++) maskData.set(_legalSlots, i * ACTION_SIZE)
 
   const stateTensor = new ort.Tensor('float32', stateData, [n, STATE_SIZE])
-  const maskTensor  = new ort.Tensor('float32', maskData,  [n, 4])
+  const maskTensor  = new ort.Tensor('float32', maskData,  [n, ACTION_SIZE])
   const output      = await session.run({ state: stateTensor, action_mask: maskTensor })
   const logits      = output[session.outputNames[0]].data as Float32Array
 
@@ -159,10 +172,13 @@ async function _inferBatch(inputs: EncodeInput[]): Promise<ActionProbs[]> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _toActionProbs(logits: Float32Array, batchIdx: number): ActionProbs {
-  const offset = batchIdx * 4
-  const raw    = [logits[offset], logits[offset+1], logits[offset+2], logits[offset+3]]
-  const pos    = raw.map(v => Math.max(v, 0))
-  const total  = pos.reduce((a, b) => a + b, 0)
-  const probs  = total > 1e-7 ? pos.map(v => v / total) : [0.25, 0.25, 0.25, 0.25]
-  return { fold: probs[0], call: probs[1], raise: probs[2], allIn: probs[3] }
+  const offset = batchIdx * ACTION_SIZE
+  // Slots: 0=fold/check, 1=call, 2=raise50, 3=raise100, 4=RAISE_2 (masked), 5=all-in
+  const raw = [logits[offset], logits[offset+1], logits[offset+2],
+               logits[offset+3], logits[offset+5]]
+  const pos   = raw.map(v => Math.max(v, 0))
+  const total = pos.reduce((a, b) => a + b, 0)
+  const probs = total > 1e-7 ? pos.map(v => v / total) : [0.2, 0.2, 0.2, 0.2, 0.2]
+  return { fold: probs[0], call: probs[1], raise50: probs[2],
+           raise100: probs[3], allIn: probs[4] }
 }

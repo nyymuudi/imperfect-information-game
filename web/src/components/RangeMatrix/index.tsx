@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import React, { useState, useTransition } from 'react'
 import { RANKS, SUITS, makeCard, cardRank, cardSuit, cardLabel, STARTING_STACK } from '@/lib/onnx/encoder'
 import { queryStrategyBatch, type ActionProbs } from '@/lib/onnx/session'
 import { STREET_NAMES, type Street } from '@/types'
@@ -23,10 +23,11 @@ function cellGradient(p: ActionProbs): string {
     pct += w
     stops.push(`${color} ${pct.toFixed(1)}%`)
   }
-  add('#4a5a50', p.fold  * 100)
-  add('#22c55e', p.call  * 100)
-  add('#f59e0b', p.raise * 100)
-  add('#a78bfa', p.allIn * 100)
+  add('#4a5a50', p.fold     * 100)
+  add('#22c55e', p.call     * 100)
+  add('#f59e0b', p.raise50  * 100)
+  add('#f97316', p.raise100 * 100)
+  add('#a78bfa', p.allIn    * 100)
   return stops.length ? `linear-gradient(to bottom, ${stops.join(', ')})` : 'var(--bg3)'
 }
 
@@ -251,7 +252,8 @@ export default function RangeMatrix() {
         {([
           ['#4a5a50', 'Fold / Check'],
           ['#22c55e', 'Call'],
-          ['#f59e0b', 'Raise'],
+          ['#f59e0b', 'Raise 50%'],
+          ['#f97316', 'Raise 100%'],
           ['#a78bfa', 'All-in'],
         ] as [string, string][]).map(([color, label]) => (
           <div key={label} className="legend-item">
@@ -268,8 +270,8 @@ export default function RangeMatrix() {
             <div className="matrix-corner" />
             {ranks.map(r => <div key={`h-${r}`} className="matrix-header">{r}</div>)}
             {ranks.map((rowRank, ri) => (
-              <>
-                <div key={`row-${rowRank}`} className="matrix-row-header">{rowRank}</div>
+              <React.Fragment key={`row-${rowRank}`}>
+                <div className="matrix-row-header">{rowRank}</div>
                 {ranks.map((colRank, ci) => {
                   const r1    = RANKS.indexOf(rowRank)
                   const r2    = RANKS.indexOf(colRank)
@@ -282,7 +284,7 @@ export default function RangeMatrix() {
                       key={label}
                       className="matrix-cell"
                       title={probs
-                        ? `${label}  fold ${(probs.fold*100).toFixed(0)}%  call ${(probs.call*100).toFixed(0)}%  raise ${(probs.raise*100).toFixed(0)}%  all-in ${(probs.allIn*100).toFixed(0)}%`
+                        ? `${label}  fold ${(probs.fold*100).toFixed(0)}%  call ${(probs.call*100).toFixed(0)}%  r50 ${(probs.raise50*100).toFixed(0)}%  r100 ${(probs.raise100*100).toFixed(0)}%  all-in ${(probs.allIn*100).toFixed(0)}%`
                         : label}
                       style={{ background: probs ? cellGradient(probs) : 'var(--bg3)' }}
                     >
@@ -290,7 +292,7 @@ export default function RangeMatrix() {
                     </div>
                   )
                 })}
-              </>
+              </React.Fragment>
             ))}
           </div>
         </div>

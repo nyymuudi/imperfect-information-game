@@ -32,6 +32,20 @@ def main() -> int:
     p.add_argument("--web-models",
                    default="web/public/models",
                    help="Target web models dir (default: web/public/models).")
+    p.add_argument("--cache", default=None,
+                   help="Advisor cache .bin to deploy alongside the model "
+                        "(sets manifest cache_path/cache_entries).")
+    p.add_argument("--lbr", type=float, default=None,
+                   help="LBR number for the manifest (mbb/decision).")
+    p.add_argument("--lbr-note", default=None,
+                   help="Metric/provenance note for the LBR number, e.g. "
+                        "'LBR v2 bayes+stratified, 5 seeds'.")
+    p.add_argument("--action-size", type=int, default=None,
+                   help="Network output slots (manifest action_size; the "
+                        "web builds masks from this — 4 legacy, 6 multi-raise).")
+    p.add_argument("--legal-slots", default=None,
+                   help="Comma list of 0/1 per slot, e.g. '1,1,1,1,0,1' "
+                        "for a 2-size tree (RAISE_2 slot untrained).")
     args = p.parse_args()
 
     bp_dir = Path(args.blueprint)
@@ -62,10 +76,34 @@ def main() -> int:
             web_models.mkdir(parents=True, exist_ok=True)
 
     plan = [
-        (manifest_src,  web_models / "model_manifest.json"),
         (onnx_src,      web_models / "strategy_net.onnx"),
         (versioned_src, web_models / versioned_name),
     ]
+
+    # Manifest is written (not copied) so deploy-time fields can be merged:
+    # cache pointer, published LBR number + metric note, action layout.
+    manifest_out = dict(manifest)
+    manifest_out["blueprint"] = bp_dir.name
+    if args.cache:
+        cache_src = Path(args.cache)
+        if not cache_src.exists():
+            print(f"Error: cache {cache_src} missing", file=sys.stderr)
+            return 1
+        plan.append((cache_src, web_models / cache_src.name))
+        manifest_out["cache_path"] = f"/models/{cache_src.name}"
+        import struct
+        with open(cache_src, "rb") as f:
+            hdr = f.read(12)
+        manifest_out["cache_entries"] = struct.unpack("<III", hdr)[2]
+    if args.lbr is not None:
+        manifest_out["lbr_mbb_per_decision"] = args.lbr
+    if args.lbr_note:
+        manifest_out["lbr_note"] = args.lbr_note
+    if args.action_size is not None:
+        manifest_out["action_size"] = args.action_size
+    if args.legal_slots:
+        manifest_out["legal_slots"] = [int(x) for x in
+                                       args.legal_slots.split(",")]
 
     print(f"Blueprint: {bp_dir}")
     print(f"  iterations:  {manifest.get('iterations')}")
@@ -88,8 +126,21 @@ def main() -> int:
         if args.dry_run:
             print(f"  [dry-run] cp  {src} → {dst}")
         else:
+            # Remove any existing dst first: a legacy strategy_net.onnx was a
+            # symlink to a versioned file, and copy2 would follow it and
+            # overwrite the WRONG (linked) target instead of replacing the
+            # link. Unlinking makes every deploy write a real, independent file.
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
             shutil.copy2(src, dst)
             print(f"  cp  {dst.name}")
+
+    manifest_dst = web_models / "model_manifest.json"
+    if args.dry_run:
+        print(f"  [dry-run] write {manifest_dst}: {json.dumps(manifest_out)}")
+    else:
+        manifest_dst.write_text(json.dumps(manifest_out, indent=2) + "\n")
+        print(f"  write {manifest_dst.name}")
 
     print()
     if args.dry_run:

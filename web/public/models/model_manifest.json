@@ -1,11 +1,21 @@
 {
-  "model_path": "/models/strategy_net.e6c5adf4d007.onnx",
-  "hash": "e6c5adf4d007",
-  "iterations": 500,
+  "model_path": "/models/strategy_net.cb250bc120aa.onnx",
+  "hash": "cb250bc120aa",
+  "iterations": 2500,
   "state_size": 49,
-  "cache_path": "/models/v14d_advisor_v4.cache.bin",
-  "cache_entries": 2000,
-  "lbr_mbb_per_decision": 761,
-  "blueprint": "50bb_v15_c2_v5_aux",
-  "timestamp": "2026-06-18T20:05:19"
+  "timestamp": "2026-07-05T16:07:41",
+  "blueprint": "50bb_v16c_2size_cache_2500",
+  "cache_path": "/models/v16b_advisor_v1.cache.bin",
+  "cache_entries": 3638,
+  "lbr_mbb_per_decision": 998.0,
+  "lbr_note": "LBR v2 (bayes+stratified opp-beliefs, 5 seeds, \u00b126)",
+  "action_size": 6,
+  "legal_slots": [
+    1,
+    1,
+    1,
+    1,
+    0,
+    1
+  ]
 }

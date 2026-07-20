@@ -49,13 +49,17 @@ export const EQ_MAX = 0.842
 export const STARTING_STACK = 50.0
 export const BOARD_CARDS_BY_STREET = [0, 3, 4, 5] // indexed by street 0-3
 
-// Verified against NLHE_ACTION_ENC[4] = {0.0f, 0.25f, 0.5f, 1.0f} in nlhe_game.hpp
-// Actions: 0=fold/check, 1=call, 2=raise, 3=all-in
+// Mirrors NLHE_ACTION_ENC[6] = {0.0, 0.25, 0.5, 0.4, 0.6, 1.0} in
+// nlhe_game.hpp (multi-raise enum: FOLD_OR_CHECK, CALL, RAISE_0, RAISE_1,
+// RAISE_2, ALL_IN). v16c uses two raise sizes → slots 2 (50% pot) and
+// 3 (100% pot); slot 4 (RAISE_2) is unused padding in the 2-size tree.
 export const ACTION_ENC: Record<number, number> = {
   0: 0.0,  // fold or check
   1: 0.25, // call
-  2: 0.5,  // raise
-  3: 1.0,  // all-in
+  2: 0.5,  // raise 50% pot (RAISE_0)
+  3: 0.4,  // raise 100% pot (RAISE_1)
+  4: 0.6,  // RAISE_2 (unused in 2-size tree)
+  5: 1.0,  // all-in
 }
 
 export interface EncodeInput {

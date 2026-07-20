@@ -10,10 +10,11 @@ import { STREET_NAMES, type Street } from '@/types'
 const STARTING_STACK = STACK_SIZE
 
 const ACTION_META: Record<keyof ActionProbs, { label: string; color: string; desc: string }> = {
-  fold:  { label: 'Fold / Check', color: '#7a8a80', desc: 'Surrender your hand or pass without betting' },
-  call:  { label: 'Call',         color: '#22c55e', desc: "Match the opponent's bet to stay in the hand" },
-  raise: { label: 'Raise',        color: '#f59e0b', desc: 'Increase the bet (50% of the pot)' },
-  allIn: { label: 'All-in',       color: '#a78bfa', desc: 'Commit all remaining chips to the pot' },
+  fold:     { label: 'Fold / Check', color: '#7a8a80', desc: 'Surrender your hand or pass without betting' },
+  call:     { label: 'Call',         color: '#22c55e', desc: "Match the opponent's bet to stay in the hand" },
+  raise50:  { label: 'Raise 50%',    color: '#f59e0b', desc: 'Raise half the pot' },
+  raise100: { label: 'Raise 100%',   color: '#f97316', desc: 'Raise the full pot' },
+  allIn:    { label: 'All-in',       color: '#a78bfa', desc: 'Commit all remaining chips to the pot' },
 }
 
 const STREET_INFO: Record<Street, { cards: number; desc: string }> = {
@@ -218,7 +219,7 @@ export default function StrategyExplorer() {
       {/* Header */}
       <div className="header">
         <h1 className="title">CFR // Strategy Explorer</h1>
-        <p className="subtitle">Deep CFR · HU NLHE · {STARTING_STACK}BB · 50% pot · Neural inference</p>
+        <p className="subtitle">Deep CFR · HU NLHE · {STARTING_STACK}BB · 50/100% pot bets · Neural inference</p>
       </div>
 
       {/* Street: locked to preflop. Postflop spots need an action-history
