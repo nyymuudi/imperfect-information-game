@@ -299,6 +299,61 @@ class TurnVectorCFR:
             self._traverse((), r0.copy(), r1.copy(), 0)
             self._traverse((), r1.copy(), r0.copy(), 1)
 
+    def _avg_sigma(self, cont: tuple, na: int) -> np.ndarray:
+        ss = self._strat_sum.get((cont,))
+        if ss is None:
+            return np.full((N_COMBOS, na), 1.0 / na)
+        tot = ss.sum(axis=1, keepdims=True)
+        return np.where(tot > 0, ss / np.where(tot > 0, tot, 1.0), 1.0 / na)
+
+    def _value_pass(self, cont: tuple, x_tr: np.ndarray, x_opp: np.ndarray,
+                    traverser: int) -> np.ndarray:
+        """u_tr[1326] at the turn root under the AVERAGE strategies — same
+        leaves as _traverse (fold / all-in / river-boundary net), no
+        regret/strategy updates. Feeds turn-root CFVs for a turn CFV net."""
+        rep = self._rep(cont)
+        game = self.game
+        state = game._parse_state(rep)
+        if game.is_terminal(rep) or state["street_idx"] > TURN_STREET:
+            if state["folded"][0] or state["folded"][1]:
+                f = float(game.terminal_payoffs(rep)[traverser])
+                return f * disjoint_mass(x_opp)
+            if state["all_in"]:
+                return self._allin_showdown(rep, x_opp, traverser)
+            return self._river_boundary(rep, x_tr, x_opp, traverser)
+
+        player = game.current_player(rep)
+        legal = game.legal_actions(rep)
+        sigma = self._avg_sigma(cont, len(legal))
+        if player == traverser:
+            u = np.zeros(N_COMBOS)
+            for ai, a in enumerate(legal):
+                u += sigma[:, ai] * self._value_pass(
+                    cont + (a,), x_tr * sigma[:, ai], x_opp, traverser)
+            return u
+        u = np.zeros(N_COMBOS)
+        for ai, a in enumerate(legal):
+            u += self._value_pass(cont + (a,), x_tr, x_opp * sigma[:, ai],
+                                  traverser)
+        return u
+
+    def root_values(self) -> tuple[np.ndarray, np.ndarray]:
+        """Conditional per-combo turn-root EVs (v0[1326], v1[1326]) under
+        the average strategies: v_p(h) = u_p(h) / Σ_{h' disjoint} x_opp(h').
+        Zero where the combo conflicts with the turn board or the opponent
+        has no disjoint mass. Mirrors RiverVectorCFR.root_values."""
+        out = []
+        for tr in (0, 1):
+            x_tr = self.roots[tr]
+            x_opp = self.roots[1 - tr]
+            u = self._value_pass((), x_tr.copy(), x_opp.copy(), tr)
+            denom = disjoint_mass(x_opp)
+            v = np.zeros(N_COMBOS)
+            ok = (denom > 1e-12) & self.live_mask
+            v[ok] = u[ok] / denom[ok]
+            out.append(v)
+        return out[0], out[1]
+
     def strategy_at(self, history, player: int) -> np.ndarray:
         from .nlhe_river_vector import COMBO_IDX
         cont = tuple(history[3:])[len(self.base_actions):]
