@@ -47,14 +47,21 @@ _OVERLAP = ((_C1[:, None] == _C1[None, :]) | (_C1[:, None] == _C2[None, :])
             | (_C2[:, None] == _C1[None, :]) | (_C2[:, None] == _C2[None, :]))
 
 _BOARD_TABLE_CACHE: dict[tuple, tuple] = {}
+# Bounded FIFO: each entry is ~16 MB (measured: +16 MB RSS/board — the
+# [1326×1326] float32 all-in operator dominates). The unbounded version
+# OOM-killed the turn data-gen run at ~9.8k boards (~150 GB): the
+# collector touches a FRESH board every sample, so "a bounded set of
+# boards" only holds for eval reruns, not collection.
+_BOARD_TABLE_CACHE_MAX = 16
 
 
 def _board_tables(turn_board: tuple, river_cards: tuple, live_mask):
-    """Per-turn-board tables (LRU-ish: unbounded, entries ~3 MB, and a
-    training/eval run touches only a bounded set of boards)."""
+    """Per-turn-board tables, bounded FIFO cache (see note above)."""
     key = turn_board
     if key in _BOARD_TABLE_CACHE:
         return _BOARD_TABLE_CACHE[key]
+    while len(_BOARD_TABLE_CACHE) >= _BOARD_TABLE_CACHE_MAX:
+        _BOARD_TABLE_CACHE.pop(next(iter(_BOARD_TABLE_CACHE)))
 
     n_r = len(river_cards)
     card_mask: dict[int, np.ndarray] = {}
